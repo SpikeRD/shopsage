@@ -37,7 +37,7 @@ python -m eval.run --suite agent        # 跑 Agent 成功率 / 多 Agent 对比
 2. 写 `eval/rag_eval.py`：跑检索 + Ragas 三指标。
 3. 写 `eval/agent_eval.py`：跑完整图，判成功率 + 事实命中率。
 4. 写 `eval/compare.py`：单 Agent vs 多 Agent 对比报告。
-5. 接入 CI：阈值不达标阻断（`infra.md`）。
+5. 准备 CI 接入：阈值不达标即失败的检查脚本；实际挂到 CI 由 `infra.md` 第 19 步完成。
 
 ## 7. 测试用例
 
@@ -52,5 +52,5 @@ def test_multi_agent_beats_single():     # 多 Agent 成功率 > 单 Agent 成�
 
 - [ ] 检索 Recall 从 X% 提到 Y%（G1，量化）。
 - [ ] 多 Agent 方案成功率/质量高于单 Agent（简历上的「量化收益」）。
-- [ ] 评测纳入 CI，低于阈值阻断合并。
+- [ ] 评测纳入 CI（第 19 步接通），低于阈值阻断合并。
 - [ ] 证据链接：`eval/report#__` / `CI 评测#__`

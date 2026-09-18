@@ -38,7 +38,7 @@ from app.observability.langfuse_cb import langfuse_handler
 1. 写 `metrics.py`：定义计数器/histogram，注册 Prometheus collector。
 2. 写 `tracing.py`：OTEL tracer + 节点/工具/LLM 埋点装饰器。
 3. 写 `langfuse_cb.py`：Langfuse handler 接入 `llm.md` 的调用。
-4. `infra.md` 起 prometheus + grafana，配 scrape 目标与面板。
+4. 用 `infra.md` 第 2 步的 dev compose 起 prometheus + grafana，配 scrape 目标与面板。
 5. 压测一次，验证能从 Grafana 定位到具体瓶颈节点。
 
 ## 7. 测试用例

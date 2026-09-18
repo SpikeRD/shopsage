@@ -5,13 +5,13 @@
 用 Docker Compose 编排所有依赖服务与业务镜像，用 GitHub Actions 打通「lint → test → 构建镜像 → 部署 Linux」。
 目标：**本机能一键起依赖开发，服务器能一键起全套生产**。
 
-> ⚠️ 本模块横跨两个阶段：**P0 只做开发依赖（`docker-compose.dev.yml`，本机起数据库/Redis）**；
-> **生产 compose + 镜像 + CI/CD 留到 P6**。见下方「开发步骤」。
+> ⚠️ 本模块横跨两个阶段：**第 2 步只做开发依赖（`docker-compose.dev.yml`，本机起数据库/Redis/Prometheus/Grafana）**；
+> **生产 compose + 镜像 + CI/CD 留到第 19 步**。见下方「开发步骤」。
 
 ## 2. 对外接口
 
 ```bash
-# 开发期：只起依赖（PostgreSQL+pgvector、Redis），代码跑在本机 venv
+# 开发期：只起依赖（PostgreSQL+pgvector、Redis、Prometheus、Grafana），代码跑在本机 venv
 docker compose -f docker-compose.dev.yml up -d
 
 # 生产期：全套服务
@@ -26,7 +26,7 @@ docker compose up -d
 
 ## 4. 关键设计决策
 
-1. **开发/生产一份 Compose 拆分**：`docker-compose.dev.yml` 只含基础设施（postgres/redis）；`docker-compose.yml` 含全部服务（api/worker/web）。用 `.env` 区分（架构第 9 节）。
+1. **开发/生产一份 Compose 拆分**：`docker-compose.dev.yml` 只含基础设施（postgres/redis/prometheus/grafana）；`docker-compose.yml` 含全部服务（api/worker/web）。用 `.env` 区分（架构第 9 节）。
 2. **开发期代码不容器化**：本机 venv 直接跑，热重载快、好调试；只有「依赖服务」进容器。
 3. **镜像在 Linux runner 构建**：`docker/build-push-action` 构建 → push registry → 服务器 `pull` 后 compose 起（架构第 9 节「交付」）。
 4. **密钥不入镜像**：用 `env_file` / 运行时 `environment` 注入，绝不用 `ARG` 烧进镜像层。
@@ -40,19 +40,19 @@ docker compose up -d
 
 ## 6. 开发步骤
 
-> **本模块分两阶段，不要一次做完**：P0 只做「本机起开发依赖」（第 1 步），
-> 生产部署与 CI/CD（第 2–5 步）留到 P6 全链路跑通后再做。
+> **本模块分两阶段，不要一次做完**：第 2 步只做「本机起开发依赖」（第 1–2 步），
+> 生产部署与 CI/CD（第 3–6 步）留到第 19 步全链路跑通后再做。
 
-**P0（开发依赖，先做）**
+**第 2 步（开发依赖，先做）**
 
-1. 写 `docker-compose.dev.yml`：`postgres`（含 `pgvector` 镜像或启动脚本装扩展）+ `redis`，配 volume 持久化 + healthcheck。
+1. 写 `docker-compose.dev.yml`：`postgres`（含 `pgvector` 镜像或启动脚本装扩展）+ `redis` + `prometheus` + `grafana`，配 volume 持久化 + healthcheck。
 2. 验证：本机 `docker compose -f docker-compose.dev.yml up` → 数据库/Redis 能连（`db.md` 建表依赖它）。
 
-**P6（生产部署与 CI/CD，最后做）**
+**第 19 步（生产部署与 CI/CD，最后做）**
 
 3. 写生产 `docker-compose.yml`：`api`、`worker`、`web`、`postgres`、`redis`、`grafana`、`prometheus`。
 4. 写 `app/Dockerfile`（多阶段）+ `web/Dockerfile` + `.dockerignore`。
-5. 写 `.github/workflows/ci.yml`：ruff/black/mypy → pytest → build & push。
+5. 写 `.github/workflows/ci.yml`：ruff/black/mypy → pytest（含 `eval.md` 评测关卡，阈值不达标阻断）→ build & push。
 6. 写部署 job：SSH 到 Linux 服务器 `pull` + `docker compose up -d`。
 
 ## 7. 测试用例
@@ -61,6 +61,7 @@ docker compose up -d
 # CI 关卡（任何一条不绿则阻断合并）
 ruff check . && black --check . && mypy app
 pytest
+python -m eval.run --suite rag && python -m eval.run --suite agent   # 评测阈值不达标也阻断
 docker compose -f docker-compose.dev.yml config -q   # yaml 合法
 ```
 

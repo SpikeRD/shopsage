@@ -41,7 +41,7 @@ result = await graph.ainvoke(initial_state, config={"configurable": {"thread_id"
 1. 定义 `GraphState`（TypedDict 字段清单）。
 2. 写 `builder.py`：`StateGraph` → `add_node`（六个 agent）→ `add_conditional_edges`（按 route）→ `compile(checkpointer=...)`。
 3. 接 Postgres checkpointer（`langgraph-checkpoint-postgres`）。
-4. 写最小可跑链路：router → data → synthesis 先通，再补 rag/analysis/guardrail。
+4. 写最小可跑链路：router → data → synthesis 先通，guardrail 在 router 后 / synthesis 后横切接入（第 7 步已实现）；rag/analysis 留到第 11 步再补。
 5. 写「断点重放」演示脚本：在某节点人为抛错 → 观察从断点恢复。
 6. 对敏感写操作加 `interrupt`（human-in-the-loop）。
 

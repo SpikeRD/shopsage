@@ -26,21 +26,21 @@
 | # | 模块（文档） | 依赖的前序 | 做完能验证的里程碑 |
 |---|---|---|---|
 | 1 | [config.md](config.md) | 无 | 配置类可加载；`ENV=prod` 缺 key 启动即失败 |
-| 2 | [infra.md](infra.md) 仅开发依赖 | 1 | 本机 `docker compose -f docker-compose.dev.yml up` 起 postgres+pgvector+redis，能连 |
-| 3 | [db.md](db.md) | 1、2 | 8 张表建好 + Alembic 迁移 + 种子数据可查 |
+| 2 | [infra.md](infra.md) 仅开发依赖 | 1 | 本机 `docker compose -f docker-compose.dev.yml up` 起 postgres+pgvector+redis+prometheus+grafana，能连 |
+| 3 | [db.md](db.md) | 1、2 | 8 张业务表建好 + Alembic 迁移 + 种子数据可查（向量表由 rag 后续建） |
 | 4 | [security.md](security.md) | 3（白名单表名来自 schema） | 危险/越权 SQL 测试用例全绿（D1 静态层） |
 | 5 | [llm.md](llm.md) 基础接入 | 1（key） | 能调通一个模型；429 会退避重试（A1 基础） |
 | 6 | [tools.md](tools.md) | 4、3 | 只读查询跑通、写操作被拦、结果行数截断（C1） |
 | 7 | [agents_module.md](agents_module.md) 先做 data→router→synthesis→guardrail | 5、6、4、3 | NL→SQL→校验→合成 四个 Agent 各自单测跑通（D1） |
 | 8 | [graph.md](graph.md) | 7 | router→data→synthesis 有状态图跑通 |
-| 9 | [api.md](api.md) | 8、4（JWT） | **首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答 ✅ |
+| 9 | [api.md](api.md) | 8、4（JWT）、2（redis 限流） | **首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答 ✅ |
 | 10 | [rag.md](rag.md) | 3（pgvector）、5（embedding） | 知识库可检索、结果带溯源 |
 | 11 | [agents_module.md](agents_module.md) 补 rag、analysis | 10、7 | router 能分流到 rag 路径；对内分析可出结论 |
-| 12 | [observability.md](observability.md) | 9、10 | 能从 Grafana 定位慢在哪一步（B1） |
+| 12 | [observability.md](observability.md) | 9、10、2（prometheus/grafana） | 能从 Grafana 定位慢在哪一步（B1） |
 | 13 | [llm.md](llm.md) 加固：熔断 + 多模型降级 | 5、12 | 主模型故障自动降级、用户无感（A3） |
 | 14 | [queue.md](queue.md) | 8、2（redis） | 长任务不阻塞 API、失败进死信、断点重放（A1/A2） |
 | 15 | [cache.md](cache.md) | 10、2（redis） | 语义缓存命中、LLM 成本下降（E1） |
-| 16 | [eval.md](eval.md) | 11、12 | 单 Agent vs 多 Agent 量化对比，进 CI（G1） |
+| 16 | [eval.md](eval.md) | 11、12（进 CI 需 19） | 单 Agent vs 多 Agent 量化对比（G1）；CI 接入由第 19 步接通 |
 | 17 | [mcp.md](mcp.md) | 6、4 | 外部 MCP 客户端能发现并调用工具 |
 | 18 | [web.md](web.md) | 9、11 | 对客/对内两入口 + WebSocket 流式（B2） |
 | 19 | [infra.md](infra.md) 生产部署 + CI/CD | 18、16 | 一键构建镜像并部署到 Linux（上线） |

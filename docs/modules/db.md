@@ -39,7 +39,7 @@ from app.db.session import get_read_engine, get_write_engine      # 读写分离
 ## 6. 开发步骤
 
 1. `docker-compose.dev.yml` 起 `postgres` + 启用 `pgvector` 扩展（见 `infra.md`）。
-2. 写 `app/db/base.py`（DeclarativeBase）+ 8 张表的模型（字段、索引、外键）。
+2. 写 `app/db/base.py`（DeclarativeBase）+ 8 张业务表的模型（字段、索引、外键）。
 3. 写 `session.py`：`create_engine`（带池参数）、`SessionLocal`、`get_db` / `get_read_engine` / `get_write_engine`。
 4. 用 Alembic 建迁移：`alembic init` → 生成首版 → `alembic upgrade head`。
 5. 写 `scripts/seed.py`：插入模拟用户/订单/商品/库存/工单/员工数据（电商场景演示必需）。
@@ -65,7 +65,7 @@ def test_read_write_separation_switch():
 
 ## 8. 验收标准
 
-- [ ] 8 张表建模完成，Alembic 迁移可重复执行（`upgrade` / `downgrade`）。
+- [ ] 8 张业务表建模完成，Alembic 迁移可重复执行（`upgrade` / `downgrade`）（向量表见 `rag.md`）。
 - [ ] 高并发下数据库连接数稳定不超上限（承接 **C1**）。
 - [ ] 对客查询路径所有 SQL 都带行级过滤（承接 **D1**）。
 - [ ] 证据链接：`PR#__` / `压测报告#__`

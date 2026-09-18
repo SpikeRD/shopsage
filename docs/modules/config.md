@@ -4,6 +4,7 @@
 
 集中管理所有运行配置与密钥，让同一份代码能无改动地在「本机开发 / Linux 生产」之间切换。
 只负责**读取和校验**配置，不负责业务逻辑。
+同时从第 1 步就定好「日志规范」（结构化 / 级别 / 脱敏），后续所有模块复用，避免每加一个模块回头补。
 
 ## 2. 对外接口
 
@@ -40,11 +41,12 @@ settings.llm_api_key       # 从环境变量读，永不硬编码
 ## 6. 开发步骤
 
 1. 建 `app/config/__init__.py` + `settings.py`，定义 `Settings(BaseSettings)`。
-2. 字段覆盖：`ENV`、`database_url`、`redis_url`、`llm_primary`、`llm_fallback`、`llm_api_key: SecretStr`、`otel_endpoint`、`langfuse_public_key` 等。
+2. 字段覆盖：`ENV`、`database_url`、`redis_url`、`llm_primary`、`llm_fallback`、`llm_api_key: SecretStr`、`otel_endpoint`、`langfuse_public_key`、`log_level` 等。
 3. 加 `model_validator`：`ENV=prod` 时必须存在 `llm_api_key`、`database_url`，否则 raise。
 4. 覆写 `__repr__` 隐藏敏感字段。
-5. 写 `.env.example`（全部占位符）+ 把 `.env` 加入 `.gitignore`。
-6. 写单测（见下）。
+5. 写 `app/config/logging.py`，定「日志规范」：结构化 JSON、统一 logger 名、敏感字段不打印（配合 `__repr__` 约定）。
+6. 写 `.env.example`（全部占位符）+ 把 `.env` 加入 `.gitignore`。
+7. 写单测（见下）。
 
 ## 7. 测试用例
 

@@ -5,10 +5,13 @@
 统一封装对 LLM 的调用：多模型路由、自动降级、重试、熔断、token/成本计量。
 所有 Agent 一律通过这里调模型，**不允许各处直接 `openai.chat.completions`**。
 
+> ⚠️ 本模块横跨两个阶段：**第 5 步只做基础接入（单模型调通 + 429 退避重试）**；
+> **熔断器 + 多模型降级 + Langfuse 回调留到第 13 步（加固）**。见下方「开发步骤」。
+
 ## 2. 对外接口
 
 ```python
-from app.llm import llm_call
+from app.llm import llm_call, embed
 
 resp = await llm_call(
     messages=[...],
@@ -16,6 +19,9 @@ resp = await llm_call(
     fallback_models=["gpt-4o-mini", "deepseek-chat"],  # 降级链
     max_retries=3,
 )
+
+# embedding 也走 LiteLLM 统一门面，供 rag / cache 使用
+vecs = await embed(texts=["退货政策是什么"], model="text-embedding-3-small")
 ```
 
 ## 3. 依赖
@@ -41,11 +47,21 @@ resp = await llm_call(
 
 ## 6. 开发步骤
 
-1. 写 `app/llm/client.py`：`llm_call()` 封装 litellm + tenacity 重试 + 熔断器。
-2. 配置 fallback 链（主/备/小模型），读自 `config`。
-3. 写降级触发与恢复逻辑（熔断半开探测）。
-4. 接入 Langfuse 回调记录 token/成本。
-5. 写故障演练脚本：手动把主模型设为不可用 → 观察自动降级。
+> **本模块分两阶段，不要一次做完**：第 5 步只做「基础接入」（单模型 + 退避重试），
+> 熔断 + 多模型降级 + Langfuse 留到第 13 步「加固」再做。
+
+**基础接入（第 5 步，先做）**
+
+1. 写 `app/llm/client.py`：`llm_call()` 封装 litellm + tenacity 指数退避重试（带 jitter）。
+2. 单模型调通（读 `config` 的 `llm_primary` / `llm_api_key`），写 429 退避重试测试。
+3. 写 `embed()`：embedding 同样走 LiteLLM 门面，供 `rag.md` / `cache.md` 使用。
+
+**加固（第 13 步，后做）**
+
+4. 配置 fallback 链（主/备/小模型），读自 `config`。
+5. 加熔断器 + 半开探测，写降级触发与恢复逻辑。
+6. 接入 Langfuse 回调记录 token/成本（配合 `observability.md`）。
+7. 写故障演练脚本：手动把主模型设为不可用 → 观察自动降级。
 
 ## 7. 测试用例
 

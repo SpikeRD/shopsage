@@ -31,7 +31,7 @@ def guardrail_node(state: GraphState) -> GraphState: ...
 - `langchain`（SQLDatabaseToolkit 等）+ `llm`（LiteLLM 接入层）
 - `tools/`（SQL 执行器、检索、图表、工单）
 - `security/`（data 执行前校验、synthesis 执行后脱敏、guardrail 合规）
-- `db/`、`rag/`、`cache/`
+- `db/`（第一批 data 需要）、`rag/`、`cache/`（第二批 rag/analysis 需要）
 
 ## 4. 关键设计决策
 
@@ -49,12 +49,21 @@ def guardrail_node(state: GraphState) -> GraphState: ...
 
 ## 6. 开发步骤
 
-1. 先写 `guardrail.py`（最小可用：注入关键词 + LLM 判定双重校验）。
-2. 写 `router.py`：意图分类 prompt + 结构化输出解析 + 权限上下文注入。
-3. 写 `data.py`：接 `SQLDatabaseToolkit` → few-shot → `validate_sql` → 执行 → 报错重试。
-4. 写 `rag.py`：调 `rag/` 检索接口 + rerank + 溯源字段。
-5. 写 `analysis.py`：聚合查询 + 结论生成 + 可选图表数据。
-6. 写 `synthesis.py`：两套角色模板合成。
+> **分两批做，不要一次做完**：第一批（README 第 7 步）先做 `data → router → synthesis → guardrail` 四个，
+> 跑通「NL→SQL→校验→合成」；第二批（README 第 11 步）再补 `rag`、`analysis`。
+
+**第一批（第 7 步，先做 4 个）**
+
+1. 写 `data.py`：接 `SQLDatabaseToolkit` → few-shot → `validate_sql` → 执行 → 报错重试（NL→SQL）。
+2. 写 `router.py`：意图分类 prompt + 结构化输出解析 + 权限上下文注入（分流）。
+3. 写 `synthesis.py`：两套角色模板合成（合成）。
+4. 写 `guardrail.py`：输入/输出双向校验，最小可用 = 注入关键词 + LLM 判定双重校验（校验）。
+
+**第二批（第 11 步，补 2 个）**
+
+5. 写 `rag.py`：调 `rag/` 检索接口 + rerank + 溯源字段。
+6. 写 `analysis.py`：聚合查询 + 结论生成 + 可选图表数据。
+
 7. 每个 Agent 单独写单测（mock LLM，测 prompt 输出解析与分支）。
 
 ## 7. 测试用例
@@ -70,7 +79,8 @@ def test_guardrail_blocks_injection():  # 输入/输出注入都被拦（D2）
 
 ## 8. 验收标准
 
-- [ ] 六个 Agent 均可独立调用、独立测试（不依赖整图跑通）。
+- [ ] 第一批（第 7 步）：data / router / synthesis / guardrail 四个 Agent 可独立调用、独立测试（不依赖整图跑通）。
+- [ ] 第二批（第 11 步）：rag / analysis 补上后，六个 Agent 均可独立调用、独立测试。
 - [ ] Router 分流准确率在 golden set 上达标（配合 `eval.md`）。
 - [ ] Data Agent 生成 SQL 100% 过 `validate_sql`，越权被拦（D1）。
 - [ ] Guardrail 双向拦截注入（D2）。
