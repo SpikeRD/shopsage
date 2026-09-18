@@ -1,0 +1,388 @@
+# 配置实操手册（config / Docker 取值 / 测试）
+
+> 面向开发与运维的**操作指南**。设计原理与踩坑推导见 `docs/modules/config.md`，本文只讲「怎么用、怎么改、怎么验证」。
+>
+> 涉及代码：`app/config/settings.py`、`tests/test_config.py`。本文所有命令均已在本机实测。
+
+---
+
+## 0. 30 秒速查
+
+| 我想… | 命令 / 做法 |
+|---|---|
+| 看当前生效的配置（已掩码） | `python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"` |
+| 改本机开发配置 | 仓库根建 `.env`（从 `.env.example` 复制），改完**重启进程** |
+| 临时改一次，不动文件 | PowerShell: `$env:DATABASE_URL="..."; python -m app...` |
+| 看本机有哪些环境变量可能覆盖我这（只列名，不打印值） | 见 §1.5 |
+| 跑全部测试 | `python -m pytest -q`（**必须在仓库根**） |
+| 只跑某一组测试 | `python -m pytest -q tests/test_config.py -k "mask"` |
+| 排查「改了配置却不生效」 | §1.7 决策树 |
+
+---
+
+## 1. config 从哪里取值 / 怎么改
+
+### 1.1 四个取值来源与优先级
+
+`Settings` 由 pydantic-settings 装配，来源优先级**从高到低**：
+
+```
+① 代码入参  Settings(env="prod", database_url="...")   ← 最高，测试/覆盖用
+② 进程环境变量  os.environ["DATABASE_URL"]
+③ .env 文件    仓库根的 .env（「当前工作目录」相对）
+④ 字段默认值   代码里写死的默认（如 redis_url 的本地默认）
+```
+
+一个字段按 ①→④ 依次找，**先找到的赢**，后面的不再覆盖它。
+
+> ⚠️ 这条优先级是理解一切「配置不生效」问题的钥匙：**环境变量永远压过 `.env`**。
+
+### 1.2 字段总表（字段名 → 环境变量名）
+
+字段名与环境变量名是「同名大写」，大小写不敏感（`case_sensitive=False`），当前没有前缀（`env_prefix` 未设）。
+
+| 字段 | 环境变量 | 默认值 | 敏感性 | prod 要求 |
+|---|---|---|---|---|
+| `env` | `ENV` | `dev` | — | 只接受 `dev` / `prod` |
+| `database_url` | `DATABASE_URL` | `""`（空） | 连接串，密码段掩码 | **必填**，缺失 fail-fast |
+| `redis_url` | `REDIS_URL` | `redis://localhost:6379/0` | 连接串，密码段掩码 | 有默认值 |
+| `llm_primary` | `LLM_PRIMARY` | `gpt-4o-mini` | — | 不得为空/空白 |
+| `llm_fallback` | `LLM_FALLBACK` | `""`（空 = 不启用降级） | — | 非空时不得等于 `llm_primary` |
+| `llm_api_key` | `LLM_API_KEY` | `""` | **密钥，整体掩码** | **必填**，缺失 fail-fast |
+| `otel_endpoint` | `OTEL_ENDPOINT` | `""` | — | 有默认值 |
+| `langfuse_public_key` | `LANGFUSE_PUBLIC_KEY` | `""` | 公开值 | 有默认值 |
+| `langfuse_secret_key` | `LANGFUSE_SECRET_KEY` | `""` | **密钥，整体掩码** | 有默认值 |
+
+补充约定：
+
+- `.env` 里**本表之外的键**（如其他模块的 `EMBEDDING_MODEL`）会被接受并放进 `Settings.__pydantic_extra__`，**不会报错**（`extra="allow"`）。所以各模块可以各自往 `.env` 加键。
+- 未知的**进程环境变量**同样被忽略（进程环境里本来就有 `PATH` 等几十个无关变量）。
+
+### 1.3 日常修改：`.env` 文件（推荐）
+
+```powershell
+# 1) 首次：从模板复制
+Copy-Item .env.example .env
+
+# 2) 按需填写（.env 已在 .gitignore，不会进 Git）
+#    ENV=dev
+#    DATABASE_URL=postgresql://user:password@localhost:5432/shopsage
+#    LLM_API_KEY=sk-...
+
+# 3) 验证是否读到了
+python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+```
+
+生效时机：**`Settings()` 构造时读一次**。因为 `get_settings()` 用 `@lru_cache` 做了进程内单例，改了 `.env` 必须**重启进程**才生效（见 §1.7）。
+
+### 1.4 临时覆盖：进程环境变量
+
+```powershell
+# 只在当前终端会话有效，关掉即失效 —— 推荐的本机临时改法
+$env:DATABASE_URL = "postgresql://user:pw@localhost:5432/shopsage_test"
+$env:LLM_API_KEY  = "sk-test-xxxx"
+python -m pytest -q
+
+# 永久用户级（会影响本机所有项目/所有进程，慎用；且对当前终端不生效，要新开终端）
+setx DATABASE_URL "postgresql://..."
+```
+
+改完记得清掉：
+
+```powershell
+Remove-Item Env:DATABASE_URL
+```
+
+> `setx` 的两个坑（本文实测/查证）：单值上限 1024 字符；会对值做 `%VAR%` 展开 —— 连接串密码里若有 `%40` 这类 URL 编码可能被改写。**含百分号的值请用 `.env` 或 `[Environment]::SetEnvironmentVariable`**。
+
+### 1.5 查看本机环境变量（只列名字，不打印值）
+
+> 直接 `Get-ChildItem Env:` 会把 `LLM_API_KEY` 这类**明文**打到屏幕，可能进日志/截图/聊天记录。**只列名字**：
+
+```powershell
+# 会与本项目字段撞名的那几个（空输出 = 没有冲突）
+'ENV','DATABASE_URL','REDIS_URL','LLM_PRIMARY','LLM_FALLBACK','LLM_API_KEY','OTEL_ENDPOINT','LANGFUSE_PUBLIC_KEY','LANGFUSE_SECRET_KEY' |
+  Where-Object { [Environment]::GetEnvironmentVariable($_,'User') -or [Environment]::GetEnvironmentVariable($_,'Machine') }
+
+# 全部用户级变量名
+[Environment]::GetEnvironmentVariables('User').Keys | Sort-Object
+```
+
+命名提示：本项目未使用 `env_prefix`，所以环境变量名很通用（`ENV`、`DATABASE_URL`）。若本机同时还跑别的项目，**优先用 `.env` 而不是永久环境变量**，避免互相串味。
+
+### 1.6 环境变量 vs `.env` 冲突时会怎样
+
+由于优先级是「环境变量 > `.env`」，同名环境变量会**静默盖掉** `.env`。本项目**不要求你清理环境变量**，而是启动时自动告警：
+
+```
+[WARNING] 配置冲突：进程环境变量 DATABASE_URL 正在覆盖 .env 中的同名值（生效值: postgresql://u:***@prod-host:5432/shopsage）。
+优先级为「环境变量 > .env」，如需以 .env 为准请改环境变量名或调整其值。
+```
+
+规则：
+
+- 只在「两边**都存在**且**值不同**」时告警（值相同不打扰，避免刷噪音）。
+- 告警**绝不打印明文**：连接串只露 host/port/db（排障要的正是这个），密钥整体 `**********`。
+- 未配置日志时，Python 会把 WARNING 打到 stderr，**所以一定看得见**。
+
+### 1.7 排查「我改了配置但没生效」
+
+按顺序问三句：
+
+```
+1) 有没有看到「配置冲突」告警？
+   → 有：环境变量盖住了 .env。用 §1.5 的命令确认，然后三选一：
+        · 删掉该环境变量（Remove-Item Env:XXX / setx XXX ""）
+        · 改 .env 以匹配环境变量的值（承认环境变量为准）
+        · 把字段改名成更专属的名字（长期方案）
+
+2) 是从仓库根运行的吗？
+   → 否：env_file=".env" 是「当前工作目录」相对的，换目录就读不到 .env，
+        且是**静默**退回默认值（不报错）。本仓 `app/` 是源码目录、未安装成包，
+        所以还要求仓库根在 sys.path 上：从子目录跑 python -c 会
+        `ModuleNotFoundError: No module named 'app'`。
+
+3) 进程重启了吗？
+   → 否：get_settings() 是 lru_cache 单例，配置在启动时定型一次。
+        同一进程内改 .env / 环境变量都不会重新读取。
+
+另：Settings 是 frozen 的 —— 运行期 `settings.env = "prod"` 会抛 ValidationError，
+   这是刻意的（防止改名式越权），不是 bug。
+```
+
+---
+
+## 2. Docker 启动时怎么传值
+
+> **现状说明**：仓库目前**还没有** `Dockerfile` / `docker-compose.yml`（按 `docs/modules/infra.md` 的计划，dev compose 属第 2 步、生产 compose 与镜像属第 19 步）。下面是**将要采用**的做法与可直接照抄的示例；落地时以 `infra.md` 的步骤为准。
+
+### 2.1 核心概念：两个 `.env` 不是一回事
+
+这是最容易混淆、也最容易踩坑的一点：
+
+| | 宿主机的 `.env`（仓库根） | compose 的 `env_file:` / `environment:` |
+|---|---|---|
+| 谁读它 | **本机直接跑的 Python 进程**（pydantic 读 `.env` 文件） | **compose 自己**，把值注入容器进程环境 |
+| 生效位置 | 宿主机进程 | 容器内进程的 `os.environ` |
+| 容器里起作用吗 | **不起作用**（`.dockerignore` 排除，镜像里没有 `.env`） | 起作用 |
+| 用途 | 本机开发 | 部署 |
+
+结论：**容器内的 `Settings` 只读环境变量**，因为 `.env` 根本不在镜像里。这正是「本机用 `.env`、容器用环境变量」的分工。
+
+### 2.2 三种传值方式
+
+```bash
+# ① docker run：逐个 -e（临时排查、跑一次性任务最方便）
+docker run --rm \
+  -e ENV=prod \
+  -e DATABASE_URL="postgresql://user:pw@db:5432/shopsage" \
+  -e LLM_API_KEY="$LLM_API_KEY" \
+  shopsage-api:latest
+
+# ② docker run --env-file：从一个文件批量注入（注意这是「容器环境变量文件」）
+docker run --rm --env-file .env.prod shopsage-api:latest
+
+# ③ docker compose（推荐）：environment + env_file 组合
+```
+
+```yaml
+# docker-compose.yml（示例，落地时按 infra.md 第 19 步完善）
+services:
+  api:
+    image: shopsage-api:latest
+    # environment：显式列出、可直接引用宿主 .env 做变量替换、值可读性最好
+    environment:
+      ENV: prod
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      LLM_PRIMARY: gpt-4o-mini
+      LLM_FALLBACK: gpt-4o          # 非空时必须 ≠ LLM_PRIMARY
+      OTEL_ENDPOINT: http://otel-collector:4317
+    # env_file：批量注入，与 environment 同时存在时 environment 覆盖 env_file
+    env_file:
+      - .env.prod                    # 里面放 LLM_API_KEY / LANGFUSE_SECRET_KEY 等密钥
+    depends_on:
+      postgres:
+        condition: service_healthy
+```
+
+```yaml
+# docker-compose.dev.yml（本机只起依赖，代码跑在宿主机 venv）
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shopuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shoppass}
+      POSTGRES_DB: ${POSTGRES_DB:-shopsage}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shopuser}"]
+      interval: 5s
+      retries: 5
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+```
+
+注意 `postgres` 服务里写的是 `${POSTGRES_USER}` 而不是 `$SHOPSAGE_...`：**compose 变量替换读的是宿主机的 `.env`**（即仓库根那个），这是同一份文件承担两个角色的地方。
+
+### 2.3 四条硬规则
+
+1. **密钥不进镜像**：`.dockerignore` 必须排除 `.env`；用 `ARG` 把密钥烧进镜像层同等禁止（`docker history` 能翻出来）。
+2. **不要把宿主 `.env` 挂进容器**（如 `volumes: ./.env:/app/.env`）：那会让密钥落在卷里，也让「容器只读环境变量」这条契约失效。
+3. **生产必须 `ENV=prod`**：只有它才触发 fail-fast 校验（缺 `DATABASE_URL` / `LLM_API_KEY` 直接拒绝启动），并且会对「没有降级链」告警。设成 `prod` 是让错误在**启动时**暴露、而不是在第一个请求时。
+4. **`ENV` 这个变量名**：compose 的 `environment:` 里用 `ENV: prod` 没问题（它只是环境变量名）；但别在 `Dockerfile` 里写 `ENV ENV=prod` —— 可读性差且容易和 shell 变量混淆，部署期注入更清晰。
+
+### 2.4 落地后的验证步骤
+
+```bash
+# 1) 先看渲染结果：确认变量替换成功、没有空的必填项（不会真的启动）
+docker compose config
+
+# 2) 确认镜像里没有 .env、没有密钥
+docker history shopsage-api:latest
+
+# 3) 进容器看注入是否到位（用 dump_for_logging，输出已掩码，可安全贴出来）
+docker compose exec api python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+
+# 4) 故意不传 LLM_API_KEY，确认 fail-fast 生效（应出现 ValidationError 且不含密钥明文）
+docker run --rm -e ENV=prod -e DATABASE_URL="postgresql://u:p@h/db" shopsage-api:latest
+```
+
+> 进阶（超出当前阶段）：需要更强隔离时，用 Docker secrets / 挂载文件而不是环境变量。注意环境变量对容器内**所有**进程可见，包括子进程与崩溃转储；而 secrets 以文件形式挂载、可控权限，且不会出现在 `docker inspect` 里。
+
+---
+
+## 3. `tests/test_config.py` 怎么手动测试
+
+### 3.1 前置条件
+
+- **必须在仓库根目录执行**。`app/` 是源码目录、未安装成包，它靠「当前工作目录」进 `sys.path`（`pyproject.toml` 里已配 `pythonpath = ["."]`、`testpaths = ["tests"]`）。
+- 依赖：`pytest`（`pip install -e ".[dev]"`）。
+
+```powershell
+python -m pytest -q --collect-only tests/test_config.py | Select-Object -Last 2
+# 期望：54 tests collected
+```
+
+### 3.2 常用跑法
+
+```powershell
+# 全部（最常用）
+python -m pytest -q
+
+# 只跑本模块
+python -m pytest -q tests/test_config.py
+
+# 看每个用例名字（排查失败时先看这个）
+python -m pytest -q tests/test_config.py -v
+
+# 按关键字选一组（-k 匹配用例名）
+python -m pytest -q tests/test_config.py -k "mask"          # 掩码相关
+python -m pytest -q tests/test_config.py -k "collision"     # 冲突告警相关
+python -m pytest -q tests/test_config.py -k "frozen"        # 不可变性
+python -m pytest -q tests/test_config.py -k "prod"          # 生产校验相关
+python -m pytest -q tests/test_config.py -k "llm_"          # LLM 路由校验
+
+# 跑单个用例（node id = 文件::函数名）
+python -m pytest -q "tests/test_config.py::test_prod_ok_when_required_present"
+
+# 首次失败即停 + 显示完整堆栈（调试用）
+python -m pytest -q tests/test_config.py -x --tb=long
+
+# 让日志/print 直接出现在终端
+python -m pytest -q tests/test_config.py -s -o log_cli=true --log-cli-level=WARNING
+
+# 把 pydantic 警告当成失败（CI 更严格，用于确认没依赖已弃用行为）
+python -m pytest -q tests/test_config.py -W error::DeprecationWarning -W error::UserWarning
+
+# 关掉 pytest 的缓存插件：受限环境（沙箱）里它会在仓库根建 pytest-cache-files-* 目录
+# 并可能因权限失败刷警告；正常开发机不需要加
+python -m pytest -q -p no:cacheprovider
+```
+
+### 3.3 测试分组速览（54 条）
+
+| 分组（`-k` 关键字） | 覆盖什么 |
+|---|---|
+| `env` / 基础加载 | 从环境变量读值、默认值生效 |
+| `prod` | prod 缺 `DATABASE_URL`/`LLM_API_KEY` 时 fail-fast；`llm_fallback` 缺失只告警 |
+| `repr` / `str` / `dump` / `mask` | 五条泄露出口逐一钉死（`repr`/`str`/f-string/json/`dump_for_logging`）；连接串密码段掩码与边界（密码含未转义 `@`、无密码、空串） |
+| `collision` | 同名环境变量覆盖 `.env` 的告警：值不同才告警、值相同不打扰、大小写、`env_prefix`、非字符串字段、告警不含明文 |
+| `wires_collision_guard` | 端到端确认 `Settings()` 真的调了冲突检测（用 `_env_file=` 指向临时文件） |
+| `frozen` | 字段赋值/新增属性被拒；`model_copy(update=...)` 仍可用 |
+| `dump_for_logging` | 四类金丝雀不泄露；与 json 出口一致；返回可分离副本；不影响功能出口 |
+| `llm_` | `llm_primary` 非空（3 个空值参数化）；`llm_fallback` ≠ primary（含去空格）；首尾空白规范化且落到所有出口；**不**校验模型名是否存在 |
+| `secret_named` | 守卫：名字像密钥的字段必须是 `SecretStr`；守卫自检防空转 |
+| `extra_keys` | `.env` 里其他模块的键不导致启动失败 |
+
+### 3.4 手动验证清单（不看测试代码也能确认功能）
+
+**① 掩码是否真的生效**（期望：看不到真实密码/密钥）
+
+```powershell
+python -c @"
+from pydantic import SecretStr
+from app.config.settings import Settings
+s = Settings(database_url='postgresql://u:REALPASSWORD@h:5432/db', llm_api_key=SecretStr('sk-REALKEY'))
+print('repr      :', repr(s))
+print('str       :', str(s))
+print('json      :', s.model_dump_json())
+print('日志出口  :', s.dump_for_logging())
+print('功能出口  :', s.database_url)          # ← 这里必须是真值，否则连不上库
+"@
+```
+
+**② 冲突告警是否真的会响**（期望：stderr 出现 WARNING，且不含任何明文）
+
+```powershell
+# 用一份临时假 .env 与进程环境变量制造冲突；临时文件写在系统临时区，用完即删
+$probe = Join-Path $env:TEMP "probe-env-check.env"
+Set-Content -LiteralPath $probe -Encoding utf8 -Value "DATABASE_URL=postgresql://u:from-file@localhost:5432/db"
+$env:DATABASE_URL = "postgresql://u:from-os@prod-host:5432/db"
+python -c "import sys; from app.config.settings import Settings; Settings(_env_file=sys.argv[1])" $probe 2>&1
+Remove-Item Env:DATABASE_URL
+Remove-Item -LiteralPath $probe -Force
+# 期望：告警里 DATABASE_URL 被标出、密码显示为 ***、host 显示 prod-host:5432/db（便于判断连的哪个库）
+```
+
+**③ prod fail-fast 是否生效**（期望：报 `ValidationError`，且**不含**密钥原文）
+
+```powershell
+python -c "from app.config.settings import Settings; Settings(env='prod', database_url='postgresql://u:p@h/db', llm_api_key='')"
+```
+
+### 3.5 手动测试的三个坑
+
+1. **本机真实环境变量会掺进来**。测试用 `monkeypatch.setenv` 管理自己设的变量，但**不会**清掉你机器上真实存在的同名变量。例如你已设了 `LANGFUSE_SECRET_KEY`，若 `.env` 里也有同名项且值不同，跑测试时会额外出现「配置冲突」告警 —— 这是**正确行为**，不是测试坏了。要安静输出就临时 `Remove-Item Env:LANGFUSE_SECRET_KEY`（或按 §1.5 确认到底是哪几个）。
+2. **`get_settings()` 有缓存**。自己写临时脚本时，如果先调了 `get_settings()` 再改环境变量，第二次拿到的是**旧实例**。解决办法：重启进程，或
+   ```python
+   from app.config import get_settings
+   get_settings.cache_clear()
+   ```
+   测试文件里因此统一用 `Settings()` 直接构造，而不是 `get_settings()`。
+3. **受限环境（沙箱/容器）里 `tmp_path` 可能不可用**。有 6 条用例用 pytest 的 `tmp_path` 夹具（写临时 `.env`）。若运行环境禁止 `chmod`/目录遍历，pytest 创建临时目录会失败，表现为这 6 条在 **setup 阶段**集体报 `PermissionError [WinError 5]`。**这是环境限制而非代码问题**：其余用例照常通过，且这些用例在普通开发机与 CI 上正常。要绕开可自定义临时根：
+   ```powershell
+   python -m pytest -q --basetemp=.pytest-tmp     # 用完记得删掉 .pytest-tmp
+   ```
+
+### 3.6 本模块的验收基线
+
+```powershell
+# 不含 tmp_path 的用例（48 条）：任何环境都该全绿、退出码 0
+python -m pytest -q tests/test_config.py -k "not (extra_keys or wires_collision or no_collision or read_dotenv)"
+# 期望：48 passed，退出码 0
+```
+
+```powershell
+# 全量 54 条：在普通开发机/CI 上直接跑
+python -m pytest -q
+# 受限环境（禁止 chmod/目录遍历）下，6 条用 tmp_path 的用例会在 setup 阶段报
+# PermissionError [WinError 5] —— 环境限制而非代码问题，用下面的方式给它们一个可用临时根：
+python -m pytest -q --basetemp=.pytest-tmp     # 用完记得删掉 .pytest-tmp
+```
+
+完整计数与证据见 `docs/modules/config.md` 第 8 节。

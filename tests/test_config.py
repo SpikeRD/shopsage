@@ -1,7 +1,7 @@
 """config 模块单测，对应 docs/modules/config.md 第 7 节。"""
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 
 from app.config import Settings
 
@@ -40,3 +40,511 @@ def test_get_settings_is_singleton(monkeypatch):
     a = get_settings()
     b = get_settings()
     assert a is b
+
+
+# --- 信息隔离：逐条堵死泄露出口 ---
+
+
+def test_validation_error_does_not_leak_key(monkeypatch):
+    """fail-fast 报错文本里不能出现密钥原文。
+
+    回归用例：after-validator 抛 ValueError 时，pydantic 默认会把输入 dict
+    回显进 input_value，导致启动失败的日志泄露 api key。
+    """
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("LLM_API_KEY", "sk-LEAK-CANARY-999")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(ValidationError) as exc:
+        Settings()
+    assert "sk-LEAK-CANARY-999" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "render",
+    [
+        lambda s: repr(s),
+        lambda s: str(s),
+        lambda s: f"{s}",
+        lambda s: s.model_dump_json(),
+        lambda s: repr(s.model_dump(mode="json")),
+    ],
+    ids=["repr", "str", "fstring", "dump_json", "dump_json_mode"],
+)
+def test_no_leak_through_display_and_boundary_exits(monkeypatch, render):
+    """显示出口 + 跨边界序列化出口，都不得泄露任何密钥。
+
+    回归用例：pydantic 的 BaseModel.__str__ 不调用自定义 __repr__，
+    最初只覆写 __repr__ 时，str()/f-string/json 三条出口全部泄露连接串密码。
+    """
+    monkeypatch.setenv("LLM_API_KEY", "sk-LEAK-CANARY-999")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:DB-CANARY-111@localhost:5432/db")
+    monkeypatch.setenv("REDIS_URL", "redis://:REDIS-CANARY-222@localhost:6379/0")
+    out = render(Settings())
+    for canary in ("sk-LEAK-CANARY-999", "DB-CANARY-111", "REDIS-CANARY-222"):
+        assert canary not in out, f"{canary} 从渲染出口泄露了"
+
+
+def test_python_dump_is_intentionally_a_functional_exit(monkeypatch):
+    """契约固定：python 模式 model_dump() 返回真值，属功能出口，禁止直接打日志。
+
+    真值必须拿得到，否则连不上数据库；这条测试把「有意为之」钉住，
+    防止以后有人误判为漏洞而把功能改坏。
+    """
+    raw = "postgresql://u:dbsecret@localhost:5432/db"
+    monkeypatch.setenv("DATABASE_URL", raw)
+    s = Settings()
+    assert s.model_dump()["database_url"] == raw
+
+
+def test_secret_requires_explicit_access(monkeypatch):
+    """默认拿到的是 SecretStr 对象，取值必须显式调用 get_secret_value()。"""
+    monkeypatch.setenv("LLM_API_KEY", "sk-secret-123")
+    s = Settings()
+    assert isinstance(s.llm_api_key, SecretStr)
+    assert s.llm_api_key.get_secret_value() == "sk-secret-123"
+
+
+# --- 连接串密码段掩码（database_url / redis_url） ---
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("postgresql://u:p@localhost:5432/db", "postgresql://u:***@localhost:5432/db"),
+        (
+            "postgresql+asyncpg://user:s3cr3t@db.internal:5432/x",
+            "postgresql+asyncpg://user:***@db.internal:5432/x",
+        ),
+        ("redis://:onlypass@localhost:6379/0", "redis://:***@localhost:6379/0"),
+        ("postgresql://user:p%40ss@host/db", "postgresql://user:***@host/db"),
+        ("mysql://root:pw@[::1]:3306/db", "mysql://root:***@[::1]:3306/db"),
+        # 密码含未转义的 @：必须整段吃掉，不能只掩码前半段而漏出后半段
+        ("postgresql://user:p@ss@word@host/db", "postgresql://user:***@host/db"),
+        # 无密码 / 无凭据 / 空串：不做无意义的掩码
+        ("postgresql://u@localhost:5432/db", "postgresql://u@localhost:5432/db"),
+        ("redis://localhost:6379/0", "redis://localhost:6379/0"),
+        ("", ""),
+    ],
+)
+def test_url_password_masking(raw, expected):
+    from app.config.settings import _mask_url_password
+
+    assert _mask_url_password(raw) == expected
+
+
+def test_repr_masks_url_passwords_but_keeps_debug_info(monkeypatch):
+    """连接串密码要掩码，但 host/port/db 必须保留，否则排障时看不出连的哪。"""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:dbsecret@localhost:5432/shopsage")
+    monkeypatch.setenv("REDIS_URL", "redis://:redissecret@localhost:6379/0")
+    r = repr(Settings())
+    assert "dbsecret" not in r
+    assert "redissecret" not in r
+    assert "postgresql://u:***@localhost:5432/shopsage" in r
+    assert "redis://:***@localhost:6379/0" in r
+
+
+def test_masking_is_display_only(monkeypatch):
+    """脱敏只作用于显示：字段真值必须原样保留，否则生产就连不上库了。"""
+    raw = "postgresql://u:dbsecret@localhost:5432/db"
+    monkeypatch.setenv("DATABASE_URL", raw)
+    s = Settings()
+    assert s.database_url == raw
+    assert "dbsecret" in s.database_url
+
+
+# --- 守卫：名字像密钥的字段必须声明为 SecretStr ---
+
+_SECRET_NAME_HINTS = ("key", "password", "passwd", "secret", "token", "credential")
+# 本就是公开值、允许不是 SecretStr 的字段（如 Langfuse 的 public key）
+_PUBLIC_BY_DESIGN = frozenset({"langfuse_public_key"})
+
+
+def _audit_secret_named_fields(model) -> list[tuple[str, object]]:
+    """返回「名字像密钥、类型却不是 SecretStr」的字段清单。"""
+    offenders = []
+    for name, field in model.model_fields.items():
+        if name in _PUBLIC_BY_DESIGN:
+            continue
+        if not any(h in name.lower() for h in _SECRET_NAME_HINTS):
+            continue
+        if field.annotation is not SecretStr:
+            offenders.append((name, field.annotation))
+    return offenders
+
+
+def test_secret_named_fields_must_be_secret_str():
+    """守卫：否则新加一个 smtp_password: str 就会静默裸奔。"""
+    offenders = _audit_secret_named_fields(Settings)
+    assert not offenders, (
+        f"这些字段名字像密钥但不是 SecretStr: {offenders}。"
+        "要么改成 SecretStr，要么登记进 _PUBLIC_BY_DESIGN 说明它确实是公开值。"
+    )
+
+
+def test_audit_guard_actually_catches_violations():
+    """守卫有效性自检：故意造违规模型，确认抓得出来（防止守卫空转）。"""
+
+    class _BadConfig(BaseModel):
+        smtp_password: str = ""
+        api_token: str = ""
+        langfuse_public_key: str = ""  # 公开值，应被豁免
+
+    caught = dict(_audit_secret_named_fields(_BadConfig))
+    assert set(caught) == {"smtp_password", "api_token"}
+
+
+# --- 冲突告警：OS 环境变量静默覆盖 .env ---
+#
+# 背景：优先级是「环境变量 > .env」，所以 Windows 用户级环境变量（setx / 「系统属性
+# → 环境变量」里配的）会静默盖掉项目 .env 的同名项，表现为「我明明改了 .env，
+# 配置却没变」。这里把静默变成显式告警，从而**不必清除或迁就 OS 环境变量**。
+#
+# 本组用例用 caplog 断言（logger 的 propagate 为 True，caplog 能正常收到）。
+
+
+def test_env_collision_emits_warning_and_masks(caplog):
+    """同名环境变量与 .env 值不同 → 告警，且两个值都不出现在告警里。
+
+    注意 `dotenv` 参数用**字段名**作键（DotEnvSettingsSource 的解析结果），
+    不是环境变量名。
+    """
+    from app.config.settings import _warn_on_env_collisions
+
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        _warn_on_env_collisions(
+            field_values={
+                "database_url": "postgresql://u:OS-CANARY-111@prod-host:5432/db",
+                "llm_api_key": SecretStr("sk-OS-CANARY-222"),
+            },
+            dotenv={
+                "database_url": "postgresql://u:FILE-CANARY-333@localhost:5432/db",
+                "llm_api_key": "sk-FILE-CANARY-444",
+            },
+            env={
+                "DATABASE_URL": "postgresql://u:OS-CANARY-111@prod-host:5432/db",
+                "LLM_API_KEY": "sk-OS-CANARY-222",
+            },
+            env_prefix="",
+            case_sensitive=False,
+        )
+
+    joined = " | ".join(r.getMessage() for r in caplog.records)
+    assert "DATABASE_URL" in joined and "LLM_API_KEY" in joined
+    for canary in (
+        "OS-CANARY-111",
+        "FILE-CANARY-333",
+        "sk-OS-CANARY-222",
+        "sk-FILE-CANARY-444",
+    ):
+        assert canary not in joined, f"{canary} 从冲突告警里泄露了"
+    # 连接串保留 host/db，方便判断「生效的到底连哪个库」
+    assert "prod-host:5432/db" in joined
+
+
+def test_env_collision_silent_when_values_equal(caplog):
+    """值相同 → 不告警：否则开发机上同名同值会天天刷噪音。"""
+    from app.config.settings import _warn_on_env_collisions
+
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        _warn_on_env_collisions(
+            field_values={"redis_url": "redis://localhost:6379/0"},
+            dotenv={"redis_url": "redis://localhost:6379/0"},
+            env={"REDIS_URL": "redis://localhost:6379/0"},
+            env_prefix="",
+            case_sensitive=False,
+        )
+    assert not caplog.records
+
+
+def test_env_collision_silent_when_only_one_side_present(caplog):
+    """只有一边有 → 不告警（不存在覆盖关系）。"""
+    from app.config.settings import _warn_on_env_collisions
+
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        _warn_on_env_collisions(
+            field_values={"otel_endpoint": "http://localhost:4317"},
+            dotenv={"otel_endpoint": "http://localhost:4317"},
+            env={},
+            env_prefix="",
+            case_sensitive=False,
+        )
+        _warn_on_env_collisions(
+            field_values={"langfuse_public_key": "pk-1"},
+            dotenv={},
+            env={"LANGFUSE_PUBLIC_KEY": "pk-1"},
+            env_prefix="",
+            case_sensitive=False,
+        )
+    assert not caplog.records
+
+
+def test_env_collision_respects_prefix_and_case_insensitive(caplog):
+    """env_prefix 参与对账；名字大小写不同仍是同一个变量（Windows 语义）。"""
+    from app.config.settings import _warn_on_env_collisions
+
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        _warn_on_env_collisions(
+            field_values={"llm_api_key": SecretStr("sk-os")},
+            dotenv={"llm_api_key": "sk-file"},
+            env={"shopsage_llm_api_key": "sk-os"},
+            env_prefix="SHOPSAGE_",
+            case_sensitive=False,
+        )
+    assert len(caplog.records) == 1
+    assert "SHOPSAGE_LLM_API_KEY" in caplog.records[0].getMessage()
+    assert "sk-os" not in caplog.records[0].getMessage()
+
+
+def test_env_collision_skips_non_string_fields(caplog):
+    """非字符串字段不与 .env 原文对账，且绝不能抛异常。"""
+    from app.config.settings import _warn_on_env_collisions
+
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        _warn_on_env_collisions(
+            field_values={"env": "dev", "some_list": [1, 2], "some_secret": SecretStr("")},
+            dotenv={"some_list": "x", "some_secret": "x"},
+            env={"SOME_LIST": "x", "SOME_SECRET": "x"},
+            env_prefix="",
+            case_sensitive=False,
+        )
+    assert not caplog.records
+
+
+def test_settings_wires_collision_guard(monkeypatch, tmp_path, caplog):
+    """端到端接线：Settings() 真的会调冲突检测，且优先级仍是「环境变量 > .env」。
+
+    用 `_env_file=` 指向临时 .env，因而不依赖仓库里是否存在 .env。
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DATABASE_URL=postgresql://u:filepass@localhost:5432/db\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:ospass@prod-host:5432/db")
+
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        s = Settings(_env_file=env_file)
+
+    joined = " | ".join(r.getMessage() for r in caplog.records)
+    assert "DATABASE_URL" in joined, "冲突检测没有被 Settings 调用"
+    assert "filepass" not in joined and "ospass" not in joined, "告警泄露了密码明文"
+    assert "prod-host:5432/db" in joined, "告警应保留 host/db 便于排障"
+    # 优先级契约：环境变量赢
+    assert s.database_url == "postgresql://u:ospass@prod-host:5432/db"
+
+
+def test_no_collision_warning_when_env_file_absent(monkeypatch, tmp_path, caplog):
+    """没有 .env 可读时零输出、零影响（不制造噪音、不影响取值）。"""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        s = Settings(_env_file=tmp_path / "definitely-missing.env")
+
+    assert not caplog.records
+    assert s.database_url == "postgresql://u:p@localhost:5432/db"
+
+
+# --- .env 原文读取（冲突检测的对账基础） ---
+
+
+def test_read_dotenv_values_reads_file(tmp_path):
+    from app.config.settings import _read_dotenv_values
+
+    p = tmp_path / ".env"
+    p.write_text("A=1\nB=two\n# 注释\nC=\n", encoding="utf-8")
+    assert _read_dotenv_values(str(p), "utf-8") == {"A": "1", "B": "two", "C": ""}
+
+
+def test_read_dotenv_values_returns_none_when_unavailable(tmp_path):
+    """不可读 / None / 异常类型一律返回 None —— 检测是尽力而为，不得阻断启动。"""
+    from app.config.settings import _read_dotenv_values
+
+    assert _read_dotenv_values(str(tmp_path / "missing.env"), "utf-8") is None
+    assert _read_dotenv_values(None, "utf-8") is None
+    assert _read_dotenv_values(123, "utf-8") is None
+    assert _read_dotenv_values(object(), "utf-8") is None
+
+
+def test_read_dotenv_values_candidate_list_order(tmp_path):
+    """候选列表：后读到的覆盖先读到的，与 pydantic-settings 的顺序语义一致。"""
+    from app.config.settings import _read_dotenv_values
+
+    first = tmp_path / "first.env"
+    second = tmp_path / "second.env"
+    first.write_text("A=1\nB=first\n", encoding="utf-8")
+    second.write_text("B=second\n", encoding="utf-8")
+
+    assert _read_dotenv_values([str(first), str(second)], "utf-8") == {"A": "1", "B": "second"}
+
+
+def test_extra_keys_are_accepted_not_rejected(tmp_path):
+    """extra="allow"：.env 里属于其他模块的键（如 EMBEDDING_MODEL）不得导致启动失败。
+
+    这是刻意选择：各模块会各自往 .env 加键，本组件不认识就报错，会让「加一个
+    无关配置项」直接崩掉启动。注意 `.env` 的键不会进进程环境变量，所以放宽 extra
+    并没有放宽配置来源。
+    """
+    p = tmp_path / ".env"
+    p.write_text("EMBEDDING_MODEL=text-embedding-3-small\n", encoding="utf-8")
+    s = Settings(_env_file=p)
+    assert (s.__pydantic_extra__ or {}).get("embedding_model") == "text-embedding-3-small"
+
+
+# --- frozen：配置启动即定型，运行期不得改写 ---
+
+
+def test_frozen_rejects_field_assignment():
+    """防「改名式越权」：settings.llm_api_key = ... 必须失败。
+
+    注意抛的是 ValidationError（pydantic 语义），不是 AttributeError。
+    """
+    s = Settings()
+    with pytest.raises(ValidationError):
+        s.env = "prod"
+    with pytest.raises(ValidationError):
+        s.llm_api_key = SecretStr("sk-injected")
+
+
+def test_frozen_rejects_silent_extra_attribute():
+    """防手滑：frozen 下新建属性也失败，避免 `settings.typo = 1` 静默生效。"""
+    s = Settings()
+    with pytest.raises(ValidationError):
+        s.typo_field = 1
+
+
+def test_frozen_still_allows_model_copy():
+    """冻结不阻断「造一个改过的副本」这条正规姿势。"""
+    s = Settings()
+    assert s.model_copy() is not s
+    updated = s.model_copy(update={"env": "prod"})
+    assert updated.env == "prod"
+    assert s.env == "dev", "原实例不得被副本改动影响"
+
+
+# --- dump_for_logging：打日志用的安全出口 ---
+
+
+def test_dump_for_logging_masks_everything_sensitive():
+    """「打印配置」只该走这里；四类金丝雀（两个连接串密码 + 两个密钥）都不出现。"""
+    s = Settings(
+        database_url="postgresql://u:DB-CANARY-111@prod-host:5432/db",
+        redis_url="redis://:REDIS-CANARY-222@localhost:6379/0",
+        llm_api_key=SecretStr("sk-LEAK-CANARY-999"),
+        langfuse_secret_key=SecretStr("lf-CANARY-444"),
+    )
+    dumped = s.dump_for_logging()
+    joined = repr(dumped)
+    for canary in ("DB-CANARY-111", "REDIS-CANARY-222", "sk-LEAK-CANARY-999", "lf-CANARY-444"):
+        assert canary not in joined, f"{canary} 从 dump_for_logging 泄露了"
+    # 保留 host/db：排障要的正是「连的哪个库」
+    assert dumped["database_url"] == "postgresql://u:***@prod-host:5432/db"
+    assert dumped["llm_api_key"] == "**********"
+
+
+def test_dump_for_logging_matches_json_exit():
+    """掩码规则不许漂移：两条安全出口必须是同一套规则（实现上共用）。"""
+    s = Settings(
+        database_url="postgresql://u:p@h:5432/db",
+        llm_api_key=SecretStr("sk-x"),
+    )
+    assert s.dump_for_logging() == s.model_dump(mode="json")
+
+
+def test_dump_for_logging_returns_detached_copy():
+    """返回可变副本：调用方随手改不会污染冻结的实例。"""
+    s = Settings()
+    dumped = s.dump_for_logging()
+    dumped["env"] = "tampered"
+    assert s.env == "dev"
+
+
+def test_functional_exit_unaffected_by_safe_helper():
+    """加了安全出口不等于把功能出口关掉：python 模式 model_dump() 仍是真值。"""
+    raw = "postgresql://u:dbsecret@localhost:5432/db"
+    s = Settings(database_url=raw)
+    assert s.model_dump()["database_url"] == raw
+    assert "dbsecret" not in repr(s.dump_for_logging())
+
+
+# --- llm 路由字段的形状校验 ---
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_llm_primary_must_not_be_blank(blank):
+    """主模型为空 = 调用必然失败，且发生在请求路径上 → 启动即拦。"""
+    with pytest.raises(ValidationError):
+        Settings(llm_primary=blank)
+
+
+def test_llm_fallback_must_differ_from_primary():
+    """备模型等于主模型 → 「降级」变成重复打同一个模型，静默丧失可用性收益。"""
+    with pytest.raises(ValidationError):
+        Settings(llm_fallback="gpt-4o-mini")  # 默认 primary
+    with pytest.raises(ValidationError):
+        Settings(llm_fallback="  gpt-4o-mini  ")  # 去空格后仍相等
+
+
+def test_llm_fallback_empty_is_legal():
+    """空 fallback 是合法语义「不启用降级」，不能在启动时报错。"""
+    assert Settings(llm_fallback="").llm_fallback == ""
+
+
+def test_llm_model_names_are_stripped():
+    """首尾空白会被规范化：避免 " gpt-4o " 这种模型名到调用时才炸。"""
+    s = Settings(llm_primary="  gpt-4o  ", llm_fallback="  gpt-4o-mini  ")
+    assert s.llm_primary == "gpt-4o"
+    assert s.llm_fallback == "gpt-4o-mini"
+
+
+def test_llm_normalization_applies_to_every_exit():
+    """规范化必须落到 __dict__，否则会出现「属性是 A、JSON 出口是 B」的隐性不一致。
+
+    回归：frozen 下用 object.__setattr__ 在 after-validator 里改值，
+    需要确认序列化器读到的是改后的值（而不是 after-validator 之前的快照）。
+    """
+    s = Settings(llm_primary="  gpt-4o  ")
+    assert s.__dict__["llm_primary"] == "gpt-4o"
+    assert s.model_dump()["llm_primary"] == "gpt-4o"
+    assert '"llm_primary":"gpt-4o"' in s.model_dump_json()
+    assert s.dump_for_logging()["llm_primary"] == "gpt-4o"
+    assert "'llm_primary': 'gpt-4o'" in repr(s)
+
+
+def test_llm_validation_does_not_check_model_existence():
+    """刻意不校验模型名是否被厂商认识 —— 那是替 litellm 维护它的模型表。
+
+    任何非空且互不相同的名字都必须放行（包括尚不存在的名字）。
+    """
+    s = Settings(llm_primary="totally-made-up-model-xyz", llm_fallback="another-made-up")
+    assert s.llm_primary == "totally-made-up-model-xyz"
+
+
+def test_prod_without_fallback_warns_but_starts(caplog):
+    """prod 无降级链 → 告警而非 fail-fast（降级链也可能由代码内置）。"""
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        s = Settings(
+            env="prod",
+            database_url="postgresql://u:p@localhost:5432/db",
+            llm_api_key=SecretStr("sk-LEAK-CANARY-999"),
+        )
+    assert s.env == "prod"
+    joined = " | ".join(r.getMessage() for r in caplog.records)
+    assert "llm_fallback" in joined
+    assert "sk-LEAK-CANARY-999" not in joined, "告警泄露了密钥"
+    # 回归：这条日志没有 %-插值参数，百分号必须按字面印出（曾误写 %%，输出成 99.9%%）
+    assert "99.9%" in joined and "99.9%%" not in joined
+
+
+def test_prod_with_fallback_does_not_warn(caplog):
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        Settings(
+            env="prod",
+            database_url="postgresql://u:p@localhost:5432/db",
+            llm_api_key=SecretStr("sk-x"),
+            llm_fallback="gpt-4o",
+        )
+    assert not [r for r in caplog.records if "llm_fallback" in r.getMessage()]
+
+
+
+
+

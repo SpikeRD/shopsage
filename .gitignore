@@ -16,6 +16,8 @@ env/
 
 # 测试 / 工具缓存
 .pytest_cache/
+# 受限环境（沙箱）下 pytest 可能在此建临时目录且无法清理，见 docs/config-guide.md §3.2
+pytest-cache-files-*/
 .mypy_cache/
 .ruff_cache/
 .coverage

@@ -34,6 +34,11 @@ docker compose up -d
 ## 5. 核心技术点（要懂为什么）
 
 - **多阶段构建（multi-stage）**：Python 镜像用 `python:3.11-slim` 装依赖 → 复制代码，最后只留运行所需层，镜像体积小、攻击面小。
+- **`.env` 只服务本机开发，容器里一律走环境变量**（与 `config.md` 的「同名变量会覆盖 .env」配套）：
+  - 本机开发：`docker-compose.dev.yml` 只起依赖（postgres/redis/…），代码跑在本机 venv，配置来自项目 `.env`。
+  - 容器运行：用 compose 的 `environment` / `env_file` 在**运行时**注入，`.dockerignore` 排除 `.env` → 镜像里没有任何配置文件。此时 `Settings` 只读进程环境变量（`.env` 不存在，冲突检测自然跳过，零噪音）。
+  - 于是两侧的「同名覆盖」问题各自有明确归属：本机由 `config.md` 的启动告警兜住；容器里环境变量本就是唯一来源，不存在覆盖。
+  - ⚠️ 反例：不要为了「让容器内也能读 .env」而把 `.env` 打进镜像或挂到 `WORKDIR` —— 那会把密钥固化进镜像层与卷，违背第 4 节第 4 条。
 - **`.dockerignore`**：排除 `.env` / `.git` / `__pycache__` / `venv`，避免把密钥和垃圾打进构建上下文。
 - **healthcheck**：给 postgres/redis/api 配 `healthcheck`，compose 用 `depends_on: condition: service_healthy` 保证启动顺序，避免 API 先于数据库起来连不上。
 - **为什么 worker 单独一个服务**：Arq 异步任务是常驻进程，和 API 独立扩缩、独立重启（架构第 8 节「按层独立扩缩」）。
