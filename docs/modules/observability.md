@@ -1,0 +1,65 @@
+# observability — 可观测性三件套（OTEL + Langfuse + Prometheus/Grafana）
+
+## 1. 职责
+
+回答三个问题：**慢在哪**（链路追踪）、**健康吗**（指标）、**花多少钱/质量如何**（成本与质量）。
+是 B1「P99 高但不知道慢在哪」的解药，也是所有 problem-solving 条目「量化证据」的来源。
+
+## 2. 对外接口
+
+```python
+from app.observability.metrics import AGENT_DURATION, SQL_DURATION, REQUEST_COUNT
+from app.observability.tracing import trace_node, trace_tool, trace_llm
+from app.observability.langfuse_cb import langfuse_handler
+```
+
+## 3. 依赖
+
+- `opentelemetry`（SDK + exporter）→ 采集链路
+- `prometheus-client`（暴露 `/metrics`）
+- `langfuse`（回调记录 token/耗时/成本/质量）
+- `grafana` + `prometheus`（`infra.md` 里起）
+
+## 4. 关键设计决策
+
+1. **埋点粒度 = 架构第 7 节**：每个 Agent 节点、每次工具调用、每次 LLM 调用、每次向量检索都埋点——「慢在哪一步」直接定位。
+2. **三个工具各管一摊，不互相替代**：OTEL 管「调用链/依赖关系」，Prometheus 管「聚合指标/告警」，Langfuse 管「LLM 专用：token/成本/答案质量」。
+3. **指标用 histogram 而非平均值**：`AGENT_DURATION` 用 histogram 记录 P50/P95/P99，平均值会掩盖长尾（B1 的关键）。
+
+## 5. 核心技术点（要懂为什么）
+
+- **为什么分位数比均值重要**：一个 P99=10s、均值=200ms 的系统，看均值会以为「很健康」，实际最差 1% 用户已经气走了。
+- **trace 的父子 span**：一个请求 = 根 span，节点/工具/LLM = 子 span；看火焰图就能知道时间花在哪个 span。
+- **Langfuse 记「质量」**：除 token/耗时外，可记录人工评分/评测得分，把「成本」和「质量」关联（配合 `eval.md`）。
+- **Grafana 面板设计**：黄金指标（QPS/P99/错误率）+ 分 Agent 耗时 + 队列深度（`queue.md`）。
+
+## 6. 开发步骤
+
+1. 写 `metrics.py`：定义计数器/histogram，注册 Prometheus collector。
+2. 写 `tracing.py`：OTEL tracer + 节点/工具/LLM 埋点装饰器。
+3. 写 `langfuse_cb.py`：Langfuse handler 接入 `llm.md` 的调用。
+4. `infra.md` 起 prometheus + grafana，配 scrape 目标与面板。
+5. 压测一次，验证能从 Grafana 定位到具体瓶颈节点。
+
+## 7. 测试用例
+
+```python
+def test_metrics_exposed():
+    # GET /metrics 返回 request_count / agent_duration / sql_duration
+
+def test_trace_spans_recorded():
+    # 一次请求产生 根span + 各节点/工具/LLM 子span
+
+def test_langfuse_records_tokens():
+    # LLM 调用后 Langfuse 有 token/耗时/cost 记录
+
+def test_histogram_has_p99():
+    # agent_duration histogram 能算出 P99（而非只有均值）
+```
+
+## 8. 验收标准
+
+- [ ] 每个 Agent 节点 / 工具 / LLM / 检索都有埋点（B1）。
+- [ ] Grafana 能看到分 Agent 耗时、P99、队列深度；能定位到具体瓶颈。
+- [ ] Langfuse 记录 token/成本，支撑 `cache.md`、`eval.md` 的量化对比。
+- [ ] 证据链接：`Grafana 面板#__` / `PR#__`

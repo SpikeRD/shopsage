@@ -1,0 +1,70 @@
+# rag — 文档解析 / 分块 / embedding / 增量索引（RAG 检索层）
+
+## 1. 职责
+
+把内部知识库（退换货政策、产品手册、操作流程、FAQ）变成可检索的向量索引，并对外提供「混合检索 + rerank + 溯源」能力。
+只管「怎么存、怎么查」，不管「怎么用结果合成答案」（那是 `agents_module.md` 的 RAG Agent）。
+
+## 2. 对外接口
+
+```python
+from app.rag.ingest import ingest_document, reindex_document, delete_document
+from app.rag.retriever import hybrid_search   # 混合检索：向量 + 关键词 + rerank
+
+hits = hybrid_search(query="退货政策", top_k=5)
+# hits: [{"text":..., "source":..., "chunk_id":..., "score":...}, ...]
+```
+
+## 3. 依赖
+
+- `llama-index`（解析、分块、索引、检索链）+ `pgvector`（向量存储）
+- `db/`（pgvector 表与业务库同库，见 `db.md`）
+- 一个 embedding 模型（经 LiteLLM 接入，见 `llm.md`）+ 一个 rerank 模型
+
+## 4. 关键设计决策
+
+1. **混合检索（hybrid）而非纯向量**：向量检索对「语义相近」好，对「精确词/编号/政策条款号」差；关键词检索（BM25）互补。两者召回后做 RRF 融合（Reciprocal Rank Fusion）。
+2. **rerank 只取 top-k 精华**：初召回拿 20~30 条，rerank 精排后只取 top-k 送 LLM，省 token、降噪（E2）。
+3. **增量索引而非全量重建**：文档变更只对受影响 chunk 重新 embedding + upsert，旧向量标记失效（F1）。
+4. **chunk 粒度按文档类型定**：政策类按条款切、手册类按章节切、FAQ 一条一 chunk；chunk 太小丢上下文，太大稀释语义。
+
+## 5. 核心技术点（要懂为什么）
+
+- **embedding 的「相似度」不等于「相关度」**：向量近 ≠ 真的答得上，所以必须 rerank 二次排序，用交叉编码器逐对打分。
+- **chunk 要带 metadata**：`source / 章节 / 页码 / 更新时间`，溯源和增量更新都靠它。
+- **增量索引的「失效」处理**：旧 chunk 不能直接删（可能被引用），标 `is_active=False` + `updated_at`，检索时过滤。
+- **为什么强时效数据不进向量库**：订单/库存要实时查库（`agents_module.md` Data Agent），不进 RAG；语义缓存对它们也禁用（`cache.md`）。
+
+## 6. 开发步骤
+
+1. 建 pgvector 表（`chunks(id, text, embedding vector(n), source, chunk_id, is_active, updated_at)`）+ IVFFlat/HNSW 索引。
+2. 写 `ingest.py`：文档解析（PDF/MD/HTML）→ 分块 → embedding → upsert。
+3. 写 `retriever.py`：向量检索（pgvector ANN）+ 关键词检索（BM25/`tsvector`）→ RRF 融合 → rerank。
+4. 写 `sync.py`：监听文档变更 → 增量 reindex（F1）。
+5. 写 `scripts/load_knowledge_base.py`：灌入示例政策/FAQ 数据。
+
+## 7. 测试用例
+
+```python
+def test_ingest_then_retrieve():
+    ingest_document("退货政策.pdf")
+    hits = hybrid_search("7天无理由退货")
+    assert hits and hits[0].source == "退货政策.pdf"
+
+def test_incremental_update():
+    reindex_document("退货政策.pdf", new_chunks)
+    assert 旧 chunk 被标 is_active=False，新 chunk 可检索到
+
+def test_hybrid_beats_vector_only():
+    # 对含精确条款号的查询，混合检索召回 > 纯向量召回
+
+def test_citation_present():
+    assert all(h.source for h in hybrid_search("FAQ: 如何修改地址"))
+```
+
+## 8. 验收标准
+
+- [ ] 知识库可检索且答案带溯源（source/chunk_id）。
+- [ ] 增量更新后，新内容在约定延迟内可见（F1，如 < 1min）。
+- [ ] rerank 后 top-k 上下文更精简，token 下降且质量不降（E2）。
+- [ ] 证据链接：`PR#__` / `eval/report#__`

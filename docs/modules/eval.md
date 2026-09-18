@@ -1,0 +1,56 @@
+# eval — 评测体系（Ragas + golden dataset + 单/多 Agent 对比）
+
+## 1. 职责
+
+用「可复现的评测」回答「这次改动是变好还是变坏」（G1）：建 golden dataset、跑 Ragas 指标、做单 Agent vs 多 Agent 对比，并把评测纳入 CI。
+
+## 2. 对外接口
+
+```bash
+python -m eval.run --suite rag          # 跑 RAG 评测（Recall/Faithfulness/Answer Relevance）
+python -m eval.run --suite agent        # 跑 Agent 成功率 / 多 Agent 对比
+```
+
+## 3. 依赖
+
+- `ragas`（RAG 评测指标）
+- `llm.md`（评测也用 LLM 打分）
+- golden dataset（`eval/datasets/*.json`，真实问题 + 标准答案）
+- 被 `infra.md` 的 CI 调用
+
+## 4. 关键设计决策
+
+1. **golden dataset 用「真实问题 + 标准答案 + 关键事实点」**：覆盖订单/售后/产品/政策/内部报表等意图，答案里标注「必须包含的事实」，便于自动判分。
+2. **指标分层**：检索层看 Recall（召回）、Faithfulness（忠于检索、不编造）、Answer Relevance（答相关）；Agent 层看成功率与关键事实命中率。
+3. **单 Agent vs 多 Agent 对比**：同一 golden set 跑「一个大 prompt 全干」vs「多 Agent 图」，产出量化差距——这是简历上「量化收益」的来源（G1）。
+4. **评测进 CI**：低于阈值即阻断合并，防「悄悄变差」。
+
+## 5. 核心技术点（要懂为什么）
+
+- **Ragas 三指标各测什么**：Recall 测「该检索到的有没有检索到」；Faithfulness 测「答案是否忠于检索结果（不幻觉）」；Answer Relevance 测「答案是否切题」。
+- **为什么要有「标准答案关键事实点」**：纯 LLM 打分不稳定，标注「必须命中的事实」后可用规则 + LLM 双重判分，更可靠。
+- **评测数据要版本化**：golden set 进 Git，问题/答案变更走 review，否则评测基线会漂移。
+
+## 6. 开发步骤
+
+1. 建 `eval/datasets/`：编写 golden dataset（含标准答案关键事实点）。
+2. 写 `eval/rag_eval.py`：跑检索 + Ragas 三指标。
+3. 写 `eval/agent_eval.py`：跑完整图，判成功率 + 事实命中率。
+4. 写 `eval/compare.py`：单 Agent vs 多 Agent 对比报告。
+5. 接入 CI：阈值不达标阻断（`infra.md`）。
+
+## 7. 测试用例
+
+```python
+def test_golden_dataset_schema():        # 每条含 question / reference / key_facts
+def test_ragas_recall_threshold():       # Recall >= 阈值
+def test_faithfulness_no_hallucination():# Faithfulness >= 阈值
+def test_multi_agent_beats_single():     # 多 Agent 成功率 > 单 Agent 成功率
+```
+
+## 8. 验收标准
+
+- [ ] 检索 Recall 从 X% 提到 Y%（G1，量化）。
+- [ ] 多 Agent 方案成功率/质量高于单 Agent（简历上的「量化收益」）。
+- [ ] 评测纳入 CI，低于阈值阻断合并。
+- [ ] 证据链接：`eval/report#__` / `CI 评测#__`

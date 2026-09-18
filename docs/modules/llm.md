@@ -1,0 +1,72 @@
+# llm — LLM 接入层（LiteLLM 多模型路由 / 重试 / 熔断）
+
+## 1. 职责
+
+统一封装对 LLM 的调用：多模型路由、自动降级、重试、熔断、token/成本计量。
+所有 Agent 一律通过这里调模型，**不允许各处直接 `openai.chat.completions`**。
+
+## 2. 对外接口
+
+```python
+from app.llm import llm_call
+
+resp = await llm_call(
+    messages=[...],
+    model="gpt-4o",                    # 主模型
+    fallback_models=["gpt-4o-mini", "deepseek-chat"],  # 降级链
+    max_retries=3,
+)
+```
+
+## 3. 依赖
+
+- `litellm`（统一多模型接口 + fallback 配置）
+- `tenacity`（指数退避重试，带 jitter）
+- 读 `config` 的 `llm_primary` / `llm_fallback` / `llm_api_key`
+- 被所有 Agent、评测（`eval.md`）调用
+
+## 4. 关键设计决策
+
+1. **LiteLLM 做统一门面**：一套接口调 OpenAI/DeepSeek/Anthropic/本地模型，模型名切换不改业务代码。
+2. **fallback 链 = 主备模型**：主模型 429/5xx/超时 → 自动降级备用模型或小模型，「质量可降级、可用性不降」（A3）。
+3. **指数退避 + jitter**：429 限流时 `min(2^n, cap)` 秒退避 + 随机抖动，避免多副本同时重试形成风暴（A1）。
+4. **熔断器**：连续失败 N 次直接快速失败一段时间，保护下游模型不被打爆，也避免用户长等。
+
+## 5. 核心技术点（要懂为什么）
+
+- **为什么退避要加 jitter**：无抖动时，所有失败请求在同一时刻重试，会瞬间打爆模型形成「惊群」；随机抖动把重试错开。
+- **fallback 的判断边界**：只有「限流/超时/5xx」这类**可恢复错误**才降级；「参数错误/鉴权失败/内容违规」不应降级（降了也没用，还掩盖 bug）。
+- **主备模型的成本/质量权衡**：主模型质量高、贵；备模型便宜、快、质量略低。降级时保留原问题上下文，让备模型也能答到及格线。
+- **统一计费**：每次调用记录 `model / tokens / cost / latency`，汇入 Langfuse（`observability.md`），成本优化靠它。
+
+## 6. 开发步骤
+
+1. 写 `app/llm/client.py`：`llm_call()` 封装 litellm + tenacity 重试 + 熔断器。
+2. 配置 fallback 链（主/备/小模型），读自 `config`。
+3. 写降级触发与恢复逻辑（熔断半开探测）。
+4. 接入 Langfuse 回调记录 token/成本。
+5. 写故障演练脚本：手动把主模型设为不可用 → 观察自动降级。
+
+## 7. 测试用例
+
+```python
+def test_retry_on_429(monkeypatch):
+    # 前两次返回 429，第三次成功 → 断言最终成功且重试了 2 次
+
+def test_fallback_on_timeout(monkeypatch):
+    # 主模型超时 → 自动调 fallback_models[0]，结果返回且标记 downgraded
+
+def test_circuit_breaker_opens():
+    # 连续失败 N 次 → 之后调用立即失败，不再打下游
+
+def test_no_fallback_on_4xx_param_error():
+    # 参数错误(400)不降级、不无限重试
+```
+
+## 8. 验收标准
+
+- [ ] 主模型故障/限流时自动降级，用户无感（A3，可用性 99.9%+）。
+- [ ] 429/超时指数退避重试，压测下零任务丢失（A1）。
+- [ ] 熔断器在连续失败时快速失败，保护下游。
+- [ ] token/成本被统一计量并汇入 Langfuse。
+- [ ] 证据链接：`PR#__` / `故障演练记录#__`
