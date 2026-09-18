@@ -17,29 +17,38 @@
 | 7. 测试用例 | 具体可写的测试（含攻击/异常用例） |
 | 8. 验收标准 | 关联 problem-solving 条目 + 量化指标 + 证据链接空位 |
 
-## 模块清单与建议开发顺序
+## 模块清单与建议开发顺序（按真实依赖关系排序）
 
-> 顺序即 `docs/architecture.md` 第 9 节的「先跑通、再加深」。**按垂直切片推进**，不要水平铺开。
+> 排序三原则：**① 依赖驱动**（前一步是后一步的地基）→ **② 每步结束都能跑能测**（不留半成品）→
+> **③ 先跑通 happy path，再加固/降本**（重试、熔断、缓存、评测都不在第一步就上）。
+> 第 1–9 步走通后，你就拿到了**第一个端到端切片**（HTTP → 图 → Text-to-SQL → 回答），后面都是在这个骨架上加能力。
 
-| 阶段 | 模块文档 | 对应代码位置 | 承接的 problem-solving 条目 |
+| # | 模块（文档） | 依赖的前序 | 做完能验证的里程碑 |
 |---|---|---|---|
-| P0 骨架 | [infra.md](infra.md) —— **仅开发依赖**：`docker-compose.dev.yml`（本机起 postgres/redis） | `infra/` | — |
-| P6 部署 | [infra.md](infra.md) —— **生产部分**：`docker-compose.yml` + Dockerfile + CI/CD | `infra/`、`.github/workflows/` | — |
-| P0 骨架 | [config.md](config.md) | `app/config/` | — |
-| P1 数据 | [db.md](db.md) | `app/db/` | C1 |
-| P1 旗舰 | [security.md](security.md) | `app/security/` | D1、C1 |
-| P1 旗舰 | [agents_module.md](agents_module.md) | `app/agents/` | D1、D2 |
-| P1 旗舰 | [tools.md](tools.md) | `app/tools/` | C1 |
-| P2 编排 | [graph.md](graph.md) | `app/graph/` | A2 |
-| P3 检索 | [rag.md](rag.md) | `app/rag/` | F1、E2 |
-| P4 可靠性 | [llm.md](llm.md) | LiteLLM 接入层 | A1、A3 |
-| P4 可靠性 | [queue.md](queue.md) | `app/queue/` | A1 |
-| P4 可观测 | [observability.md](observability.md) | `app/observability/` | B1 |
-| P5 成本 | [cache.md](cache.md) | `app/cache/` | E1、B2 |
-| P6 接口 | [api.md](api.md) | `app/api/` | B2、D1 |
-| P6 评测 | [eval.md](eval.md) | `eval/` | G1 |
-| P6 前端 | [web.md](web.md) | `web/` | B2 |
-| P6 集成 | [mcp.md](mcp.md) | `app/mcp/` | — |
+| 1 | [config.md](config.md) | 无 | 配置类可加载；`ENV=prod` 缺 key 启动即失败 |
+| 2 | [infra.md](infra.md) 仅开发依赖 | 1 | 本机 `docker compose -f docker-compose.dev.yml up` 起 postgres+pgvector+redis，能连 |
+| 3 | [db.md](db.md) | 1、2 | 8 张表建好 + Alembic 迁移 + 种子数据可查 |
+| 4 | [security.md](security.md) | 3（白名单表名来自 schema） | 危险/越权 SQL 测试用例全绿（D1 静态层） |
+| 5 | [llm.md](llm.md) 基础接入 | 1（key） | 能调通一个模型；429 会退避重试（A1 基础） |
+| 6 | [tools.md](tools.md) | 4、3 | 只读查询跑通、写操作被拦、结果行数截断（C1） |
+| 7 | [agents_module.md](agents_module.md) 先做 data→router→synthesis→guardrail | 5、6、4、3 | NL→SQL→校验→合成 四个 Agent 各自单测跑通（D1） |
+| 8 | [graph.md](graph.md) | 7 | router→data→synthesis 有状态图跑通 |
+| 9 | [api.md](api.md) | 8、4（JWT） | **首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答 ✅ |
+| 10 | [rag.md](rag.md) | 3（pgvector）、5（embedding） | 知识库可检索、结果带溯源 |
+| 11 | [agents_module.md](agents_module.md) 补 rag、analysis | 10、7 | router 能分流到 rag 路径；对内分析可出结论 |
+| 12 | [observability.md](observability.md) | 9、10 | 能从 Grafana 定位慢在哪一步（B1） |
+| 13 | [llm.md](llm.md) 加固：熔断 + 多模型降级 | 5、12 | 主模型故障自动降级、用户无感（A3） |
+| 14 | [queue.md](queue.md) | 8、2（redis） | 长任务不阻塞 API、失败进死信、断点重放（A1/A2） |
+| 15 | [cache.md](cache.md) | 10、2（redis） | 语义缓存命中、LLM 成本下降（E1） |
+| 16 | [eval.md](eval.md) | 11、12 | 单 Agent vs 多 Agent 量化对比，进 CI（G1） |
+| 17 | [mcp.md](mcp.md) | 6、4 | 外部 MCP 客户端能发现并调用工具 |
+| 18 | [web.md](web.md) | 9、11 | 对客/对内两入口 + WebSocket 流式（B2） |
+| 19 | [infra.md](infra.md) 生产部署 + CI/CD | 18、16 | 一键构建镜像并部署到 Linux（上线） |
+
+### 两条可以「提前打草稿、后置落地」的
+
+- **golden dataset**（第 16 步）：从第 4 步开始就可以随手记「真实问题 + 标准答案」，边开发边攒，别等到第 16 步才从零编。
+- **`.env.example` / 日志规范**（第 1、2 步）：一开始就定好，否则后面每加一个模块都要回头补。
 
 ## 三条铁律
 
