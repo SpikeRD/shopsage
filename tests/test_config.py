@@ -2,8 +2,10 @@
 
 import pytest
 from pydantic import BaseModel, SecretStr, ValidationError
+import json
 
 from app.config import Settings
+from app.config import get_settings
 
 
 def test_settings_loads_from_env(monkeypatch):
@@ -14,9 +16,9 @@ def test_settings_loads_from_env(monkeypatch):
 
 def test_prod_requires_llm_key(monkeypatch):
     monkeypatch.setenv("ENV", "prod")
-    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_API_KEY", "")
     with pytest.raises(ValidationError):
-        Settings()
+        print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))
 
 
 def test_secret_not_in_repr(monkeypatch):
@@ -53,7 +55,7 @@ def test_validation_error_does_not_leak_key(monkeypatch):
     """
     monkeypatch.setenv("ENV", "prod")
     monkeypatch.setenv("LLM_API_KEY", "sk-LEAK-CANARY-999")
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "")
     with pytest.raises(ValidationError) as exc:
         Settings()
     assert "sk-LEAK-CANARY-999" not in str(exc.value)
@@ -321,6 +323,7 @@ def test_settings_wires_collision_guard(monkeypatch, tmp_path, caplog):
         encoding="utf-8",
     )
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:ospass@prod-host:5432/db")
+    monkeypatch.setenv("LLM_PRIMARY", "deepseek")
 
     with caplog.at_level("WARNING", logger="app.config.settings"):
         s = Settings(_env_file=env_file)
@@ -336,6 +339,7 @@ def test_settings_wires_collision_guard(monkeypatch, tmp_path, caplog):
 def test_no_collision_warning_when_env_file_absent(monkeypatch, tmp_path, caplog):
     """没有 .env 可读时零输出、零影响（不制造噪音、不影响取值）。"""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("LLM_PRIMARY", "deepseek")
     with caplog.at_level("WARNING", logger="app.config.settings"):
         s = Settings(_env_file=tmp_path / "definitely-missing.env")
 
@@ -376,7 +380,7 @@ def test_read_dotenv_values_candidate_list_order(tmp_path):
     assert _read_dotenv_values([str(first), str(second)], "utf-8") == {"A": "1", "B": "second"}
 
 
-def test_extra_keys_are_accepted_not_rejected(tmp_path):
+def test_extra_keys_are_accepted_not_rejected(tmp_path,monkeypatch):
     """extra="allow"：.env 里属于其他模块的键（如 EMBEDDING_MODEL）不得导致启动失败。
 
     这是刻意选择：各模块会各自往 .env 加键，本组件不认识就报错，会让「加一个
@@ -385,6 +389,7 @@ def test_extra_keys_are_accepted_not_rejected(tmp_path):
     """
     p = tmp_path / ".env"
     p.write_text("EMBEDDING_MODEL=text-embedding-3-small\n", encoding="utf-8")
+    monkeypatch.setenv("LLM_PRIMARY", "deepseek")
     s = Settings(_env_file=p)
     assert (s.__pydantic_extra__ or {}).get("embedding_model") == "text-embedding-3-small"
 
@@ -478,9 +483,9 @@ def test_llm_primary_must_not_be_blank(blank):
 def test_llm_fallback_must_differ_from_primary():
     """备模型等于主模型 → 「降级」变成重复打同一个模型，静默丧失可用性收益。"""
     with pytest.raises(ValidationError):
-        Settings(llm_fallback="gpt-4o-mini")  # 默认 primary
+        Settings(llm_fallback="deepseek")  # 默认 primary
     with pytest.raises(ValidationError):
-        Settings(llm_fallback="  gpt-4o-mini  ")  # 去空格后仍相等
+        Settings(llm_fallback="  deepseek  ")  # 去空格后仍相等
 
 
 def test_llm_fallback_empty_is_legal():

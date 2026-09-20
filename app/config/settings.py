@@ -188,7 +188,7 @@ class Settings(BaseSettings):
 
     # 数据 / 缓存
     database_url: str = ""
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = ""
 
     # LLM（多模型路由：主 + 备）
     llm_primary: str = ""
