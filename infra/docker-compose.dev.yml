@@ -1,0 +1,132 @@
+# ShopSage 开发依赖栈（infra 第 2 步）
+#
+# 定位：**只起依赖服务**（postgres/pgvector、redis、prometheus、grafana），
+# 业务代码跑在本机 venv（infra.md 第 4 节第 2 条：开发期代码不容器化）。
+#
+# 部署位置：VMware-Linux 虚拟机（本机 Windows 只跑代码，通过网络连过来）。
+# 原因见 docs/modules/infra.md「跨主机拓扑」——架构第 9 节本来就是 Windows + Linux 双机。
+#
+# 启动（在【仓库根】执行，让 compose 读到根 .env）：
+#   docker compose -f infra/docker-compose.dev.yml --project-directory . up -d
+# 停止（保留数据）：      加 down
+# 清空重建（连数据一起删）：docker compose ... down -v
+#
+# 注意：下面的 -f 与 --project-directory 两条一起用，compose 才会
+#   ① 把 .env 解析到仓库根（换目录会静默丢变量替换，只剩默认值）
+#   ② 让 named volume 名字稳定为 shopsage_dev_*，不随 -f 路径漂移
+
+name: shopsage-dev
+
+services:
+  # ── PostgreSQL 16 + pgvector ────────────────────────────────────────────────
+  # 用 pgvector 官方镜像而不是 postgres:16 + 启动脚本装扩展：
+  # 扩展已编译进镜像，`CREATE EXTENSION vector` 开箱可用，少一层「初始化脚本失败」
+  # 的隐蔽故障（第 10 步 rag.md 建向量表直接依赖它）。
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: shopsage-dev-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shopuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shoppass}
+      POSTGRES_DB: ${POSTGRES_DB:-shopsage}
+      # 显式钉住 locale/编码：Windows 侧客户端多为 UTF8，避免中文种子数据乱码
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # ⚠️ 必须绑 0.0.0.0（默认值）而不是 127.0.0.1：Windows 宿主机要从外部连进来。
+      # 只想放通 VMware 网段时可设 POSTGRES_BIND_IP=192.168.x.x（写进仓库根 .env）。
+      - "${POSTGRES_BIND_IP:-0.0.0.0}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # ${POSTGRES_USER:-...} 由 compose 在宿主机侧替换，不是容器内变量展开
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shopuser} -d ${POSTGRES_DB:-shopsage}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks: [shopsage-dev]
+
+  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  # 第 9 步（api 限流）、第 14 步（Arq 队列）、第 15 步（语义缓存）都依赖它。
+  redis:
+    image: redis:7-alpine
+    container_name: shopsage-dev-redis
+    restart: unless-stopped
+    # --appendonly yes：会话/队列状态要能扛住容器重启（架构第 8 节「会话外置」）
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_BIND_IP:-0.0.0.0}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [shopsage-dev]
+
+  # ── Prometheus（第 12 步 observability.md 的指标采集端）─────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: shopsage-dev-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      # 允许通过 UI 调 scrape 目标，方便第 12 步现场排查
+      - "--web.enable-lifecycle"
+    ports:
+      - "${PROMETHEUS_BIND_IP:-0.0.0.0}:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      # prom/prometheus 镜像里没有 curl，用官方自带的 promtool 探活
+      test: ["CMD", "promtool", "check", "healthy", "--url=http://localhost:9090"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks: [shopsage-dev]
+
+  # ── Grafana（第 12 步的可视化端）───────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: shopsage-dev-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # 开发期免登录，方便直接从 Windows 浏览器看板子
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_USERS_DEFAULT_THEME: "dark"
+    ports:
+      - "${GRAFANA_BIND_IP:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      # 用 provisioning 自动挂数据源：省掉「手点 UI 加 datasource」这一步，
+      # 第 12 步验收「能从 Grafana 定位慢在哪一步」时开箱即用
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks: [shopsage-dev]
+
+networks:
+  shopsage-dev:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:

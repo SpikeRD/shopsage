@@ -12,6 +12,7 @@
 |---|---|
 | 看当前生效的配置（已掩码） | `python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"` |
 | 改本机开发配置 | 仓库根建 `.env`（从 `.env.example` 复制），改完**重启进程** |
+| 依赖（postgres/redis）连不上 | §2.4（本机无 Docker：容器在 Linux VM，host 填其 IP；`POSTGRES_*` 与 `DATABASE_URL` 必须一致） |
 | 临时改一次，不动文件 | PowerShell: `$env:DATABASE_URL="..."; python -m app...` |
 | 看本机有哪些环境变量可能覆盖我这（只列名，不打印值） | 见 §1.5 |
 | 跑全部测试 | `python -m pytest -q`（**必须在仓库根**） |
@@ -66,7 +67,7 @@ Copy-Item .env.example .env
 
 # 2) 按需填写（.env 已在 .gitignore，不会进 Git）
 #    ENV=dev
-#    DATABASE_URL=postgresql://user:password@localhost:5432/shopsage
+#    DATABASE_URL=postgresql://shopuser:shoppass@192.168.x.x:5432/shopsage   ← host 填 Linux VM 的 IP，不是 localhost
 #    LLM_API_KEY=sk-...
 
 # 3) 验证是否读到了
@@ -154,7 +155,10 @@ Remove-Item Env:DATABASE_URL
 
 ## 2. Docker 启动时怎么传值
 
-> **现状说明**：仓库目前**还没有** `Dockerfile` / `docker-compose.yml`（按 `docs/modules/infra.md` 的计划，dev compose 属第 2 步、生产 compose 与镜像属第 19 步）。下面是**将要采用**的做法与可直接照抄的示例；落地时以 `infra.md` 的步骤为准。
+> **现状说明**：`infra/docker-compose.dev.yml`（含 prometheus/grafana、healthcheck、named volume）**已创建**，属 `docs/modules/infra.md` 第 2 步的产出；**生产 compose 与 `Dockerfile` 仍属第 19 步，尚未落地**。
+> ⚠️ 关键前提：开发机是 **VMware 里的 Windows 客户机，本机没有 Docker**（5432/6379/9090/3000 全无监听）——依赖栈跑在**另一台 VMware-Linux 虚拟机**上，本机只管跑代码 venv，通过网络连过去。**跨主机拓扑（服务/端口/访问地址对照、端口为何必须绑 `0.0.0.0`、防火墙放通）见 `docs/modules/infra.md` §3.1「开发拓扑（跨主机）」**，本节只讲取值怎么传。
+>
+> 因此本节涉及 `docker compose ...` 的命令**都不在开发机上执行**，而在 Linux VM（或 CI runner）上执行，且必须在**仓库根**执行。
 
 ### 2.1 核心概念：两个 `.env` 不是一回事
 
@@ -169,7 +173,7 @@ Remove-Item Env:DATABASE_URL
 
 结论：**容器内的 `Settings` 只读环境变量**，因为 `.env` 根本不在镜像里。这正是「本机用 `.env`、容器用环境变量」的分工。
 
-### 2.2 三种传值方式
+### 2.2 传值方式（三种 + 开发依赖栈的位置）
 
 ```bash
 # ① docker run：逐个 -e（临时排查、跑一次性任务最方便）
@@ -207,36 +211,65 @@ services:
 ```
 
 ```yaml
-# docker-compose.dev.yml（本机只起依赖，代码跑在宿主机 venv）
-services:
-  postgres:
-    image: pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-shopuser}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shoppass}
-      POSTGRES_DB: ${POSTGRES_DB:-shopsage}
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shopuser}"]
-      interval: 5s
-      retries: 5
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+# ④ 开发依赖栈：**以 infra/docker-compose.dev.yml 为准，本节不再复制一份**
+#    （两份真相必然漂移：真实文件里还有 prometheus/grafana 服务、各服务的 healthcheck、
+#      named volume、以及 ${POSTGRES_BIND_IP:-0.0.0.0}:${POSTGRES_PORT:-5432}:5432 这类端口写法）
+#    要改开发依赖的端口/凭据 → 改 infra/ 下那份文件 + 仓库根 .env，不要改本文档。
 ```
 
-注意 `postgres` 服务里写的是 `${POSTGRES_USER}` 而不是 `$SHOPSAGE_...`：**compose 变量替换读的是宿主机的 `.env`**（即仓库根那个），这是同一份文件承担两个角色的地方。
+启动/停止命令（**在 Linux VM 的仓库根执行**，两个参数缺一不可，原因见下一小节）：
 
-### 2.3 四条硬规则
+```bash
+docker compose -f infra/docker-compose.dev.yml --project-directory . up -d
+docker compose -f infra/docker-compose.dev.yml --project-directory . down      # 停止（保留数据）
+docker compose -f infra/docker-compose.dev.yml --project-directory . down -v   # 清空重建
+```
+
+### 2.3 五条硬规则
 
 1. **密钥不进镜像**：`.dockerignore` 必须排除 `.env`；用 `ARG` 把密钥烧进镜像层同等禁止（`docker history` 能翻出来）。
 2. **不要把宿主 `.env` 挂进容器**（如 `volumes: ./.env:/app/.env`）：那会让密钥落在卷里，也让「容器只读环境变量」这条契约失效。
 3. **生产必须 `ENV=prod`**：只有它才触发 fail-fast 校验（缺 `DATABASE_URL` / `LLM_API_KEY` 直接拒绝启动），并且会对「没有降级链」告警。设成 `prod` 是让错误在**启动时**暴露、而不是在第一个请求时。
 4. **`ENV` 这个变量名**：compose 的 `environment:` 里用 `ENV: prod` 没问题（它只是环境变量名）；但别在 `Dockerfile` 里写 `ENV ENV=prod` —— 可读性差且容易和 shell 变量混淆，部署期注入更清晰。
+5. **开发期起依赖必须写全 `-f infra/docker-compose.dev.yml --project-directory .`**（在仓库根执行）：`compose` 文件里写的是 `${POSTGRES_USER}` 这类引用，**变量替换读的是「项目目录」下的 `.env`** —— 也就是仓库根那份；`-f` 一放在子目录，compose 就把项目目录当成了 `infra/`，于是**读不到根 `.env` 且静默退回默认值**（不报错、不告警，症状是「明明填了密码却连不上」）。这与 §1.7 第 2 条「`.env` 是当前工作目录相对、读不到不报错」是同一个坑的两个入口。
 
-### 2.4 落地后的验证步骤
+### 2.4 本机无 Docker 时的取值（开发机 Windows + 依赖在 Linux VM）
+
+本机没有 Docker，容器全在 Linux VM 上，所以「谁读哪份变量」要分得更清 —— 仓库根 `.env` 里的变量被**两套消费者**各读一半：
+
+| 变量组 | 谁读它 | 干什么用 | 写错的表现 |
+|---|---|---|---|
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`、`REDIS_*`、`GRAFANA_*` | **docker compose**（在 Linux VM 上做变量替换） | 初始化容器（首个启动时创建库与用户）+ 端口映射（`${POSTGRES_BIND_IP:-0.0.0.0}:${POSTGRES_PORT:-5432}:5432`） | 容器按默认值建库/占端口，而应用拿另一套凭据去连 → 认证失败 |
+| `DATABASE_URL` / `REDIS_URL` | **应用**（Windows 上的 `Settings`，pydantic 读 `.env`） | 建立连接（host 必须是 Linux VM 的 IP） | host 写成 `localhost` → 连的是开发机自己，必然连接被拒 |
+
+**铁律：两组必须指向同一 host / 凭据 / 端口。只改一边、忘了另一边，就是「连不上库」的头号原因**（例如 compose 用 `${POSTGRES_PASSWORD:-shoppass}` 的默认值建了库，而 `DATABASE_URL` 里写的是 `shopuser:MyRealPw`）。同理，`POSTGRES_DB` 与 `DATABASE_URL` 尾部的库名也必须一致。
+
+改完凭据要注意：`POSTGRES_*` 只在**数据卷为空时**才用于初始化，已经建过库的卷不会因为改了 `.env` 就改密码 —— 这种情况要么 `ALTER USER`，要么 `down -v` 清空重建（数据一起没）。
+
+自查（**在 Linux VM 的仓库根执行**）：
+
+```bash
+# 渲染出真实生效的端口映射，确认变量替换确实吃到了 .env（而不是默认值）
+docker compose -f infra/docker-compose.dev.yml --project-directory . config | grep -E 'published|target'
+
+# 确认容器侧实际拿到的初始化凭据
+# ⚠️ 下面这条会把 POSTGRES_PASSWORD 明文打到屏幕，别贴进日志/截图/聊天记录；
+#    只想核对用户名与库名就收窄成：grep -E 'POSTGRES_(USER|DB)='
+docker inspect shopsage-dev-postgres --format '{{range .Config.Env}}{{println .}}{{end}}' | grep POSTGRES_
+```
+
+再到 Windows 侧核对「应用到底连哪儿」（输出已掩码，可安全贴出；**改了 `.env` 必须重启进程**）：
+
+```powershell
+# 在仓库根执行
+python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+# 看 database_url 的 host:port/db 是否等于 <Linux-IP>:5432/shopsage
+```
+
+### 2.5 落地后的验证步骤
+
+> 下面四条针对**生产 compose / 业务镜像**（`shopsage-api:latest` 等，属 `infra.md` 第 19 步，**目前尚未落地**，因此现在跑不了、也别声称已通过）。
+> 执行位置：Linux 服务器或 CI runner —— 开发机（Windows）没有 Docker。
 
 ```bash
 # 1) 先看渲染结果：确认变量替换成功、没有空的必填项（不会真的启动）
@@ -262,6 +295,9 @@ docker run --rm -e ENV=prod -e DATABASE_URL="postgresql://u:p@h/db" shopsage-api
 
 - **必须在仓库根目录执行**。`app/` 是源码目录、未安装成包，它靠「当前工作目录」进 `sys.path`（`pyproject.toml` 里已配 `pythonpath = ["."]`、`testpaths = ["tests"]`）。
 - 依赖：`pytest`（`pip install -e ".[dev]"`）。
+- **不需要真实数据库 / Redis**：`tests/test_config.py` 的 54 条只验证「配置装配」（取值优先级、掩码、冲突告警、prod 校验、frozen 语义），**没有任何用例建立数据库或 Redis 连接** —— 测试文件只 import `pytest` / `pydantic` / `json` 与 `app.config`，`postgresql://...`、`redis://...` 全部只作为普通字符串参与断言（甚至故意写成不存在的主机名当金丝雀）；被测代码 `app/config/settings.py` 自身也只 import 标准库 + `dotenv` + `pydantic`，**没有引入任何数据库/Redis 驱动**，`Settings()` / `get_settings()` 构造只做字段装配与校验，不发起网络 I/O。
+  **因此：本机没装 Docker、依赖栈没起（当前就是这状态），这批用例照样能跑。** 反过来说，它们**不能**证明数据库/Redis 真的连通 —— 那要靠 `docs/modules/infra.md` §6 的跨主机连通性验证。
+  （受限环境里 6 条用 `tmp_path` 的用例会因临时目录权限在 setup 阶段报 `PermissionError`，属环境限制而非本模块依赖，见 §3.5、§3.6。）
 
 ```powershell
 python -m pytest -q --collect-only tests/test_config.py | Select-Object -Last 2

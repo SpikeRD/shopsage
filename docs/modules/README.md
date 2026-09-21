@@ -4,6 +4,9 @@
 > [`docs/problem-solving.md`](../problem-solving.md)（验收清单）配套使用。
 > 每个模块文档统一采用 **8 段模板**，开发一个模块前先读它对应的文档，开发完按「验收标准」自检并回填证据。
 
+> 🛠 **实操手册**：[`docs/infra-runbook.md`](../infra-runbook.md) —— 本机（VMware-Windows）没有 Docker，
+> 依赖栈跑在 VMware-Linux 虚拟机上。第 2 步的启动顺序、期望输出、故障速查、证据回填格式都在那里面，照抄即可。
+
 ## 8 段模板说明
 
 | 段 | 回答的问题 |
@@ -26,7 +29,7 @@
 | # | 模块（文档） | 依赖的前序 | 做完能验证的里程碑 |
 |---|---|---|---|
 | 1 | [config.md](config.md) | 无 | 配置类可加载；`ENV=prod` 缺 key 启动即失败 |
-| 2 | [infra.md](infra.md) 仅开发依赖 | 1 | 本机 `docker compose -f docker-compose.dev.yml up` 起 postgres+pgvector+redis+prometheus+grafana，能连 |
+| 2 | [infra.md](infra.md) 仅开发依赖 | 1 | 在 VMware-Linux 上用 `docker compose -f infra/docker-compose.dev.yml --project-directory . up -d` 起 postgres+pgvector+redis+prometheus+grafana，Windows 侧能连（本机无 Docker，见 [infra-runbook.md](../infra-runbook.md)） |
 | 3 | [db.md](db.md) | 1、2 | 8 张业务表建好 + Alembic 迁移 + 种子数据可查（向量表由 rag 后续建） |
 | 4 | [security.md](security.md) | 3（白名单表名来自 schema） | 危险/越权 SQL 测试用例全绿（D1 静态层） |
 | 5 | [llm.md](llm.md) 基础接入 | 1（key） | 能调通一个模型；429 会退避重试（A1 基础） |

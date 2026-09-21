@@ -38,7 +38,7 @@ from app.db.session import get_read_engine, get_write_engine      # 读写分离
 
 ## 6. 开发步骤
 
-1. `docker-compose.dev.yml` 起 `postgres` + 启用 `pgvector` 扩展（见 `infra.md`）。
+1. 在 **VMware-Linux 虚拟机**上用 `infra/docker-compose.dev.yml` 起 `postgres` + 启用 `pgvector` 扩展（见 `infra.md` §2、§3.1；本机 Windows 无 Docker，不要在开发机上试）。
 2. 写 `app/db/base.py`（DeclarativeBase）+ 8 张业务表的模型（字段、索引、外键）。
 3. 写 `session.py`：`create_engine`（带池参数）、`SessionLocal`、`get_db` / `get_read_engine` / `get_write_engine`。
 4. 用 Alembic 建迁移：`alembic init` → 生成首版 → `alembic upgrade head`。

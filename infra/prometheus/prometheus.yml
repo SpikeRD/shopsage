@@ -1,0 +1,34 @@
+# Prometheus 采集配置（开发环境）
+#
+# 关键点：Prometheus 跑在 Linux 虚拟机的容器里，而**业务代码跑在 Windows 宿主机**，
+# 所以 scrape target 不能写 "localhost"（那是容器自己）。
+# docker 网桥下，Windows 宿主机的地址是容器的默认网关（通常 172.17.0.1）。
+#
+# 第 12 步（observability.md）落地后，按下面注释解开 API job 即可。
+# 在此之前 metrics_server 尚未实现，保持注释状态，避免 Prometheus 一直刷 target down。
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    env: dev
+    project: shopsage
+
+scrape_configs:
+  # Prometheus 自采：既验证配置生效，也是 Grafana 上「没数据」时的第一手对照
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 业务 API（第 12 步启用）
+  # - job_name: shopsage-api
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ["172.17.0.1:8000"]
+  #       labels:
+  #         service: api
+  #
+  # Arq worker（第 14 步启用，队列深度/失败数在 B1 验收里要看）
+  # - job_name: shopsage-worker
+  #   static_configs:
+  #     - targets: ["172.17.0.1:9100"]

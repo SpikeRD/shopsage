@@ -2,7 +2,8 @@
 name = "shopsage"
 version = "0.1.0"
 description = "电商企业智能助手"
-requires-python = ">=3.11"
+# 开发机实测 3.12.9，口径统一为 3.12（不用 3.11：本机未装 3.11，且 3.12 是当前活跃版本）
+requires-python = ">=3.12"
 dependencies = [
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",
