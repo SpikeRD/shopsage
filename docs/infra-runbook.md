@@ -30,7 +30,7 @@ Windows 上的代码是在连自己这台机器（而它上面什么都没装）
 ┌─────────────────────────────┐         ┌──────────────────────────────────────┐
 │  VMware-Windows（开发机）      │         │  VMware-Linux（依赖机）                 │
 │                             │         │                                      │
-│  · 代码 + venv（Python）      │  TCP    │  docker compose                      │
+│  · 代码 + uv 管理的 .venv     │  TCP    │  docker compose                      │
 │  · 无 Docker / 无 WSL2        │ ──────► │  ├ postgres (pgvector)  :5432        │
 │  · 浏览器看 Grafana/Prometheus │  :5432  │  ├ redis                :6379        │
 │                             │  :6379  │  ├ prometheus           :9090        │
@@ -52,65 +52,67 @@ sg docker -c 'docker ps'        # 若提示 permission denied，说明当前用�
 
 ---
 
-### 1.1 Windows 侧：Python 版本与 venv（本步之前先做）
+### 1.1 Windows 侧：Python 版本与 uv 虚拟环境（本步之前先做）
 
-**版本口径（已定，不要再改）**：Python **3.12**，开发机是 **3.12.9**。
+**版本口径（已定，不要再改）**：Python **3.12**，开发机是 **3.12.9**；
+**虚拟环境与依赖全部走 `uv`**（不再用 `python -m venv` + `pip`，理由见下）。
 
 | 位置 | 写的是什么 | 说明 |
 |---|---|---|
-| 开发机 | 3.12.9（实测） | `py -0p` 只有 3.12 一个版本 |
-| `pyproject.toml` | `requires-python = ">=3.12"` | 低于 3.12 直接拒绝安装，避免「悄悄用 3.11 跑」 |
-| 生产镜像（第 19 步） | `python:3.12-slim` | 只钉 minor，补丁版跟随官方更新 |
-| CI（第 19 步） | `python-version: "3.12"` | 与开发机同 minor |
+| 开发机 | uv **0.11.33**（实测）、Python 3.12.9 | `uv --version`；`py -0p` 只有 3.12 一个版本 |
+| `pyproject.toml` | `requires-python = ">=3.12"`、`[dependency-groups] dev`、`[tool.uv] required-version = ">=0.11"` | dev 依赖用依赖组，`uv sync` 默认就装 |
+| 生产镜像（第 19 步） | `python:3.12-slim` + `uv sync --locked` | 只钉 minor；容器内用 `--locked` 保证与 `uv.lock` 一致 |
+| CI（第 19 步） | `astral-sh/setup-uv` + `python-version: "3.12"` | 用 `uv sync --locked` 跑 pytest |
 
-**如实标注**：下面带 ✅ 的是我实测确认过的，带 ❓ 的**没有**在本机验过（原因见注①），请在执行后自行确认。
+**以下全部为实测结果**（命令在仓库根执行，均已在本机跑通）：
 
-| # | 步骤 | 状态 |
+| # | 步骤 | 实测结果 |
 |---|---|---|
-| 1 | `py -0p` 只有 `-V:3.12 *`（3.12.9） | ✅ 实测 |
-| 2 | `py -3.12 -m venv .venv` 能建成 | ❓ **在受限沙箱里失败**（注①），在普通开发机上应当正常 |
-| 3 | `pip install -e ".[dev]"` 能装上本仓库 | ❓ 未验证（依赖第 2 步） |
-| 4 | `pytest` 结果 `48 passed, 6 errors` | ❓ 未验证；`48 passed` 已由他人用全局解释器跑出过 |
+| 1 | `uv --version` / `py -0p` | ✅ `uv 0.11.33`；只有 `-V:3.12 *`（3.12.9） |
+| 2 | `uv sync` | ✅ 建出 `.venv`（CPython 3.12.9）+ 生成 `uv.lock`（31 KB），装上 7 个包 |
+| 3 | `uv run python -c "import sys; print(sys.version, sys.prefix)"` | ✅ `3.12.9` / prefix = 仓库根的 `.venv` |
+| 4 | `uv run pytest -q` | ✅ **`54 passed in 1.82s`**（含 6 条 `tmp_path` 用例，全过） |
+| 5 | `uv run python -c "..." <参数>` 能正确转发参数 | ✅ 已验证（`sys.argv[1]` 收到的就是那个路径） |
 
 ```powershell
-# ── 在仓库根执行 ──
-py -3.12 -m venv .venv                          # 用 py launcher 明确指定 3.12，不靠 PATH 里是哪个 python
-# 若上一步报 ensurepip 失败 → 见注① 的三条修法，不要跳过（venv 里没 pip 后面全做不了）
-
-.\.venv\Scripts\Activate.ps1                    # 若报「禁止运行脚本」，见注②
-python -c "import sys; print(sys.version)"      # 期望：3.12.9 ...（必须确认这是 venv 里的解释器）
-python -m pip install -U pip
-python -m pip install -e ".[dev]"               # 第 3 步会把 SQLAlchemy/psycopg/alembic 加进依赖表，届时重跑
-python -m pytest -q
+# ── 在仓库根执行（uv 会自己找/下解释器，不需要先激活任何东西）──
+uv sync                       # 建 .venv + 装依赖（默认含 [dependency-groups] dev，不用加 --extra dev）
+uv run python -c "import sys; print(sys.version, sys.prefix)"   # 期望：3.12.9 ...\.venv
+uv run pytest -q              # 期望：54 passed
 ```
 
-> **注①：`venv` 建不出来（`ensurepip` 返回非零 / `No module named pip`）**
-> 真实原因通常不是 Python 装坏了，而是 `ensurepip._bootstrap` 要往**临时目录**写一份捆绑的 pip wheel，
-> 被权限或安全策略挡住了（我在受限沙箱里踩到的就是这条：`PermissionError: [Errno 13] ... pip-24.3.1-py3-none-any.whl`）。
-> 本机 `Lib\ensurepip\_bundled\pip-24.3.1-py3-none-any.whl` 是**存在**的（已实测），所以按顺序试：
-> 1. 换个临时目录再建：`$env:TEMP="C:\tmp"; $env:TMP="C:\tmp"`（先 `mkdir C:\tmp`），然后重跑第 2 步；
-> 2. 允许临时目录写入：杀软/受控文件夹访问把 `%TEMP%` 加白名单；
-> 3. 绕开 ensurepip —— 用全局 pip 把捆绑 wheel 直接装进 venv 的 site-packages：
->    ```powershell
->    py -3.12 -m venv --without-pip .venv
->    python -m pip install --no-deps --target ".venv\Lib\site-packages" `
->      "$env:LOCALAPPDATA\Programs\Python\Python312\Lib\ensurepip\_bundled\pip-24.3.1-py3-none-any.whl"
->    .\.venv\Scripts\python.exe -m pip --version   # 期望：pip 24.3.1 from ...\.venv\Lib\site-packages\pip
->    ```
-> 第 3 条**我未实测**（沙箱同样挡住了写入）；它用的是「全局 pip 装 wheel 到指定目录」这个常规做法，不是 `$PYTHONPATH` 之类的手法，值得先试。
+**日常命令对照表（旧 → 新）**：
 
-> **注②：PowerShell 拦 `Activate.ps1`**（`... 因为在此系统上禁止运行脚本`）——当前会话执行一次
-> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` 即可，不影响系统策略。
-> 不想激活也行：把后续所有 `python` 换成 `.\.venv\Scripts\python.exe`（等价且更显式）。
-> `.venv/` 已在 `.gitignore` 里，不会被提交。
+| 传统方式（已弃用） | 现在用 uv |
+|---|---|
+| `python -m venv .venv` | `uv sync`（自动建 `.venv`，可 `uv python pin 3.12` 固定解释器） |
+| `.\.venv\Scripts\Activate.ps1` | **不需要激活**：`uv run <命令>` 直接在项目环境里执行 |
+| `pip install -e ".[dev]"` | `uv sync`（dev 依赖在 `[dependency-groups] dev`，默认安装） |
+| `pip install <pkg>` | `uv add <pkg>`（同时更新 `pyproject.toml` 与 `uv.lock`，**不要手写 dependencies**） |
+| `pip install --dev <pkg>` / extras | `uv add --dev <pkg>` |
+| `python -m pytest -q` | `uv run pytest -q` |
+| `pip freeze > requirements.txt` | `uv.lock`（提交进 Git；`uv sync --locked` 复现，不需要 requirements.txt） |
+| `pip install -U` | `uv lock --upgrade` 然后 `uv sync` |
 
-`python -m pytest -q` 的期望是 `48 passed, 6 errors`：6 条用 `tmp_path` 的用例在受限环境报
-`PermissionError`，属已记录的环境限制而非代码问题（见 `config-guide.md` §3.5/§3.6）。
+> **注①：为什么要换掉 `python -m venv`**
+> 它依赖 `ensurepip` 往**临时目录**解压捆绑的 pip wheel —— 我在受限沙箱里实测会直接失败：
+> `PermissionError: [Errno 13] ...pip-24.3.1-py3-none-any.whl`，结果 `.venv` 建出来了但里面**没有 pip**。
+> uv 自己管理解释器与缓存（`%LOCALAPPDATA%\uv\cache`、`%APPDATA%\uv\python`），**不经过 ensurepip**，
+> 所以在本机一次性跑通（上表第 2 行）。顺带的好处：`uv sync` 比 `pip install` 快得多，且 `uv.lock` 让
+> 「我这能跑、你那不能跑」的依赖漂移消失。
 
-**为什么 venv 这一步现在补**：在 venv 里，`python` / `python -m pip` / `pytest` 指向的都是 venv 的解释器；
-没激活时它们指向全局解释器。本文档 §3 与 `config-guide.md` 里的命令都写作裸 `python`，
-**只有 venv 处于激活状态时那些命令才作用在本项目的依赖上**（这也是「我明明装了包却说没装」的常见原因）。
-即使不激活，本节要求的是「知道自己用的是哪一个」——可以用 `python -c "import sys; print(sys.prefix)"` 确认。
+> **注②：`uv.lock` 要提交，`请勿`手改**。它是解析结果的唯一事实来源；
+> 换机器/换 CI 只需 `uv sync`（复现用 `uv sync --locked`：lock 与 `pyproject.toml` 不一致时**直接失败**，
+> 这正是 CI 想要的）。`.venv/` 已在 `.gitignore` 里，不会被提交；`uv.lock` **不在** ignore 列表里，应随代码提交。
+
+> **注③：跑测试时的两个已知现象**
+> - 上表第 4 行的 `54 passed` 是**uv 建的 venv 里的结果**；用全局解释器裸跑时，6 条用 `tmp_path` 的用例
+>   可能在受限环境报 `PermissionError`（见 `config-guide.md` §3.5/§3.6）。也就是说：**用 uv 跑更接近 CI 真相**。
+> - `uv run` **不会**改变工作目录：它只保证「用项目 `.venv` 的解释器」。因此「必须在仓库根执行」这条对 uv 同样成立 ——
+>   实测在 `docs/` 下 `uv run pytest -q` 会 `no tests ran`（退出码 5）、`uv run python -c "import app"` 会
+>   `ModuleNotFoundError`。本文与 `config-guide.md` 的命令都默认你在**仓库根**。
+
+## 2. Linux VM：起依赖栈并验证
 
 ## 2. Linux VM：起依赖栈并验证
 
@@ -242,7 +244,7 @@ notepad .env
 改完核对（这条命令会掩码敏感字段，可以放心贴出来）：
 
 ```powershell
-python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+uv run python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
 ```
 
 **期望**：`database_url` 的 host 显示为你填的 Linux IP、密码显示为 `***`。
@@ -280,15 +282,16 @@ $ip = '<LINUX-IP>'
 
 ### W4. 协议层验证（真正「库能用」，不只是端口通）
 
-这一步要等 `psycopg` 进依赖表（`db.md` 第 3 步会加）。在那之前，端口 OPEN 就够本步验收。
+这一步要等 `psycopg` 进依赖表（`db.md` 第 3 步会做，届时用 `uv add "psycopg[binary]"` 加依赖、`uv sync` 装）。
+在那之前，端口 OPEN 就够本步验收。
 
 ```powershell
 # 装了 psycopg 之后（第 3 步及以后）
-python -c "import os,psycopg; from dotenv import dotenv_values; d=dotenv_values('.env'); print(psycopg.connect(d['DATABASE_URL']).execute('select version()').fetchone()[0])"
+uv run python -c "import os,psycopg; from dotenv import dotenv_values; d=dotenv_values('.env'); print(psycopg.connect(d['DATABASE_URL']).execute('select version()').fetchone()[0])"
 # 期望：打印 PostgreSQL 16.x ... 一行
 
 # Redis（装了 redis 包之后）
-python -c "import redis; from dotenv import dotenv_values; print(redis.from_url(dotenv_values('.env')['REDIS_URL']).ping())"
+uv run python -c "import redis; from dotenv import dotenv_values; print(redis.from_url(dotenv_values('.env')['REDIS_URL']).ping())"
 # 期望：True
 ```
 
@@ -303,15 +306,18 @@ python -c "import redis; from dotenv import dotenv_values; print(redis.from_url(
 
 | 症状 | 最可能的原因 | 怎么确认 | 修法 |
 |---|---|---|---|
-| `py -3.12 -m venv .venv` 报 `ensurepip` 非零退出 / venv 里 `No module named pip` | `ensurepip` 要往临时目录解压捆绑的 pip wheel，被权限或安全策略挡住 | 直接跑 `.\.venv\Scripts\python.exe -m ensurepip --upgrade` 看是否 `PermissionError ... pip-24.x.x-py3-none-any.whl` | 见 §1.1 注① 的三条修法（换 TEMP → 白名单 → `--without-pip` + 手动装捆绑 wheel） |
+| `uv sync` 报 `Failed to initialize cache at ...\uv\cache` / `拒绝访问` | uv 全局缓存目录不可写（权限、受控文件夹访问、企业策略） | 看报错里那个路径 | 按报错路径修权限；或临时改缓存位置：`$env:UV_CACHE_DIR="$PWD\.uv-cache"; uv sync`（用完记得清） |
+| `uv sync` 报解释器缺失/`No interpreter found` | 本机没有 uv 认得的 3.12，且不打算让它下载 | `uv python list --only-installed` | `uv python install 3.12`（uv 会自己下，不经过 ensurepip） |
+| `.venv` 建出来但没有 pip | 那是**旧的** `python -m venv` 失败留下的残留（uv 的 venv 本来就不需要 pip） | `uv run python -c "import sys; print(sys.prefix)"` | 删掉 `.venv` 后改用 `uv sync`；本仓不再支持 `python -m venv` 工作流 |
+| 改了 `pyproject.toml` 但依赖没变 | 没同步 lock / 没重跑 sync | `uv sync` 的输出 | `uv add` / `uv remove` 改依赖（会自动更新 `uv.lock`），改完 `uv sync` |
 | `docker compose config` 报变量为空 | 没走 `--project-directory .`，根 `.env` 没被读到（**静默**） | `docker compose ... config \| grep published` 看端口有没有渲染出来 | 命令写全 `-f infra/docker-compose.dev.yml --project-directory .` |
 | postgres 反复 unhealthy | 数据卷是旧版本初始化的 / 密码改过但卷没重建 | `docker compose ... logs postgres` 是否报 `database ... does not exist` 或认证失败 | `down -v` 后重来（⚠️ 会删数据），或改回原凭据 |
 | 改了 `POSTGRES_PASSWORD` 但没生效 | postgres 的初始化变量**只在空数据卷时生效一次** | 卷已存在 | `down -v` 重建，或进库 `ALTER USER` |
 | Grafana 没数据源 | provisioning 文件没挂上（常见于仓库放在共享文件夹） | `docker compose ... logs grafana \| grep -i provision` | 仓库挪到 Linux 原生目录后重建 |
 | Prometheus 起不来 | 配置 bind mount 权限问题 | `docker compose ... logs prometheus` | 同上；`chmod 644 infra/prometheus/prometheus.yml` |
 | 端口被占用 | Linux 上已有 postgres/redis（或别的项目） | `ss -lntp \| grep 5432` | 在 `.env` 里改 `POSTGRES_PORT`，**并同步 `DATABASE_URL` 的端口** |
-| Windows 报 `psycopg` 缺失 | 第 3 步的依赖还没加，**或** venv 没激活（装到了别处） | `python -c "import sys; print(sys.prefix)"` 看是不是 `.venv` | 先激活 venv（§1.1），再 `pip install -e ".[dev]"` |
-| `ModuleNotFoundError: No module named 'app'` | 不在仓库根执行（`app/` 靠当前工作目录进 `sys.path`） | `Get-Location` | `cd` 回仓库根，见 `config-guide.md` §1.7 |
+| Windows 报 `psycopg` 缺失 | 第 3 步的依赖还没加，**或**命令没走 `uv run`（用到了全局解释器） | `uv run python -c "import sys; print(sys.prefix)"` 看是不是仓库根的 `.venv` | 用 `uv add psycopg[binary]`（第 3 步）加依赖，并用 `uv run` 执行命令 |
+| `ModuleNotFoundError: No module named 'app'` | 用裸 `python` 在非仓库根执行（`app/` 靠当前工作目录进 `sys.path`） | `Get-Location` | 改用 `uv run`（固定项目根），或 `cd` 回仓库根；见 `config-guide.md` §1.7 |
 | `docker` 提示 permission denied | 用户不在 docker 组 | `groups` | `sudo usermod -aG docker $USER` 后重新登录 |
 
 **别做的事**：不要为了「让容器也能读 `.env`」把宿主 `.env` 挂进容器（`modules/infra.md` 第 4 节第 4 条、

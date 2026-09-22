@@ -13,7 +13,7 @@
 ## 2. 对外接口
 
 ```bash
-# ── 开发期：只起依赖（PostgreSQL+pgvector、Redis、Prometheus、Grafana），代码跑在开发机 venv ──
+# ── 开发期：只起依赖（PostgreSQL+pgvector、Redis、Prometheus、Grafana），代码用 uv run 跑在开发机 ──
 # 执行位置：VMware-Linux 虚拟机；且必须在【仓库根】执行（原因见下方「为什么带这两个参数」）
 docker compose -f infra/docker-compose.dev.yml --project-directory . up -d
 docker compose -f infra/docker-compose.dev.yml --project-directory . down      # 停止（保留数据卷）
@@ -49,10 +49,10 @@ VMware-Linux 虚拟机  ←── 依赖容器全部跑在这里（infra/docker-
         ▲
         │  通过 VMware 网卡 IP（下称 <Linux-IP>）连接
         │
-VMware-Windows 开发机 ←── 业务代码跑在这里的 venv（uvicorn / pytest / arq）
+VMware-Windows 开发机 ←── 业务代码跑在这里（uv 管理的 `.venv`：`uv run uvicorn` / `uv run pytest` / `uv run arq`）
 ```
 
-这正好落实架构第 9 节「开发期 VMware-Windows + VMware-Linux」：**Linux 侧跑依赖容器，Windows 侧跑代码 venv**，只是把两台机器的职责写明确了。
+这正好落实架构第 9 节「开发期 VMware-Windows + VMware-Linux」：**Linux 侧跑依赖容器，Windows 侧跑代码（`uv run` + 项目 `.venv`）**，只是把两台机器的职责写明确了。
 
 | 服务 | 容器内端口 | Windows 侧访问地址 | 用途（对应模块） |
 |---|---|---|---|
@@ -70,7 +70,7 @@ VMware-Windows 开发机 ←── 业务代码跑在这里的 venv（uvicorn / 
 ## 4. 关键设计决策
 
 1. **开发/生产一份 Compose 拆分**：`infra/docker-compose.dev.yml` 只含基础设施（postgres/redis/prometheus/grafana）；生产 `docker-compose.yml` 含全部服务（api/worker/web）。用 `.env` 区分（架构第 9 节）。
-2. **开发期代码不容器化**：开发机（Windows）本机 venv 直接跑，热重载快、好调试；只有「依赖服务」进容器 —— 而容器在 Linux VM 上，见 §3.1 与第 5 条。
+2. **开发期代码不容器化**：开发机（Windows）直接用 `uv run` 跑，热重载快、好调试；只有「依赖服务」进容器 —— 而容器在 Linux VM 上，见 §3.1 与第 5 条。
 3. **镜像在 Linux runner 构建**：`docker/build-push-action` 构建 → push registry → 服务器 `pull` 后 compose 起（架构第 9 节「交付」）。
 4. **密钥不入镜像**：用 `env_file` / 运行时 `environment` 注入，绝不用 `ARG` 烧进镜像层。
 5. **为什么依赖不跑在开发机（Windows 客户机）**：
@@ -81,12 +81,16 @@ VMware-Windows 开发机 ←── 业务代码跑在这里的 venv（uvicorn / 
 ## 5. 核心技术点（要懂为什么）
 
 - **多阶段构建（multi-stage）**：Python 镜像用 `python:3.12-slim` 装依赖 → 复制代码，最后只留运行所需层，镜像体积小、攻击面小。（与 `pyproject.toml` 的 `requires-python = ">=3.12"` 对齐；开发机是 3.12.9，镜像只需钉 minor，`3.12-slim` 会跟随官方更新补丁版，避免手工追 CVE 补丁。**别退回 `python:3.11`** —— 会让 CI 与开发机凭空多一个版本差异。）
+- **依赖安装走 `uv`，不是 `pip install`**：开发机已统一用 uv 管理 `.venv` 与 `uv.lock`（`uv sync` / `uv run`，见 `docs/infra-runbook.md` §1.1），因此镜像与 CI 也必须同源，否则会出现「本地能跑、镜像里装的版本不同」这类经典漂移。第 19 步的做法固定为：
+  - 镜像内**用 uv 装依赖**：官方 `ghcr.io/astral-sh/uv` 镜像里 `COPY --from` 出 uv 二进制 → `uv sync --locked --no-dev --no-install-project`（`--locked` 保证与提交的 `uv.lock` 一致，lock 过期直接失败，而不是悄悄装别的版本；分层缓存让「只改代码不改依赖」时依赖层仍然命中）。
+  - CI 用 `astral-sh/setup-uv` action，同样 `uv sync --locked` 后 `uv run pytest`；`uv.lock` **必须提交**（它不在 `.gitignore` 里），`.dockerignore` 则要排除 `.venv/`（宿主的虚拟环境绝不能进构建上下文：体积大、且里面是 Windows 平台的二进制）。
+  - ⚠️ 别在 Dockerfile 里写 `pip install -r requirements.txt` —— 本仓不维护 `requirements.txt`，`uv.lock` 是唯一事实来源。
 - **`.env` 只服务本机开发，容器里一律走环境变量**（与 `config.md` 的「同名变量会覆盖 .env」配套）：
-  - 本机开发：`infra/docker-compose.dev.yml` 只起依赖（postgres/redis/…，跑在 Linux VM 上），代码跑在开发机 venv，配置来自项目 `.env`。
+  - 本机开发：`infra/docker-compose.dev.yml` 只起依赖（postgres/redis/…，跑在 Linux VM 上），代码跑在开发机由 uv 管理的 `.venv` 里，配置来自项目 `.env`。
   - 容器运行：用 compose 的 `environment` / `env_file` 在**运行时**注入，`.dockerignore` 排除 `.env` → 镜像里没有任何配置文件。此时 `Settings` 只读进程环境变量（`.env` 不存在，冲突检测自然跳过，零噪音）。
   - 于是两侧的「同名覆盖」问题各自有明确归属：本机由 `config.md` 的启动告警兜住；容器里环境变量本就是唯一来源，不存在覆盖。
   - ⚠️ 反例：不要为了「让容器内也能读 .env」而把 `.env` 打进镜像或挂到 `WORKDIR` —— 那会把密钥固化进镜像层与卷，违背第 4 节第 4 条。
-- **`.dockerignore`**：排除 `.env` / `.git` / `__pycache__` / `venv`，避免把密钥和垃圾打进构建上下文。
+- **`.dockerignore`**：排除 `.env` / `.git` / `__pycache__` / `.venv`（uv 建的虚拟环境，含 Windows 二进制，绝不能进构建上下文；旧的 `venv`/`env` 目录名一并排除以防手贱命名），避免把密钥和垃圾打进构建上下文。
 - **healthcheck**：给 postgres/redis/api 配 `healthcheck`，compose 用 `depends_on: condition: service_healthy` 保证启动顺序，避免 API 先于数据库起来连不上。
 - **为什么 worker 单独一个服务**：Arq 异步任务是常驻进程，和 API 独立扩缩、独立重启（架构第 8 节「按层独立扩缩」）。
 - **为什么 postgres 用 `pgvector/pgvector:pg16` 而不是 `postgres:16` + 启动脚本装扩展**：向量能力是**硬依赖**（第 10 步 `rag.md` 要建 `embedding vector(n)` 列与 IVFFlat/HNSW 索引），而这个官方镜像已把扩展**编译进镜像**，`CREATE EXTENSION vector` 开箱可用。换成 `postgres:16` + `/docker-entrypoint-initdb.d/` 脚本装扩展，就多出一条「只在首次初始化数据卷时执行一次」的隐蔽故障链：脚本报错只体现在容器日志里（`up -d` 看起来照样成功）、数据卷已存在时脚本根本不会再跑、编译扩展还要拉构建工具链。**结论：能用现成镜像就别自建初始化流程**，第 10 步建表时不必再关心扩展是否装好。
@@ -108,6 +112,18 @@ VMware-Windows 开发机 ←── 业务代码跑在这里的 venv（uvicorn / 
 2. 按下面顺序验证。⚠️ **本机（Windows）没有 Docker**，所以 `docker compose ...` 全部在 **Linux VM** 上执行，`docker compose config -q` 这类静态校验只能在 **Linux VM 或 GitHub Actions runner** 上做 —— 不要在开发机上试，那里没有 `docker` 命令。
    （这套顺序的完整版、含「期望输出 / 失败症状 → 修法」对照表，见 [`docs/infra-runbook.md`](../infra-runbook.md) §2–§4；下面是要点摘要。）
 
+   **⓪ Windows：先把 Python 环境准备好（用 uv，不用 `python -m venv`）**
+
+   ```powershell
+   # 在仓库根执行；uv 会自己建 .venv 并生成 uv.lock
+   uv sync                                                    # 依赖（含 [dependency-groups] dev）一次装好
+   uv run python -c "import sys; print(sys.version, sys.prefix)"
+   uv run pytest -q                                           # 期望 54 passed
+   ```
+
+   理由、实测结果与「旧 pip/venv 命令 → uv」对照表见 `docs/infra-runbook.md` §1.1。
+   （本项目**不再**用 `python -m venv` + `pip install -e ".[dev]"`：前者依赖 `ensurepip` 写临时目录，在受限机器上会失败。）
+
    **① Linux VM：拿到代码与 `.env`（在仓库根执行）**
 
    ```bash
@@ -128,12 +144,11 @@ VMware-Windows 开发机 ←── 业务代码跑在这里的 venv（uvicorn / 
 
    等 healthcheck 变 `healthy`（postgres/redis 各自有 `pg_isready` / `redis-cli ping` 探针，启动后约 10–30 秒内到位；`starting` 不等于失败，但 `unhealthy` 要看 `docker compose ... logs <服务名>`）。
 
-   **④ Windows：把 `.env` 的 host 改成 `<Linux-IP>`**（PowerShell，在仓库根执行）
+   **④ Windows：把 `.env` 的 host 改成 `<Linux-IP>`**（PowerShell，在仓库根执行；`uv run` 不改工作目录）
 
    ```powershell
-   Copy-Item .env.example .env -ErrorAction SilentlyContinue   # 已有 .env 则跳过
    # 编辑 .env：把 DATABASE_URL / REDIS_URL 的 host 段改成 Linux VM 的 IP（不要写 localhost）
-   python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+   uv run python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
    ```
 
    上面最后一条是「应用到底连哪儿」的唯一可信来源（输出已掩码，可安全贴出）；改了 `.env` 必须**重启进程**才生效（`config-guide.md` §1.7）。

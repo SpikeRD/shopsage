@@ -21,6 +21,7 @@
 | 层 | 选型 | 说明 |
 |---|---|---|
 | 语言 / Web | Python 3.12 + FastAPI | 异步、类型友好、生态成熟（开发机实测 3.12.9，`pyproject.toml` 钉 `>=3.12`） |
+| 依赖 / 虚拟环境 | uv | 不用 `python -m venv` + `pip`：`uv sync` 建 `.venv` + 生成 `uv.lock`，`uv run` 免激活执行（实测 `uv run pytest -q` → 54 passed，见 `docs/infra-runbook.md` §1.1） |
 | Agent 编排 | LangGraph | 有状态图、checkpoint、human-in-the-loop |
 | LLM 接入 | LiteLLM | 多模型路由、自动降级、统一计费 |
 | Text-to-SQL | LangChain SQLDatabaseToolkit + 自研安全层 | schema 感知 + few-shot + 越权/只读校验 |
@@ -33,7 +34,7 @@
 | 前端 | Next.js | 演示对客/对内两个入口 |
 | 部署 | Docker Compose | 小企业够用 |
 | CI/CD | GitHub Actions | lint/test → 镜像 → 部署 Linux |
-| 开发环境 | VMware-Windows + VMware-Linux | 依赖服务（postgres/redis/prometheus/grafana）起在 Linux 那台，代码在 Windows 的 venv 跑（Windows 无 Docker，见 §9） |
+| 开发环境 | VMware-Windows + VMware-Linux；依赖管理 `uv` | 依赖服务（postgres/redis/prometheus/grafana）起在 Linux 那台，代码在 Windows 上用 `uv run` 跑（Windows 无 Docker，见 §9） |
 
 ---
 
@@ -156,7 +157,7 @@ employees       (emp_id, name, role, dept, level)                             --
 
 ## 9. 开发与部署流程（Windows → Linux）
 
-- **开发期**：VMware-Windows + VMware-Linux，两台机器分工固定 —— **依赖服务（PostgreSQL、Redis、pgvector、Prometheus、Grafana）在 VMware-Linux 那台用 `docker-compose.dev.yml` 起，代码在 VMware-Windows 上的 venv 跑，通过网络连 Linux 的 IP**（Windows 客户机没有 Docker）。文件实际位置是 `infra/docker-compose.dev.yml`，启动命令与端口/防火墙要求见 `docs/modules/infra.md` §2 与 §3.1「开发拓扑（跨主机）」。
+- **开发期**：VMware-Windows + VMware-Linux，两台机器分工固定 —— **依赖服务（PostgreSQL、Redis、pgvector、Prometheus、Grafana）在 VMware-Linux 那台用 `docker-compose.dev.yml` 起，代码在 VMware-Windows 上用 `uv run` 跑（虚拟环境由 uv 管理，见下方「依赖 / 虚拟环境」），通过网络连 Linux 的 IP**（Windows 客户机没有 Docker）。文件实际位置是 `infra/docker-compose.dev.yml`，启动命令与端口/防火墙要求见 `docs/modules/infra.md` §2 与 §3.1「开发拓扑（跨主机）」。
 - **一致性**：`docker-compose.yml` 一份，用 `.env` 区分开发/生产环境。
 - **交付**：GitHub Actions 在 Linux runner 构建镜像 → push registry → 服务器拉取后 Compose 起。
 - **密钥**：API Key 等走 `.env` / 环境变量 / Secret，不进 Git。

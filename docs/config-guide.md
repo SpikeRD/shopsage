@@ -4,19 +4,26 @@
 >
 > 涉及代码：`app/config/settings.py`、`tests/test_config.py`。本文所有命令均已在本机实测。
 
+> 🧪 **执行方式：本项目用 `uv` 管理虚拟环境与依赖**（不再用 `python -m venv` + `pip`）。
+> 因此文中所有命令都以 **`uv run`** 开头（`uv run python -c ...` / `uv run pytest -q`）；
+> `uv run` 会直接使用项目根的 `.venv`，所以**不需要先激活任何环境**。
+> ⚠️ 但它**不会**改变工作目录 —— 「必须在仓库根执行」这条仍然成立（实测：在 `docs/` 下 `uv run pytest -q` 会
+> `no tests ran`、退出码 5；`uv run python -c "import app"` 会 `ModuleNotFoundError`）。
+> 首次使用、或想弄清为什么换掉 venv，见 [`infra-runbook.md`](infra-runbook.md) §1.1（含实测结果与命令对照表）。
+
 ---
 
 ## 0. 30 秒速查
 
 | 我想… | 命令 / 做法 |
 |---|---|
-| 看当前生效的配置（已掩码） | `python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"` |
+| 看当前生效的配置（已掩码） | `uv run python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"` |
 | 改本机开发配置 | 仓库根建 `.env`（从 `.env.example` 复制），改完**重启进程** |
 | 依赖（postgres/redis）连不上 | §2.4（本机无 Docker：容器在 Linux VM，host 填其 IP；`POSTGRES_*` 与 `DATABASE_URL` 必须一致） |
-| 临时改一次，不动文件 | PowerShell: `$env:DATABASE_URL="..."; python -m app...` |
+| 临时改一次，不动文件 | PowerShell: `$env:DATABASE_URL="..."; uv run python -m app...` |
 | 看本机有哪些环境变量可能覆盖我这（只列名，不打印值） | 见 §1.5 |
-| 跑全部测试 | `python -m pytest -q`（**必须在仓库根**） |
-| 只跑某一组测试 | `python -m pytest -q tests/test_config.py -k "mask"` |
+| 跑全部测试 | `uv run pytest -q`（**必须在仓库根**：见文首说明，uv 不改工作目录） |
+| 只跑某一组测试 | `uv run pytest -q tests/test_config.py -k "mask"` |
 | 排查「改了配置却不生效」 | §1.7 决策树 |
 
 ---
@@ -71,7 +78,7 @@ Copy-Item .env.example .env
 #    LLM_API_KEY=sk-...
 
 # 3) 验证是否读到了
-python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+uv run python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
 ```
 
 生效时机：**`Settings()` 构造时读一次**。因为 `get_settings()` 用 `@lru_cache` 做了进程内单例，改了 `.env` 必须**重启进程**才生效（见 §1.7）。
@@ -82,7 +89,7 @@ python -c "from app.config import get_settings; import json; print(json.dumps(ge
 # 只在当前终端会话有效，关掉即失效 —— 推荐的本机临时改法
 $env:DATABASE_URL = "postgresql://user:pw@localhost:5432/shopsage_test"
 $env:LLM_API_KEY  = "sk-test-xxxx"
-python -m pytest -q
+uv run pytest -q
 
 # 永久用户级（会影响本机所有项目/所有进程，慎用；且对当前终端不生效，要新开终端）
 setx DATABASE_URL "postgresql://..."
@@ -142,6 +149,9 @@ Remove-Item Env:DATABASE_URL
         且是**静默**退回默认值（不报错）。本仓 `app/` 是源码目录、未安装成包，
         所以还要求仓库根在 sys.path 上：从子目录跑 python -c 会
         `ModuleNotFoundError: No module named 'app'`。
+        ⚠️ 换成 `uv run python -c ...` **也不能绕过**这一条：`uv run` 换的是解释器（项目 .venv），
+        工作目录仍是当前目录 —— 实测在 docs/ 下 `uv run python -c "import app"` 与
+        `uv run pytest -q`（no tests ran / 退出码 5）同样失败。
 
 3) 进程重启了吗？
    → 否：get_settings() 是 lru_cache 单例，配置在启动时定型一次。
@@ -156,7 +166,7 @@ Remove-Item Env:DATABASE_URL
 ## 2. Docker 启动时怎么传值
 
 > **现状说明**：`infra/docker-compose.dev.yml`（含 prometheus/grafana、healthcheck、named volume）**已创建**，属 `docs/modules/infra.md` 第 2 步的产出；**生产 compose 与 `Dockerfile` 仍属第 19 步，尚未落地**。
-> ⚠️ 关键前提：开发机是 **VMware 里的 Windows 客户机，本机没有 Docker**（5432/6379/9090/3000 全无监听）——依赖栈跑在**另一台 VMware-Linux 虚拟机**上，本机只管跑代码 venv，通过网络连过去。**跨主机拓扑（服务/端口/访问地址对照、端口为何必须绑 `0.0.0.0`、防火墙放通）见 `docs/modules/infra.md` §3.1「开发拓扑（跨主机）」**，本节只讲取值怎么传。
+> ⚠️ 关键前提：开发机是 **VMware 里的 Windows 客户机，本机没有 Docker**（5432/6379/9090/3000 全无监听）——依赖栈跑在**另一台 VMware-Linux 虚拟机**上，本机只管用 `uv run` 跑代码，通过网络连过去。**跨主机拓扑（服务/端口/访问地址对照、端口为何必须绑 `0.0.0.0`、防火墙放通）见 `docs/modules/infra.md` §3.1「开发拓扑（跨主机）」**，本节只讲取值怎么传。
 >
 > 因此本节涉及 `docker compose ...` 的命令**都不在开发机上执行**，而在 Linux VM（或 CI runner）上执行，且必须在**仓库根**执行。
 
@@ -261,8 +271,8 @@ docker inspect shopsage-dev-postgres --format '{{range .Config.Env}}{{println .}
 再到 Windows 侧核对「应用到底连哪儿」（输出已掩码，可安全贴出；**改了 `.env` 必须重启进程**）：
 
 ```powershell
-# 在仓库根执行
-python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+# 在仓库根执行（uv run 免激活）
+uv run python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
 # 看 database_url 的 host:port/db 是否等于 <Linux-IP>:5432/shopsage
 ```
 
@@ -280,6 +290,7 @@ docker history shopsage-api:latest
 
 # 3) 进容器看注入是否到位（用 dump_for_logging，输出已掩码，可安全贴出来）
 docker compose exec api python -c "from app.config import get_settings; import json; print(json.dumps(get_settings().dump_for_logging(), ensure_ascii=False, indent=2))"
+# 注意：这条是【容器内】执行，容器里有完整依赖，所以不要写 uv run（第 19 步镜像里才可能装 uv）
 
 # 4) 故意不传 LLM_API_KEY，确认 fail-fast 生效（应出现 ValidationError 且不含密钥明文）
 docker run --rm -e ENV=prod -e DATABASE_URL="postgresql://u:p@h/db" shopsage-api:latest
@@ -294,13 +305,13 @@ docker run --rm -e ENV=prod -e DATABASE_URL="postgresql://u:p@h/db" shopsage-api
 ### 3.1 前置条件
 
 - **必须在仓库根目录执行**。`app/` 是源码目录、未安装成包，它靠「当前工作目录」进 `sys.path`（`pyproject.toml` 里已配 `pythonpath = ["."]`、`testpaths = ["tests"]`）。
-- 依赖：`pytest`（`pip install -e ".[dev]"`）。
+- 依赖：`pytest`（`uv sync` 会按 `[dependency-groups] dev` 装上，见 `infra-runbook.md` §1.1）。
 - **不需要真实数据库 / Redis**：`tests/test_config.py` 的 54 条只验证「配置装配」（取值优先级、掩码、冲突告警、prod 校验、frozen 语义），**没有任何用例建立数据库或 Redis 连接** —— 测试文件只 import `pytest` / `pydantic` / `json` 与 `app.config`，`postgresql://...`、`redis://...` 全部只作为普通字符串参与断言（甚至故意写成不存在的主机名当金丝雀）；被测代码 `app/config/settings.py` 自身也只 import 标准库 + `dotenv` + `pydantic`，**没有引入任何数据库/Redis 驱动**，`Settings()` / `get_settings()` 构造只做字段装配与校验，不发起网络 I/O。
   **因此：本机没装 Docker、依赖栈没起（当前就是这状态），这批用例照样能跑。** 反过来说，它们**不能**证明数据库/Redis 真的连通 —— 那要靠 `docs/modules/infra.md` §6 的跨主机连通性验证。
   （受限环境里 6 条用 `tmp_path` 的用例会因临时目录权限在 setup 阶段报 `PermissionError`，属环境限制而非本模块依赖，见 §3.5、§3.6。）
 
 ```powershell
-python -m pytest -q --collect-only tests/test_config.py | Select-Object -Last 2
+uv run pytest -q --collect-only tests/test_config.py | Select-Object -Last 2
 # 期望：54 tests collected
 ```
 
@@ -308,36 +319,36 @@ python -m pytest -q --collect-only tests/test_config.py | Select-Object -Last 2
 
 ```powershell
 # 全部（最常用）
-python -m pytest -q
+uv run pytest -q
 
 # 只跑本模块
-python -m pytest -q tests/test_config.py
+uv run pytest -q tests/test_config.py
 
 # 看每个用例名字（排查失败时先看这个）
-python -m pytest -q tests/test_config.py -v
+uv run pytest -q tests/test_config.py -v
 
 # 按关键字选一组（-k 匹配用例名）
-python -m pytest -q tests/test_config.py -k "mask"          # 掩码相关
-python -m pytest -q tests/test_config.py -k "collision"     # 冲突告警相关
-python -m pytest -q tests/test_config.py -k "frozen"        # 不可变性
-python -m pytest -q tests/test_config.py -k "prod"          # 生产校验相关
-python -m pytest -q tests/test_config.py -k "llm_"          # LLM 路由校验
+uv run pytest -q tests/test_config.py -k "mask"          # 掩码相关
+uv run pytest -q tests/test_config.py -k "collision"     # 冲突告警相关
+uv run pytest -q tests/test_config.py -k "frozen"        # 不可变性
+uv run pytest -q tests/test_config.py -k "prod"          # 生产校验相关
+uv run pytest -q tests/test_config.py -k "llm_"          # LLM 路由校验
 
 # 跑单个用例（node id = 文件::函数名）
-python -m pytest -q "tests/test_config.py::test_prod_ok_when_required_present"
+uv run pytest -q "tests/test_config.py::test_prod_ok_when_required_present"
 
 # 首次失败即停 + 显示完整堆栈（调试用）
-python -m pytest -q tests/test_config.py -x --tb=long
+uv run pytest -q tests/test_config.py -x --tb=long
 
 # 让日志/print 直接出现在终端
-python -m pytest -q tests/test_config.py -s -o log_cli=true --log-cli-level=WARNING
+uv run pytest -q tests/test_config.py -s -o log_cli=true --log-cli-level=WARNING
 
 # 把 pydantic 警告当成失败（CI 更严格，用于确认没依赖已弃用行为）
-python -m pytest -q tests/test_config.py -W error::DeprecationWarning -W error::UserWarning
+uv run pytest -q tests/test_config.py -W error::DeprecationWarning -W error::UserWarning
 
 # 关掉 pytest 的缓存插件：受限环境（沙箱）里它会在仓库根建 pytest-cache-files-* 目录
 # 并可能因权限失败刷警告；正常开发机不需要加
-python -m pytest -q -p no:cacheprovider
+uv run pytest -q -p no:cacheprovider
 ```
 
 ### 3.3 测试分组速览（54 条）
@@ -360,7 +371,7 @@ python -m pytest -q -p no:cacheprovider
 **① 掩码是否真的生效**（期望：看不到真实密码/密钥）
 
 ```powershell
-python -c @"
+uv run python -c @"
 from pydantic import SecretStr
 from app.config.settings import Settings
 s = Settings(database_url='postgresql://u:REALPASSWORD@h:5432/db', llm_api_key=SecretStr('sk-REALKEY'))
@@ -379,7 +390,7 @@ print('功能出口  :', s.database_url)          # ← 这里必须是真值，
 $probe = Join-Path $env:TEMP "probe-env-check.env"
 Set-Content -LiteralPath $probe -Encoding utf8 -Value "DATABASE_URL=postgresql://u:from-file@localhost:5432/db"
 $env:DATABASE_URL = "postgresql://u:from-os@prod-host:5432/db"
-python -c "import sys; from app.config.settings import Settings; Settings(_env_file=sys.argv[1])" $probe 2>&1
+uv run python -c "import sys; from app.config.settings import Settings; Settings(_env_file=sys.argv[1])" $probe 2>&1
 Remove-Item Env:DATABASE_URL
 Remove-Item -LiteralPath $probe -Force
 # 期望：告警里 DATABASE_URL 被标出、密码显示为 ***、host 显示 prod-host:5432/db（便于判断连的哪个库）
@@ -388,7 +399,7 @@ Remove-Item -LiteralPath $probe -Force
 **③ prod fail-fast 是否生效**（期望：报 `ValidationError`，且**不含**密钥原文）
 
 ```powershell
-python -c "from app.config.settings import Settings; Settings(env='prod', database_url='postgresql://u:p@h/db', llm_api_key='')"
+uv run python -c "from app.config.settings import Settings; Settings(env='prod', database_url='postgresql://u:p@h/db', llm_api_key='')"
 ```
 
 ### 3.5 手动测试的三个坑
@@ -402,23 +413,25 @@ python -c "from app.config.settings import Settings; Settings(env='prod', databa
    测试文件里因此统一用 `Settings()` 直接构造，而不是 `get_settings()`。
 3. **受限环境（沙箱/容器）里 `tmp_path` 可能不可用**。有 6 条用例用 pytest 的 `tmp_path` 夹具（写临时 `.env`）。若运行环境禁止 `chmod`/目录遍历，pytest 创建临时目录会失败，表现为这 6 条在 **setup 阶段**集体报 `PermissionError [WinError 5]`。**这是环境限制而非代码问题**：其余用例照常通过，且这些用例在普通开发机与 CI 上正常。要绕开可自定义临时根：
    ```powershell
-   python -m pytest -q --basetemp=.pytest-tmp     # 用完记得删掉 .pytest-tmp
+   uv run pytest -q --basetemp=.pytest-tmp     # 用完记得删掉 .pytest-tmp
    ```
 
 ### 3.6 本模块的验收基线
 
 ```powershell
 # 不含 tmp_path 的用例（48 条）：任何环境都该全绿、退出码 0
-python -m pytest -q tests/test_config.py -k "not (extra_keys or wires_collision or no_collision or read_dotenv)"
+# 实测（uv 环境）：48 passed, 6 deselected in 0.34s，退出码 0
+uv run pytest -q tests/test_config.py -k "not (extra_keys or wires_collision or no_collision or read_dotenv)"
 # 期望：48 passed，退出码 0
 ```
 
 ```powershell
 # 全量 54 条：在普通开发机/CI 上直接跑
-python -m pytest -q
-# 受限环境（禁止 chmod/目录遍历）下，6 条用 tmp_path 的用例会在 setup 阶段报
-# PermissionError [WinError 5] —— 环境限制而非代码问题，用下面的方式给它们一个可用临时根：
-python -m pytest -q --basetemp=.pytest-tmp     # 用完记得删掉 .pytest-tmp
+# 实测（uv 环境）：54 passed in 0.42s，退出码 0 —— 6 条 tmp_path 用例也全过
+uv run pytest -q
+# 只有在「禁止 chmod/目录遍历」的受限环境里，那 6 条才可能在 setup 阶段报
+# PermissionError [WinError 5] —— 环境限制而非代码问题，可用下面的方式给它一个可用临时根：
+uv run pytest -q --basetemp=.pytest-tmp     # 用完记得删掉 .pytest-tmp
 ```
 
 完整计数与证据见 `docs/modules/config.md` 第 8 节。

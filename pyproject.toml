@@ -1,3 +1,20 @@
+# ── 依赖管理与虚拟环境统一走 uv（不用 python -m venv + pip）──
+# 开发机实测：uv 0.11.33；`uv sync` → `.venv` + `uv.lock`；`uv run pytest -q` → 54 passed
+#
+# 常用命令：
+#   uv sync               建/更新 .venv 并安装依赖（默认含 dev 组）
+#   uv sync --locked      CI/复现：lock 过期直接失败（推荐写进 CI 与 Dockerfile）
+#   uv run python ...     在项目 .venv 里执行（免激活）
+#   uv run pytest -q      跑测试
+#   uv add <pkg>          加运行依赖（会同时改本文件与 uv.lock，不要手写 dependencies）
+#   uv add --dev <pkg>    加 dev 依赖
+#   uv lock --upgrade     升级锁定版本
+#
+# 为什么不用 `python -m venv`：它依赖 ensurepip 往临时目录解压捆绑 wheel，
+# 在权限/安全策略受限的机器上会直接失败（venv 建出来但没有 pip，本机实测过）；uv 自己管理解释器与缓存，不经过 ensurepip。
+#
+# 注意：`uv run` 只保证「用项目 .venv 的解释器」，**不会**改工作目录 —— 命令仍需在仓库根执行。
+
 [project]
 name = "shopsage"
 version = "0.1.0"
@@ -10,9 +27,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 保留：给不使用 uv 的环境（例如旧 CI 用 pip）一个安装入口
 dev = [
     "pytest>=8.0",
 ]
+
+# dev 依赖的 uv 原生写法（PEP 735 依赖组）：
+# `uv sync` 默认就会装上 dev 组，不需要 `--extra dev`；等价于 pip 侧的 `-e ".[dev]"`
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# 显式声明工作流要求的最低 uv 版本，避免 lock 格式/依赖组语义在老版本上行为不一致
+required-version = ">=0.11"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

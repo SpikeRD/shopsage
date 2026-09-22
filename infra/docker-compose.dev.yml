@@ -1,7 +1,7 @@
 # ShopSage 开发依赖栈（infra 第 2 步）
 #
 # 定位：**只起依赖服务**（postgres/pgvector、redis、prometheus、grafana），
-# 业务代码跑在本机 venv（infra.md 第 4 节第 2 条：开发期代码不容器化）。
+# 业务代码跑在本机 uv 管理的 .venv（infra.md 第 4 节第 2 条：开发期代码不容器化）。
 #
 # 部署位置：VMware-Linux 虚拟机（本机 Windows 只跑代码，通过网络连过来）。
 # 原因见 docs/modules/infra.md「跨主机拓扑」——架构第 9 节本来就是 Windows + Linux 双机。

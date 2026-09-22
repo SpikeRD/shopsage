@@ -228,7 +228,7 @@ def test_audit_guard_actually_catches_violations():
 |---|---|
 | 被测代码 | `app/config/settings.py`（`_read_dotenv_values` / `_dotenv_field_values` / `_warn_on_env_collisions` / `Settings.settings_customise_sources`） |
 | 测试代码 | `tests/test_config.py`（新增 11 条：3 条冲突告警 + 1 条端到端接线 + 1 条无 .env 时不打扰 + 3 条 .env 原文读取 + 1 条 extra 不报错 + 2 条已并入上面的参数化） |
-| 复跑命令 | `python -m pytest -q` |
+| 复跑命令 | `uv run pytest -q` |
 | 结果 | 37 passed / 0 failed（26 条原有 + 11 条新增） |
 | 独立验证 | 另有一次性脚本逐项验证 helper（值相同/不同、大小写、prefix、非字符串字段、密钥掩码、候选列表顺序）+ `Settings()` 端到端，26 项全通过 |
 
@@ -236,7 +236,7 @@ def test_audit_guard_actually_catches_violations():
 > （`%TEMP%\pytest-of-<user>`）会被首次运行以 `0o700` 创建，而该沙箱禁止 `chmod`，
 > 于是**同一 shell 里第二次运行**会因无权进入该目录而报 `PermissionError [WinError 5]`
 > （表现为 6 条用 `tmp_path` 的用例集体 error）。**这是环境限制，不是代码问题**：
-> 全新 shell 下 `python -m pytest -q` 稳定 37 passed / 退出码 0。普通开发机与 CI 无此问题。
+> 全新 shell 下 `uv run pytest -q` 稳定 37 passed / 退出码 0。普通开发机与 CI 无此问题。
 
 **证据（三项加固，2026-09-18 追加）**
 
@@ -247,7 +247,7 @@ def test_audit_guard_actually_catches_violations():
 | 被测代码 | `app/config/settings.py`（`model_config.frozen` / `dump_for_logging` / `_validate_llm_routing` / prod 无降级链告警） |
 | 测试代码 | `tests/test_config.py` 新增 17 条：frozen 3 条、`dump_for_logging` 4 条、llm 路由 7 条（含 `llm_primary` 3 个空值参数化 + 1 条「规范化落到所有出口」）、prod 降级链告警 2 条、`extra="allow"` 1 条 |
 | 用例总数 | 54 条（37 条此前 + 17 条新增） |
-| 复跑命令 | `python -m pytest -q` |
+| 复跑命令 | `uv run pytest -q` |
 | 独立验证 | 一次性脚本逐项验证三项行为，26 项全通过（frozen 的 4 种行为、`dump_for_logging` 的 9 项掩码/一致性、llm 路由 9 项、prod 告警 4 项） |
 | 定向复跑 | `pytest -k "frozen or dump_for_logging or llm_ or prod_with" -W error::DeprecationWarning` → 19 passed / 退出码 0（把 pydantic 的 DeprecationWarning 升级为失败也能过，确认 frozen 下的规范化赋值不是靠已弃用行为） |
 
@@ -264,3 +264,17 @@ def test_audit_guard_actually_catches_violations():
 - [ ] 第 6 节第 2 步的 `log_level` 字段：未加进 `Settings`（依赖上面的 logging 模块，故一并待办）。
 
 > 完成度：第 1、3、4、6、7 步已完成；第 2 步除 `log_level` 外已完成；第 5 步未开始。
+
+**证据（依赖管理切换到 uv 后的全量复跑，2026-09-21）**
+
+| 项 | 内容 |
+|---|---|
+| 变更 | 项目改用 uv 管理虚拟环境与依赖：`pyproject.toml` 增 `[dependency-groups] dev` 与 `[tool.uv] required-version`，新增并提交 `uv.lock`（31 KB）；不再使用 `python -m venv` + `pip` |
+| 环境 | `uv 0.11.33`；CPython 3.12.9；`uv sync` 建出的仓库根 `.venv` |
+| 复跑命令 | `uv run pytest -q` |
+| 结果 | **54 passed / 0 failed**（`54 passed in 1.82s`，退出码 0） |
+| 关键变化 | 此前记录的「6 条 `tmp_path` 用例在受限环境集体 `PermissionError`」**未出现** —— 用 uv 建的 venv 复跑时 54 条全绿 |
+
+> 说明：上面 2026-09-18 那些证据里的「37 passed」「26 passed」以及 `tmp_path` 环境限制，都是**当时环境**的真实记录，
+> 保留不动；本表是同一天之后切换到 uv 的**全量**复跑结果，构成当前基线。
+> 命令与「旧 pip/venv → uv」对照见 [`docs/infra-runbook.md`](../infra-runbook.md) §1.1。
