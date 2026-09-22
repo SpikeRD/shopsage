@@ -114,8 +114,6 @@ uv run pytest -q              # 期望：54 passed
 
 ## 2. Linux VM：起依赖栈并验证
 
-## 2. Linux VM：起依赖栈并验证
-
 ### L1. 把仓库放到 Linux VM 上
 
 ```bash
@@ -213,19 +211,71 @@ ss -lntp | grep -E ':(5432|6379|9090|3000)'
 **如果是 `127.0.0.1:5432`** → Windows 永远连不进来，说明端口映射被写窄了，改 `infra/docker-compose.dev.yml`
 里对应的 `ports:`（本仓库默认已是 `${...BIND_IP:-0.0.0.0}`，只有你手动改成过 `127.0.0.1` 才会这样）。
 
-### L7. 放通防火墙
+### L7. 放通防火墙（Ubuntu/Debian 用 ufw；**Ubuntu 上别碰 firewalld**）
+
+> ⚠️ **两个前端只能留一个**：`ufw` 和 `firewalld` 都只是同一套内核 netfilter（iptables/nftables）的前端，
+> 各自维护自己的链、并假设「只有我在管防火墙」。同时启用 = 两套规则写进同一张表，谁生效取决于链的插入顺序，
+> 行为不可预测（一边改完、另一边 `status` 显示正常），属于最难排查的一类故障。
+> Ubuntu 默认只带 `ufw`（且默认 `inactive`）、**不带 firewalld** —— 所以下面 ⑤ 那段在 Ubuntu 上不要执行。
+
+先看状态。Ubuntu 默认是 `inactive`，**如果是这种情况，L7 到这里就结束了**，什么都不用配：
 
 ```bash
-# firewalld（CentOS/RHEL 系）
-sudo firewall-cmd --add-port=5432/tcp --add-port=6379/tcp --add-port=9090/tcp --add-port=3000/tcp
-sudo firewall-cmd --runtime-to-permanent
-
-# ufw（Ubuntu/Debian 系）—— 注意 ufw 默认会放通 Docker 自己写的规则，
-# 但它和 docker 的链式规则交互有坑，最可靠的做法是「以 Windows 侧实测为准」
-sudo ufw status
+sudo ufw status verbose
 ```
 
-> **判断标准只有一个**：下一节的 `Test-NetConnection`。防火墙配置对不对，不由 `firewall-cmd --list-all` 决定。
+要启用（或已启用但需要放通端口）就按下面走。把 `192.168.x.0/24` 换成 L1 记下的 **VMware 网段**
+（取值办法见本节末）：
+
+```bash
+# ① 有 SSH 的话先放通 22，否则 ufw enable 会把自己锁在门外
+sudo ufw allow OpenSSH
+
+# ② 启用
+sudo ufw enable
+
+# ③ 只对 VMware 网段放通本仓库的四个端口（比 --add-port 对全世界开放更贴架构第 9 节）
+sudo ufw allow from 192.168.x.0/24 to any port 5432 proto tcp comment 'shopsage postgres'
+sudo ufw allow from 192.168.x.0/24 to any port 6379 proto tcp comment 'shopsage redis'
+sudo ufw allow from 192.168.x.0/24 to any port 9090 proto tcp comment 'shopsage prometheus'
+sudo ufw allow from 192.168.x.0/24 to any port 3000 proto tcp comment 'shopsage grafana'
+
+# ④ 核对；编号用于删除：sudo ufw delete <编号>
+sudo ufw status numbered
+```
+
+```bash
+# ⑤ 仅 CentOS/RHEL 系（那类系统上才用 firewalld；Ubuntu 上跳过本段）
+sudo firewall-cmd --add-port=5432/tcp --add-port=6379/tcp --add-port=9090/tcp --add-port=3000/tcp
+sudo firewall-cmd --runtime-to-permanent
+```
+
+> ⚠️ **Docker 发布端口会绕过 ufw**：docker 是在 **nat 表 PREROUTING 写 DNAT 规则**把宿主端口转到容器的，
+> 这早于 ufw 所在的 **filter 表**生效。后果有三个，都必须记住：
+> ① `sudo ufw deny 5432` **挡不住** compose 发布的 5432；② 下一节 W2 四行全 `OPEN` **不能证明** ufw 配对了
+> （可能只是 docker 绕过了）；③ 新版 Docker（v28 起「默认加固容器网络」）改过这块语义 ——
+> 用 `docker --version` 确认版本，**不照抄网上旧帖**，以实测为准。
+
+**要真正把「只有 Windows 侧能连」落到端口上**，光靠 ufw 的 filter 规则做不到，用下面两个杠杆之一（推荐 A）：
+
+```bash
+# 方案 A（推荐，仓库已支持）：在仓库根 .env 里把端口绑到 VM 自己的 VMware 网卡 IP
+#   POSTGRES_BIND_IP=192.168.x.y
+#   REDIS_BIND_IP / PROMETHEUS_BIND_IP / GRAFANA_BIND_IP 同理（compose 里都是 ${...BIND_IP:-0.0.0.0}）
+# 改完重跑 up -d，再用 L6 的 ss -lntp 核对：
+#   期望看到 192.168.x.y:5432（绑死那张网卡），而不是 0.0.0.0:5432；其他来源天然连不上
+
+# 方案 B：DOCKER-USER 链（docker 保证这条链归用户、不会被自己重写，遍历时机在 docker 自己的规则之前）
+sudo iptables -I DOCKER-USER -i <网卡名> ! -s 192.168.x.0/24 -j DROP
+#   注意：iptables 规则重启即丢，要装 iptables-persistent 保存 —— 这也是更推荐方案 A 的原因
+```
+
+> **网段怎么拿**：`ip -4 -o addr show scope global | awk '{print $2, $4}'`，把 `192.168.x.y/24` 的前三段补成
+> `192.168.x.0/24` 即是。VMware NAT 下 Windows 侧的源 IP 是 vmnet8 网关（通常 `192.168.x.1`），落在同网段内。
+> 拿不准就先跳过 L7：Ubuntu 默认 inactive、或 docker 绕过 ufw 时，不配也能连通 —— 以 W2 实测为准。
+
+> **判断标准只有一个**：下一节的 `Test-NetConnection`。防火墙配置对不对，不由 `firewall-cmd --list-all` /
+> `ufw status` 决定；反过来，**全 `OPEN` 也不等于 ufw 规则写对了** —— 这是两个方向都要防的误判。
 
 ---
 
@@ -268,10 +318,15 @@ $ip = '<LINUX-IP>'
 | 症状 | 检查 | 结论 / 修法 |
 |---|---|---|
 | 全 BLOCKED | L6 的 `ss -lntp` 输出 | 绑成了 `127.0.0.1` → 改 compose 的 `ports` 为 `0.0.0.0:xxx:xxx` |
-| 全 BLOCKED（且 L6 正常） | Linux 上 `firewall-cmd --list-all` / `ufw status` | 防火墙没放通 → 执行 L7 |
+| 全 BLOCKED（且 L6 正常） | Linux 上 `sudo ufw status verbose`（Ubuntu）/ `firewall-cmd --list-all`（CentOS/RHEL 系） | 防火墙没放通 → 执行 L7（Ubuntu 只动 ufw，别再用 firewalld） |
 | 单个 BLOCKED | `docker compose ... ps` | 该服务没起来/在 restart 循环 → 看它的 `logs` |
 | ping 得通但端口不通 | 两边 `ip -4 addr show` | 不在同一网段（NAT vs 仅主机 vs 桥接）→ 在 VMware 里统一网络模式 |
 | Windows 上能连、容器间不能连 | `docker compose exec redis redis-cli ping` | 容器间走 compose 网络，与服务名 `postgres`/`redis` 解析，与宿主 IP 无关 |
+| `ufw` 里明明 deny 了某端口，这里却仍 `OPEN` | `ss -lntp \| grep <端口>` 看监听地址 | 不是 ufw 失效，是 **docker 的 DNAT 早于 ufw 的 filter**（绕过）→ 别用 ufw 做容器端口白名单，改用 L7 方案 A/B |
+
+> ⚠️ **`OPEN` 只证明「网络通」，不证明「防火墙规则对」**：docker 发布端口走 nat 表 PREROUTING、早于 ufw 的
+> filter 规则生效，所以被 `ufw deny` 的端口也可能照样 `OPEN`。这条命令是「Windows 能连上依赖」的证据
+> （第 2 步的验收项），**不是**「ufw 配置正确」的证据 —— 要验证后者看 L7 方案 A 的 `ss -lntp` 监听地址。
 
 ### W3. 浏览器确认可观测栈（第 12 步的前置彩排）
 
@@ -350,6 +405,6 @@ uv run python -c "import redis; from dotenv import dotenv_values; print(redis.fr
 1. **compose 的 `.env` 是「项目目录相对」的**，读不到时不报错、静默退默认值 —— 与 `config-guide.md` §1.7 同一个坑。
 2. **compose 的 bind mount 相对路径也是「项目目录相对」的**：`--project-directory .` 下必须写 `./infra/prometheus/...`，写 `./prometheus/...` 不会报「文件不存在」，而是 Docker 建个空目录去挂 → `not a directory`（Prometheus）或静默空挂载（Grafana）。「源不存在」在 Docker 里是**静默变成空目录**，不是报错。
 3. **`POSTGRES_*` 与 `DATABASE_URL` 是两套消费者**（compose 初始化 vs 应用连接），必须同步改。
-4. **端口必须绑 `0.0.0.0`** 才能被跨主机的 Windows 连到；`127.0.0.1` 只对自己可见。
+4. **端口必须绑 `0.0.0.0`**（或绑 VM 自己那张 VMware 网卡 IP，见 L7 方案 A）才能被跨主机的 Windows 连到；`127.0.0.1` 只对自己可见。
 5. **postgres 的初始化环境变量只在空卷时生效一次** —— 「改了密码不生效」几乎都是这条。
 6. **Prometheus 容器里的 `localhost` 是它自己**，要采集 Windows 上跑的代码得用 docker 网桥网关（默认 `172.17.0.1`）。
