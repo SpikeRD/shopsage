@@ -80,7 +80,12 @@ services:
     ports:
       - "${PROMETHEUS_BIND_IP:-0.0.0.0}:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # ⚠️ 路径带 infra/ 前缀是必须的：bind mount 的相对路径按【项目目录】解析，
+      # 而 --project-directory . 把项目目录钉在仓库根，所以 ./prometheus/... 会指向
+      # 仓库根的 prometheus/（不存在）→ Docker 自动建个空目录再挂到文件上，
+      # 报 "not a directory: Are you trying to mount a directory onto a file"。
+      # 改这两个路径时别丢了 --project-directory . 的对应关系（见文件头注释）。
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     healthcheck:
       # prom/prometheus 镜像里没有 curl，用官方自带的 promtool 探活
@@ -108,7 +113,9 @@ services:
     volumes:
       # 用 provisioning 自动挂数据源：省掉「手点 UI 加 datasource」这一步，
       # 第 12 步验收「能从 Grafana 定位慢在哪一步」时开箱即用
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # 同样必须是 ./infra/...（原因见 prometheus 服务里的注释）；
+      # 少了 infra/ 时不会报错，只会静默挂上一个空目录 → 「Grafana 没数据源」
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
     depends_on:
       prometheus:

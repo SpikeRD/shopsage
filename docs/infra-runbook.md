@@ -313,8 +313,9 @@ uv run python -c "import redis; from dotenv import dotenv_values; print(redis.fr
 | `docker compose config` 报变量为空 | 没走 `--project-directory .`，根 `.env` 没被读到（**静默**） | `docker compose ... config \| grep published` 看端口有没有渲染出来 | 命令写全 `-f infra/docker-compose.dev.yml --project-directory .` |
 | postgres 反复 unhealthy | 数据卷是旧版本初始化的 / 密码改过但卷没重建 | `docker compose ... logs postgres` 是否报 `database ... does not exist` 或认证失败 | `down -v` 后重来（⚠️ 会删数据），或改回原凭据 |
 | 改了 `POSTGRES_PASSWORD` 但没生效 | postgres 的初始化变量**只在空数据卷时生效一次** | 卷已存在 | `down -v` 重建，或进库 `ALTER USER` |
-| Grafana 没数据源 | provisioning 文件没挂上（常见于仓库放在共享文件夹） | `docker compose ... logs grafana \| grep -i provision` | 仓库挪到 Linux 原生目录后重建 |
-| Prometheus 起不来 | 配置 bind mount 权限问题 | `docker compose ... logs prometheus` | 同上；`chmod 644 infra/prometheus/prometheus.yml` |
+| `up -d` 报 `OCI runtime create failed: ... not a directory: Are you trying to mount a directory onto a file`（Prometheus） | compose 里 bind mount 的相对路径**少了 `infra/` 前缀**：相对路径按「项目目录」解析，而 `--project-directory .` 把项目目录钉在仓库根，于是 `./prometheus/...` 指向仓库根下并不存在的位置，Docker 把它**自动建成空目录**再去挂文件 → 目录挂到文件必失败 | `docker compose -f infra/docker-compose.dev.yml --project-directory . config \| grep -i source` 看渲染出的**宿主绝对路径**；再 `ls -la prometheus` 确认仓库根多了个空目录 | compose 改成 `./infra/prometheus/prometheus.yml`（Grafana 同理 `./infra/grafana/provisioning`）；删掉 Docker 建的空目录：`rmdir prometheus grafana`（`rmdir` 非空会拒绝，不会误删 `infra/` 下的真配置）；再 `up -d` |
+| Grafana 没数据源 | ① 仓库在共享文件夹（hgfs）导致挂载权限异常；② compose 里写的是 `./grafana/provisioning`（少 `infra/`）→ 静默挂上空目录，**不报错** | `docker compose ... logs grafana \| grep -i provision`；或 `docker compose ... config \| grep -i source` 核对宿主路径 | ① 仓库挪到 Linux 原生目录后重建；② 修 compose 路径同上 |
+| Prometheus 起不来（挂载成功但配置读不到） | 配置 bind mount 权限问题 | `docker compose ... logs prometheus` | `chmod 644 infra/prometheus/prometheus.yml`；仓库在共享文件夹时挪到原生目录 |
 | 端口被占用 | Linux 上已有 postgres/redis（或别的项目） | `ss -lntp \| grep 5432` | 在 `.env` 里改 `POSTGRES_PORT`，**并同步 `DATABASE_URL` 的端口** |
 | Windows 报 `psycopg` 缺失 | 第 3 步的依赖还没加，**或**命令没走 `uv run`（用到了全局解释器） | `uv run python -c "import sys; print(sys.prefix)"` 看是不是仓库根的 `.venv` | 用 `uv add psycopg[binary]`（第 3 步）加依赖，并用 `uv run` 执行命令 |
 | `ModuleNotFoundError: No module named 'app'` | 用裸 `python` 在非仓库根执行（`app/` 靠当前工作目录进 `sys.path`） | `Get-Location` | 改用 `uv run`（固定项目根），或 `cd` 回仓库根；见 `config-guide.md` §1.7 |
@@ -344,10 +345,11 @@ uv run python -c "import redis; from dotenv import dotenv_values; print(redis.fr
 
 ---
 
-## 6. 记住这五个坑（面试/复述用）
+## 6. 记住这六个坑（面试/复述用）
 
 1. **compose 的 `.env` 是「项目目录相对」的**，读不到时不报错、静默退默认值 —— 与 `config-guide.md` §1.7 同一个坑。
-2. **`POSTGRES_*` 与 `DATABASE_URL` 是两套消费者**（compose 初始化 vs 应用连接），必须同步改。
-3. **端口必须绑 `0.0.0.0`** 才能被跨主机的 Windows 连到；`127.0.0.1` 只对自己可见。
-4. **postgres 的初始化环境变量只在空卷时生效一次** —— 「改了密码不生效」几乎都是这条。
-5. **Prometheus 容器里的 `localhost` 是它自己**，要采集 Windows 上跑的代码得用 docker 网桥网关（默认 `172.17.0.1`）。
+2. **compose 的 bind mount 相对路径也是「项目目录相对」的**：`--project-directory .` 下必须写 `./infra/prometheus/...`，写 `./prometheus/...` 不会报「文件不存在」，而是 Docker 建个空目录去挂 → `not a directory`（Prometheus）或静默空挂载（Grafana）。「源不存在」在 Docker 里是**静默变成空目录**，不是报错。
+3. **`POSTGRES_*` 与 `DATABASE_URL` 是两套消费者**（compose 初始化 vs 应用连接），必须同步改。
+4. **端口必须绑 `0.0.0.0`** 才能被跨主机的 Windows 连到；`127.0.0.1` 只对自己可见。
+5. **postgres 的初始化环境变量只在空卷时生效一次** —— 「改了密码不生效」几乎都是这条。
+6. **Prometheus 容器里的 `localhost` 是它自己**，要采集 Windows 上跑的代码得用 docker 网桥网关（默认 `172.17.0.1`）。
