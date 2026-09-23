@@ -24,3 +24,22 @@
 2. **problem-solving.md**：按 P0 → P1 → P2 优先级，把架构中的设计落到可验证的工程问题，形成「问题 → 方案 → 证据」闭环。
 3. **docs/modules/Number.xxx.md**：开始写某个模块前，读它对应的「开发 + 测试」文档；开发完按「验收标准」自检并回填证据。
 4. **docs/runbook/**：动到环境/库/迁移这类「必须一步步确认」的操作时，照抄同编号的实操手册（`3.db-runbook.md` 等），并把实测输出回填到模块文档第 8 节。
+
+## 当前进度
+
+| 模块 | 状态 | 代码 | 验证方式 |
+|---|---|---|---|
+| 1 config | ✅ 完成 | `app/config/` | `uv run pytest -q tests/test_config.py` |
+| 2 infra（仅开发依赖） | ✅ 依赖栈在 Linux VM 上跑通 | `infra/docker-compose.dev.yml` | `docs/runbook/2.infra-runbook.md` |
+| 3 **db** | ✅ **完成**（8 张表 / 迁移 / 种子 / 行级过滤 / 连接池） | `app/db/`、`alembic/`、`scripts/` | `uv run alembic upgrade head` → `uv run python -m scripts.seed` → `uv run python -m scripts.db_check --check` → `uv run pytest -q`（**97 passed, 1 skipped**） |
+
+常用命令（都在**仓库根**执行；本机无 Docker，数据库在 VMware-Linux 上）：
+
+```bash
+uv run pytest -q                              # 全量测试（连不上库时 db 用例自动 skip）
+uv run pytest -q -m "not db"                  # 只跑不需要数据库的用例
+uv run alembic upgrade head                   # 建表 / 升级（连接串从 .env 读，见 alembic/README）
+uv run python -m scripts.seed                 # 灌演示数据（幂等：重复执行结果一致）
+uv run python -m scripts.db_check             # 现场核查：表、行数、约束统计
+uv run python -m scripts.db_check --check     # 验收断言：缺表/行数不足则退出码 1
+```

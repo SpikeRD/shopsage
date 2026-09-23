@@ -166,7 +166,7 @@ employees       (emp_id, name, role, dept, level)                             --
 
 ## 10. Git 管理
 
-- monorepo 结构：`app/`、`web/`（Next.js 前端）、`infra/`（docker yaml，开发依赖栈为 `infra/docker-compose.dev.yml`；生产 compose 属第 19 步）、`docs/`、`scripts/`、`eval/`。
+- monorepo 结构：`app/`、`web/`（Next.js 前端）、`infra/`（docker yaml，开发依赖栈为 `infra/docker-compose.dev.yml`；生产 compose 属第 19 步）、`docs/`、`scripts/`（`seed.py` 种子数据、`db_check.py` 现场核查）、`tests/`（第 3 步的 `tests/test_db_*.py`）、`eval/`；**数据库迁移在 `alembic/`（第 3 步已落地，`env.py` 从 `Settings` 注入连接串、不把密码写进 `alembic.ini`）**。
 - Conventional Commits + pre-commit（ruff/black/mypy）。
 - 分支：main / develop / feature-*。
 - CI：lint → test → 构建镜像 → 部署。

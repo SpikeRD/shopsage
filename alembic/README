@@ -1,0 +1,57 @@
+# alembic/ — 数据库迁移
+
+第 3 步（`docs/modules/3.db.md`）的迁移工程。逐步操作手册见
+[`docs/runbook/3.db-runbook.md`](../docs/runbook/3.db-runbook.md) §3；本文件只记「这个目录里的约定」。
+
+## 文件分工
+
+| 文件 | 作用 |
+|---|---|
+| `../alembic.ini` | Alembic 配置。**必须保持纯 ASCII**（见下） |
+| `env.py` | 运行环境：注入连接串、`target_metadata`、autogenerate 护栏 |
+| `script.py.mako` | 新迁移文件的模板（Alembic 自带） |
+| `versions/` | 迁移脚本，**要提交进 Git**（`file_template` 带日期前缀，按名字排序即时间序） |
+
+## 四条约定
+
+1. **连接串不写进 `alembic.ini`**：唯一真相是仓库根 `.env` 的 `DATABASE_URL`，
+   由 `env.py` 通过 `app.config.get_settings()` 注入。想临时指向别的库用
+   `alembic -x db_url=postgresql://... upgrade head`。
+   —— 两处都写必然漂移（改了 `.env` 忘了 ini，症状是「迁移跑到了别的库」），而且 ini 会进 Git。
+
+2. **`alembic.ini` 保持纯 ASCII**：Alembic 用 `configparser` 的 **`encoding="locale"`** 读它，
+   zh-CN Windows 上 locale 是 **GBK**，ini 里只要有中文就会在**读配置阶段**报
+   `UnicodeDecodeError: 'gbk' codec can't decode byte ...`。
+   ⚠️ `PYTHONUTF8=1` **不能**绕过（UTF-8 模式不影响 `"locale"` 的取值）。
+   所以中文说明写在 `env.py` 的 docstring 和本文件里，ini 里只留英文。
+   校验：`python -c "print(sum(b>127 for b in open('alembic.ini','rb').read()))"` → `0`。
+
+3. **`env.py` 必须 `import app.db.models`**：`target_metadata` 只认识「已经定义过」的表，
+   漏了这行 → `--autogenerate` 会**静默生成空迁移**（不报错，最难查）。
+   仓库里用 `tests/test_db_migrations.py::test_initial_migration_creates_all_eight_tables` 钉住这一点。
+
+4. **不许 `Base.metadata.create_all()` 与迁移混用**：那样库里会有表、而 `alembic_version` 是空的，
+   之后 `upgrade` 必报 `relation "users" already exists`。表一律由迁移创建。
+
+## autogenerate 的两道护栏（`env.py` 的 `_process_revision_directives`）
+
+- **空迁移**：库与模型一致时拒绝生成（否则迁移历史里全是 `pass` 文件）；
+  确实需要时显式放开：`alembic -x allow_empty=true revision --autogenerate -m "..."`。
+- **库不是 head**：先要求 `alembic upgrade head`。否则 autogenerate 会拿**旧结构**跟新模型比，
+  产出错误 diff（甚至重复建表）。
+- `-x` 参数只能在 **env 模块级**的 `EnvironmentContext` 上读（`context.get_x_argument()`）；
+  钩子里拿到的是 **MigrationContext**（只有 `get_current_heads()` / `.script`）—— 两者 API 名字很像，别混用。
+
+## 常用命令（仓库根执行）
+
+```bash
+uv run alembic current                      # 当前版本
+uv run alembic history                      # 迁移历史（应无分叉）
+uv run alembic upgrade head                 # 升级到最新
+uv run alembic downgrade base               # 全部回滚（⚠️ 连数据一起删）
+uv run alembic revision --autogenerate -m "add xxx"   # 改完模型后生成迁移（生成后务必人工看 diff）
+uv run alembic upgrade head --sql           # 离线模式：只输出 SQL，不连库
+```
+
+CI / 验收的回环（`3.db.md` §8 第一条验收）：
+`downgrade base` → `upgrade head`，**连跑两轮**都要成功。
