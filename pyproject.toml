@@ -22,8 +22,11 @@ description = "电商企业智能助手"
 # 开发机实测 3.12.9，口径统一为 3.12（不用 3.11：本机未装 3.11，且 3.12 是当前活跃版本）
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.0",
+    "psycopg[binary]>=3.2",
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",
+    "sqlalchemy>=2.0",
 ]
 
 [project.optional-dependencies]

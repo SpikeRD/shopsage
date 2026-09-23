@@ -8,11 +8,19 @@
 |---|---|---|
 | [docs/architecture.md](docs/architecture.md) | 技术框架、模块划分、多 Agent 协作、数据库 Schema、安全/可观测/可伸缩设计、开发部署流程 | 先读，建立整体认知 |
 | [docs/problem-solving.md](docs/problem-solving.md) | 痛点 → 方案 → 技术点 → 指标的工程问题清单（含落地优先级） | 后读，用于落地与面试/简历讲述 |
-| [docs/config-guide.md](docs/config-guide.md) | **配置实操手册**：配置从哪取值、怎么改（`.env` / 环境变量）、Docker 怎么传值、`test_config.py` 怎么手动测 | 第一次配环境时读，排查「配置不生效」时查 |
-| [docs/modules/](docs/modules/README.md) | 每个模块的开发 + 测试文档（8 段模板），含建议开发顺序与 problem-solving 映射 | 开发每个模块前/后，边做边查 |
+| [docs/runbook/1.config-guide.md](docs/runbook/1.config-guide.md) | **配置实操手册**：配置从哪取值、怎么改（`.env` / 环境变量）、Docker 怎么传值、`test_config.py` 怎么手动测 | 第一次配环境时读，排查「配置不生效」时查 |
+| [docs/runbook/2.infra-runbook.md](docs/runbook/2.infra-runbook.md) | **开发依赖启动手册**：跨主机（Windows 开发机 + Linux 依赖机）起 postgres/pgvector/redis/prometheus/grafana、连通性验证、故障速查、证据回填 | 起依赖栈时照抄；「连不上库」时分诊 |
+| [docs/runbook/3.db-runbook.md](docs/runbook/3.db-runbook.md) | **数据库实操手册**：建库/扩展校验、SQLAlchemy 连接与连接池、Alembic 迁移、种子数据、读写引擎切换与行级过滤验证 | 做第 3 步（db）时照抄；查连接数/SQL 归属时用 |
+| [docs/modules/](docs/modules/README.md) | 每个模块的开发 + 测试文档（8 段模板，文件名按建议开发顺序编号），含建议开发顺序与 problem-solving 映射 | 开发每个模块前/后，边做边查 |
+| [docs/runbook/](docs/runbook/) | 实操手册目录（编号与 `docs/modules/` 的第 N 步对齐，如 `1.config-guide.md`、`2.infra-runbook.md`、`3.db-runbook.md`） | 要「怎么做、怎么确认做对了」时读 |
+
+> 📌 **编号约定**：`docs/modules/` 下的模块文档按 [`docs/modules/README.md`](docs/modules/README.md) 的**建议开发顺序**编号
+> （`1.config.md` … `16.web.md`，README 自身不编号）；`docs/runbook/` 下的手册复用同一套编号，即
+> **第 N 步的模块文档配 `N.*` 手册**（例：`3.db.md` ↔ `3.db-runbook.md`）。
 
 ## 建议阅读顺序
 
 1. **architecture.md**：了解技术栈选型与模块边界，明确「对客/对内」两条业务线。
 2. **problem-solving.md**：按 P0 → P1 → P2 优先级，把架构中的设计落到可验证的工程问题，形成「问题 → 方案 → 证据」闭环。
-3. **docs/modules/**：开始写某个模块前，读它对应的「开发 + 测试」文档；开发完按「验收标准」自检并回填证据。
+3. **docs/modules/Number.xxx.md**：开始写某个模块前，读它对应的「开发 + 测试」文档；开发完按「验收标准」自检并回填证据。
+4. **docs/runbook/**：动到环境/库/迁移这类「必须一步步确认」的操作时，照抄同编号的实操手册（`3.db-runbook.md` 等），并把实测输出回填到模块文档第 8 节。
