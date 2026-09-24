@@ -12,11 +12,15 @@
 | [docs/runbook/2.infra-runbook.md](docs/runbook/2.infra-runbook.md) | **开发依赖启动手册**：跨主机（Windows 开发机 + Linux 依赖机）起 postgres/pgvector/redis/prometheus/grafana、连通性验证、故障速查、证据回填 | 起依赖栈时照抄；「连不上库」时分诊 |
 | [docs/runbook/3.db-runbook.md](docs/runbook/3.db-runbook.md) | **数据库实操手册**：建库/扩展校验、SQLAlchemy 连接与连接池、Alembic 迁移、种子数据、读写引擎切换与行级过滤验证 | 做第 3 步（db）时照抄；查连接数/SQL 归属时用 |
 | [docs/modules/](docs/modules/README.md) | 每个模块的开发 + 测试文档（8 段模板，文件名按建议开发顺序编号），含建议开发顺序与 problem-solving 映射 | 开发每个模块前/后，边做边查 |
+| [docs/runbook/4.uv-pytest-basics.md](docs/runbook/4.uv-pytest-basics.md) | **uv / pytest 基础命令手册**：uv 管环境依赖（`sync`/`run`/`add`/锁文件）、pytest 选用例与读输出（`-k`/`-m`/退出码/fixture）、本项目 `db` 标记与实测口径、故障速查 | 第一次拿到仓库时读；命令报错（`exit code 5`、缓存权限）时查 |
 | [docs/runbook/](docs/runbook/) | 实操手册目录（编号与 `docs/modules/` 的第 N 步对齐，如 `1.config-guide.md`、`2.infra-runbook.md`、`3.db-runbook.md`） | 要「怎么做、怎么确认做对了」时读 |
 
 > 📌 **编号约定**：`docs/modules/` 下的模块文档按 [`docs/modules/README.md`](docs/modules/README.md) 的**建议开发顺序**编号
 > （`1.config.md` … `16.web.md`，README 自身不编号）；`docs/runbook/` 下的手册复用同一套编号，即
 > **第 N 步的模块文档配 `N.*` 手册**（例：`3.db.md` ↔ `3.db-runbook.md`）。
+>
+> ⚠️ 一个例外：`4.uv-pytest-basics.md` **不绑定第 4 步模块**，它是任何一步都要用的**工具命令手册**
+> （uv/pytest 底座），放在 `runbook/` 下只是因为同属「怎么做」类文档。
 
 ## 建议阅读顺序
 

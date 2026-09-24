@@ -4,12 +4,16 @@
 - **纯逻辑层（不需要数据库）**：把每个对客查询编译成 SQL，断言「带 WHERE、带 LIMIT」。
   这一层用 `pkgutil` 遍历 `app.db.queries` 里所有公开函数，**新增查询函数时自动纳入检查** ——
   以后有人写了不带 `WHERE user_id` 的封装，测试立刻红，不用等越权事件暴露。
-- **集成层（`@pytest.mark.db`）**：对真库断言「拿 A 的 id 查不到 B 的数据」。
+- **集成层（`@pytest.mark.db`）**：对真库断言「拿 A 的 id 查不到 B 的数据」；
+  库侧证据用 `pg_stat_statements` 时**按 queryid 锚定**，而不是按 «全文含 user_id» 捞一批
+  —— 后者会把「挑种子数据的装置查询」（带 `user_id` 列名、但没有 WHERE）也算成违规（见 §5.2 与 §7.1）。
+  ⚠️ 这几条不要在 `pytest-xdist` 下并发跑（`-n`），否则别的 worker 的 orders 语句会混进快照。
 """
 
 from __future__ import annotations
 
 import inspect
+import re
 from decimal import Decimal
 
 import pytest
@@ -203,15 +207,121 @@ def test_seed_counts_meet_minimum(seeded: None):
         assert snap.counts[table] >= minimum, f"{table} 只有 {snap.counts[table]} 行，要求 >= {minimum}"
 
 
+# 库侧证据的判据（§5.2）：
+#   ① 业务路径「零容忍」—— 只有带行级过滤（`WHERE ... user_id = $n`）的语句才允许落地；
+#   ② 不带 WHERE 的语句只允许命中**已知豁免清单**（测试装置 / 结构自检 / 迁移 introspection），
+#      清单以外出现新的裸 orders 查询 = 有人绕开 `app/db/queries.py` → 测试红。
+# 这两条都按**编译后的 SQL 结构**判定，不按「全文里有没有 user_id 这个词」——后者是假阳性来源：
+# `SELECT DISTINCT orders.user_id FROM orders LIMIT $1` 带 user_id 列名却没有任何过滤。
+#
+# queryid 由 pg_stat_statements 计算（语句文本归一化后的 hash），同一 SQL 的多次执行归并为一条；
+# 因此「拉两次快照比新增 queryid」= 精确定位「本次对客调用到底发了哪些语句」。
+_QUERYID_RE = re.compile(r"queryid\s*=\s*(-?\d+)", re.IGNORECASE)
+
+# 对客出口必须带的行级过滤：绑定参数形态（`$1::BIGINT`，见 pg_stat_statements 的归一化输出）。
+_ROW_FILTER_RE = re.compile(r"WHERE\s+orders\.user_id\s*=", re.IGNORECASE)
+
+# 允许「不带 WHERE」的已知语句（SQL LIKE 通配）
+# ⚠️ 它只用于**人工分诊与测试判据**，不是给判据开的豁免分支：清单外的裸 orders 查询一律算违规。
+UNFILTERED_STMT_EXEMPTIONS: dict[str, str] = {
+    "SELECT DISTINCT orders.user_id%FROM orders%": (
+        "tests/test_db_queries.py::_two_users_with_orders —— 只挑「有订单的用户 id」当前置条件，"
+        "不返回订单内容，天然不该带 WHERE"
+    ),
+    "%information_schema%": "tests/db_helpers.py / scripts/db_check.py 的结构自检，不碰业务行",
+    "SELECT%pg_extension%": "扩展可用性探测（pg_stat_statements / vector 是否装了）",
+}
+
+
+# §5.2 分诊时从活库 `pg_stat_statements` 抄回来的两条真实语句（去掉 `+` 续行符）——
+# 用它们把「判据怎么读」钉成不依赖数据库的用例，避免下次再被「全文含 user_id」误导。
+LIVE_SQL_WITH_ROW_FILTER = (
+    "SELECT orders.order_id, orders.user_id, orders.status, orders.total_amount, "
+    "orders.payment_method, orders.created_at FROM orders "
+    "WHERE orders.user_id = $1::BIGINT "
+    "ORDER BY orders.created_at DESC, orders.order_id DESC LIMIT $2::INTEGER"
+)
+LIVE_SQL_TEST_HELPER_WITHOUT_FILTER = (
+    "SELECT DISTINCT orders.user_id FROM orders LIMIT $1::INTEGER"
+)
+
+
+def _orders_queryid_snapshot() -> dict[int | None, tuple[int, str]]:
+    """orders 相关语句的现场快照：{queryid: (calls, 归一化语句全文)}（只读）。"""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "select queryid, calls, query from pg_stat_statements"
+                " where query ilike '%from orders%'"
+            )
+        ).fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def _queryids_referenced(stmt) -> set[int]:
+    """语句里引用的 queryid（SQLAlchemy 编译输出里以注释形式带 `queryid = ...`）。"""
+    compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    return {int(m) for m in _QUERYID_RE.findall(compiled)}
+
+
+def _sql_like(query: str, pattern: str) -> bool:
+    """纯 Python 的 SQL LIKE 语义（`%` 通配），避免为了判据再往库里发一条查询。"""
+    regex = "^" + ".*".join(re.escape(part) for part in re.split(r"%", pattern)) + "$"
+    return re.match(regex, query, re.IGNORECASE | re.DOTALL) is not None
+
+
+def _is_exempt(query: str) -> bool:
+    """该语句是否命中已知豁免清单（`%` 通配，大小写不敏感）。"""
+    return any(_sql_like(query, pattern) for pattern in UNFILTERED_STMT_EXEMPTIONS)
+
+
+def test_row_filter_regex_matches_filtered_not_helper():
+    """判据读法：`WHERE orders.user_id =` 认得出真过滤语句，不会把装置语句算成过滤。
+
+    这是「带 user_id 列名 ≠ 带 WHERE user_id」的可执行版本：两条语句都含 `user_id`，
+    但只有第一条带行级过滤。用正则判结构，别用 `'user_id' in query` 判。
+    """
+    assert _ROW_FILTER_RE.search(LIVE_SQL_WITH_ROW_FILTER)
+    assert not _ROW_FILTER_RE.search(LIVE_SQL_TEST_HELPER_WITHOUT_FILTER)
+    # 两条都含 user_id —— 这正是「按全文 ilike」会翻车的原因
+    assert "user_id" in LIVE_SQL_WITH_ROW_FILTER
+    assert "user_id" in LIVE_SQL_TEST_HELPER_WITHOUT_FILTER
+
+
+def test_unfiltered_helper_statement_is_on_exemption_list():
+    """挑种子数据的装置查询（无过滤）在豁免清单里；业务裸查询不在（应当被测试抓住）。"""
+    assert _is_exempt(LIVE_SQL_TEST_HELPER_WITHOUT_FILTER)
+    assert _ROW_FILTER_RE.search(LIVE_SQL_WITH_ROW_FILTER)  # 真出口不需要豁免
+    assert not _is_exempt(
+        "SELECT orders.order_id, orders.user_id FROM orders"  # 假想的业务裸查询
+    )
+
+
+def test_sql_like_helper_uses_percent_as_wildcard():
+    """豁免清单用 SQL LIKE 语义（`%` = 任意串），转义字符不该被当通配。"""
+    assert _sql_like(
+        "SELECT DISTINCT orders.user_id FROM orders LIMIT $1",
+        "SELECT DISTINCT orders.user_id%FROM orders%",
+    )
+    assert _sql_like("select 1 from information_schema.tables", "%information_schema%")
+    assert not _sql_like("SELECT orders.order_id FROM orders", "SELECT DISTINCT orders.user_id%")
+
+
 @pytest.mark.db
 def test_live_sql_contains_row_filter(seeded: None):
-    """库侧证据：`pg_stat_statements` 里能看到带 WHERE 的真实语句。
+    """库侧证据（D1）：对客出口落地的真实 SQL 带行级过滤，且没有新的裸 orders 查询。
 
-    拿不到该视图时（未 `shared_preload_libraries`）跳过，并提示改用 `echo=True` 或引擎级事件
-    —— 见 `docs/runbook/3.db-runbook.md` §5.2。
+    判据（按 queryid 锚定，不按「全文含 user_id」）：
+    1. 先取 orders 语句快照 → 调一次 `get_orders_for_customer()`（本次对客查询）→ 再取快照；
+    2. **业务路径零容忍**：由本次调用引入（或 `calls` 上涨）的 orders 语句必须含
+       `WHERE orders.user_id = $n`；
+    3. **不漏新裸查询**：不带 WHERE 的语句只允许命中 `UNFILTERED_STMT_EXEMPTIONS`，
+       否则报错并直接给出完整 SQL 供分诊。
+
+    拿不到该视图时（未配 `shared_preload_libraries`）跳过，提示改用 `echo=True` 或
+    引擎级事件——见 `docs/runbook/3.db-runbook.md` §5.2、§7.1 坑 4/5。
     """
     user_a, _ = _two_users_with_orders()
-    get_orders_for_customer(user_a)  # 先制造一次真实查询
 
     with engine.connect() as conn:
         available = conn.execute(
@@ -219,11 +329,43 @@ def test_live_sql_contains_row_filter(seeded: None):
         ).scalar_one()
         if not available:
             pytest.skip("未安装 pg_stat_statements 扩展：改用 echo=True 打印 SQL 作为等效证据")
-        rows = conn.execute(
-            text(
-                "select query from pg_stat_statements"
-                " where query ilike '%from orders%' and query ilike '%user_id%' limit 20"
-            )
-        ).fetchall()
-    assert rows, "pg_stat_statements 里没有看到带 user_id 过滤的 orders 查询"
-    assert all("WHERE" in r[0].upper() for r in rows), "存在不带 WHERE 的 orders 查询 —— 对客路径有裸查询"
+
+    before = _orders_queryid_snapshot()
+    before_calls = {qid: calls for qid, (calls, _) in before.items()}
+
+    get_orders_for_customer(user_a)  # 唯一目的：让真实对客 SQL 落进 pg_stat_statements
+
+    after = _orders_queryid_snapshot()
+    if not after:
+        pytest.skip(
+            "pg_stat_statements 里没有 orders 语句：确认 `shared_preload_libraries` 或"
+            " `pg_stat_statements.track`（见 3.db-runbook.md §7.1 坑 4）"
+        )
+
+    # 本次调用「新出现」或「被再次执行」的语句
+    touched = {
+        qid: (calls, query)
+        for qid, (calls, query) in after.items()
+        if qid not in before_calls or calls > before_calls[qid]
+    }
+
+    naked = {
+        qid: query
+        for qid, (_, query) in touched.items()
+        if not _ROW_FILTER_RE.search(query)
+    }
+
+    # ① 业务路径零容忍 + 顺带固化「装置查询不算违规」这条口径：
+    #    不带行级过滤的语句只允许命中豁免清单，清单外一律违规
+    violations = {qid: query for qid, query in naked.items() if not _is_exempt(query)}
+    assert not violations, (
+        "对客路径出现裸查询（未带 WHERE user_id 且不在豁免清单）—— 收口到 app/db/queries.py，"
+        f"并把该 SQL 补进 4.security.md 的拦截用例：{violations}"
+    )
+
+    # ② 正向证据：必须看到「带行级过滤的 orders 语句」被真实执行过
+    filtered = {qid: q for qid, (_, q) in touched.items() if _ROW_FILTER_RE.search(q)}
+    assert filtered, (
+        "本次对客调用没有产生带 `WHERE orders.user_id = ` 的语句："
+        "要么走了未封装的查询，要么统计没记录（track）"
+    )

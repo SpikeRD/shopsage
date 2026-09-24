@@ -32,6 +32,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-shopsage}
       # 显式钉住 locale/编码：Windows 侧客户端多为 UTF8，避免中文种子数据乱码
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
     ports:
       # ⚠️ 必须绑 0.0.0.0（默认值）而不是 127.0.0.1：Windows 宿主机要从外部连进来。
       # 只想放通 VMware 网段时可设 POSTGRES_BIND_IP=192.168.x.x（写进仓库根 .env）。
