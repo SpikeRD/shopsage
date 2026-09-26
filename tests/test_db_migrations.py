@@ -136,6 +136,13 @@ def test_migration_round_trip_is_repeatable():
     """`downgrade base` → `upgrade head` 跑**两遍**都成功，且表集合回到 9 张。
 
     末尾重新灌种子数据，避免把演示库留在空库状态。
+
+    ⚠️ 末尾还要**重放只读角色授权**：`downgrade base` 会 `DROP TABLE`，而
+    `GRANT SELECT ON TABLE orders` 是挂在**表对象**上的 —— 表一删授权就没了，
+    随后 upgrade 建回来的是全新的表，只读角色会变成「一张表都读不了」。
+    实测踩过：跑完本用例后 `tests/test_db_queries.py` 全线
+    `permission denied for table orders`。所以这里显式重放（幂等，可重复调用），
+    详见 `scripts/db_readonly.py::regrant` 与 `docs/runbook/4.security-runbook.md` §3.4。
     """
     cfg = _alembic_config()
 
@@ -161,7 +168,12 @@ def test_migration_round_trip_is_repeatable():
             f"第 {round_no} 轮升级后缺表: {set(BUSINESS_TABLES) - after_upgrade}"
         )
 
-    # 收尾：把种子数据灌回来，别让演示库空着
+    # 收尾 1：重放只读角色授权（表被 DROP 过，授权需要重新挂到新表上）
+    from scripts.db_readonly import regrant
+
+    regrant()
+
+    # 收尾 2：把种子数据灌回来，别让演示库空着
     from scripts.seed import seed
 
     counts = seed()

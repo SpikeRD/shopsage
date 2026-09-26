@@ -23,10 +23,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger(__name__)
 
 # 敏感字段：只读不打印，repr / 日志里整体脱敏为 **********
-_SENSITIVE_FIELDS = frozenset({"llm_api_key", "langfuse_secret_key"})
+_SENSITIVE_FIELDS = frozenset({"llm_api_key", "langfuse_secret_key", "jwt_secret"})
 
 # 可能内嵌密码的连接串：整体掩码会丢掉排障价值，所以只掩码密码段
-_MASKED_URL_FIELDS = ("database_url", "redis_url")
+_MASKED_URL_FIELDS = ("database_url", "database_read_url", "redis_url")
 
 # 匹配 scheme://user:password@ 中的密码段。
 # 密码段用贪婪的 [^/\s]*，这样密码里出现未转义的 @ 也能被一并吃掉，
@@ -188,7 +188,17 @@ class Settings(BaseSettings):
 
     # 数据 / 缓存
     database_url: str = ""
+    # 只读连接串（第 4 步 security 落地）：Text-to-SQL 的读路径只走它，写操作在数据库层被拒。
+    # 留空 = 读路径回落到 `database_url`（此时「只读」只在命名上成立，见 3.db-runbook §5.3）。
+    # ⚠️ 必须**显式声明**成字段，不能靠 extra="allow" 兜：pydantic 的 extra 只保留
+    #    「看起来像本模型字段」的键，第 1 步就定好的 `DATABASE_READ_URL` 属于配置的一部分。
+    database_read_url: str = ""
     redis_url: str = ""
+
+    # 鉴权（第 4 步 security）：JWT 签名密钥。
+    # 用 SecretStr，保证 repr / dump_for_logging / 报错回显里都不会出现明文（同 llm_api_key 的待遇）。
+    # 生产（ENV=prod）缺失时 `app/security/auth.py` 会拒绝启动 —— 不允许静默用弱默认密钥。
+    jwt_secret: SecretStr = SecretStr("")
 
     # LLM（多模型路由：主 + 备）
     llm_primary: str = ""
@@ -313,7 +323,7 @@ class Settings(BaseSettings):
     # 注意 pydantic 的 BaseModel.__str__ 不会调用我们覆写的 __repr__，
     # 它自己拼字段显示；所以 __str__ 必须单独覆写，否则 str(settings) 会泄露明文。
 
-    @field_serializer("database_url", "redis_url", when_used="json")
+    @field_serializer("database_url", "database_read_url", "redis_url", when_used="json")
     def _serialize_masked_urls(self, value: str) -> str:
         """连接串走 JSON 序列化时掩码密码段（json 出口通常意味着跨进程/进日志）。"""
         return _mask_url_password(value)
