@@ -29,6 +29,29 @@ def pytest_configure(config) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _reset_logging_state():
+    """防御性装置：把被**库代码**关停的 logger 打开。
+
+    背景（本仓实测）：`alembic/env.py` 会执行 `logging.config.fileConfig()`，
+    且它的默认行为是 `disable_existing_loggers=True` —— 一次**全局**日志重配置。
+    `tests/test_db_migrations.py` 在 import 期触发它，于是它之后的用例里 `caplog` 收不到日志：
+    典型症状是「断言日志的用例单独跑绿、全量跑红」，非常难查。
+
+    根因已修（`alembic/env.py` 显式传 `disable_existing_loggers=False`），
+    这里再兜一道：**任何**库/工具关停日志都不该让别的用例静默失效。
+    `disabled` 是每个 logger 上的显式开关（与 level 无关），清掉它不会改变日志级别策略。
+    """
+    import logging
+
+    for name in list(logging.root.manager.loggerDict):
+        logger = logging.getLogger(name)
+        if isinstance(logger, logging.Logger) and logger.disabled:
+            logger.disabled = False
+    logging.getLogger().disabled = False
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_settings_cache():
     """每条用例前后清掉 `get_settings()` 的 lru_cache。
 

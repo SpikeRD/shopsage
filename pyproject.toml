@@ -24,6 +24,7 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.20.0",
     "litellm>=1.50",
+    "openai>=1.0",
     "psycopg[binary]>=3.2",
     "pydantic-settings>=2.0",
     "pyjwt>=2.8",
@@ -44,6 +45,7 @@ dev = [
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.uv]
@@ -53,3 +55,10 @@ required-version = ">=0.11"
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# async 用例（tests/test_llm_client_retry.py 的取消语义用例）走 pytest-asyncio：
+# auto 模式省掉每条用例写 @pytest.mark.asyncio 的噪音
+asyncio_mode = "auto"
+markers = [
+    # 真实厂商探活（花钱/需密钥）：默认不跑；CI 与日常用 `-m "not llm_live"` 排除
+    "llm_live: 需要真实 LLM API key 的探活用例（见 tests/test_llm_live.py、docs/runbook/5.llm-runbook.md §4）",
+]

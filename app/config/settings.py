@@ -205,6 +205,11 @@ class Settings(BaseSettings):
     llm_fallback: str = ""
     llm_api_key: SecretStr = SecretStr("")
 
+    # 向量化模型（第 5 步 llm 的 embed() 用；第 10 步 rag 检索、第 13 步 cache 判相似都走它）。
+    # 与 llm_primary 分开配置：embedding 端点常常不是同一个厂商/同一个模型族
+    # （见 docs/runbook/5.llm-runbook.md §7.4），所以不能共用 llm_primary。
+    embedding_model: str = "openai/text-embedding-3-small"
+
     # 可观测
     otel_endpoint: str = ""
     langfuse_public_key: str = ""
@@ -253,6 +258,17 @@ class Settings(BaseSettings):
             )
         if primary != self.llm_primary:
             object.__setattr__(self, "llm_primary", primary)
+
+        # embedding_model 与 llm_primary 同类：空/空白会让 embed() 在请求路径上必然失败，
+        # 且 litellm 对空模型名的报错很隐晦（会走到「不认识这个 provider」），所以在这里拦住。
+        embedding = self.embedding_model.strip()
+        if not embedding:
+            raise ValueError(
+                "embedding_model 不能为空（EMBEDDING_MODEL 被显式设为空/空白）。"
+                "留空不会回退到默认模型，请填写模型名。"
+            )
+        if embedding != self.embedding_model:
+            object.__setattr__(self, "embedding_model", embedding)
 
         fallback = self.llm_fallback.strip()
         if fallback != self.llm_fallback:

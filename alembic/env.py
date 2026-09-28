@@ -58,7 +58,16 @@ def _process_revision_directives(context, revision, directives) -> None:  # noqa
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # ⚠️ `disable_existing_loggers=False` 是必须的（踩过）：
+    # fileConfig() 默认 **True**，会把「此刻已存在的所有 logger」强制 `disabled=True`，
+    # 并把 root logger 的 handler 换成 ini 里的 console handler ——
+    # 也就是说它是一次**全局日志重配置**，不只影响 alembic。
+    # 实测到的后果（本仓）：`tests/test_db_migrations.py` 在 import 期就 import 了本模块，
+    # 于是该文件之后的所有用例里 `caplog` 再也收不到任何日志，
+    # `tests/test_llm_client_retry.py` 那些「断言退避日志」的用例在**全量跑时红、单独跑时绿**。
+    # 关掉它之后：alembic/sqlalchemy 的日志照旧按 ini 生效（我们只关心这两族），
+    # 而其它 logger（app.*、pytest 的 caplog 等）不再被无辜关停。
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
