@@ -8,7 +8,10 @@
 > [`1.config-guide.md`](../runbook/1.config-guide.md)（配置取值 / 改法 / 验证）、
 > [`2.infra-runbook.md`](../runbook/2.infra-runbook.md)（本机 VMware-Windows 没有 Docker，依赖栈跑在 VMware-Linux 上：
 > 启动顺序、期望输出、故障速查、证据回填格式照抄即可）、
-> [`3.db-runbook.md`](../runbook/3.db-runbook.md)（建表 / 迁移 / 种子数据 / 连接池与行级过滤的逐步验证）。
+> [`3.db-runbook.md`](../runbook/3.db-runbook.md)（建表 / 迁移 / 种子数据 / 连接池与行级过滤的逐步验证）、
+> [`4.security-runbook.md`](../runbook/4.security-runbook.md)（SQL 白名单 / 越权拦截 / 脱敏 / 鉴权 / 只读角色）、
+> [`5.llm-runbook.md`](../runbook/5.llm-runbook.md)（LiteLLM 门面 / 429 指数退避重试 / `embed()`；含依赖安装与离线 mock 测法），
+> 另有不绑定某一步的底座命令手册 [`4.uv-pytest-basics.md`](../runbook/4.uv-pytest-basics.md)（uv 环境与 pytest 选用例）。
 >
 > 📌 **本目录文件已按「建议开发顺序」编号**（`1.config.md` … `16.web.md`，与下表 `#` 一致；
 > README 自身不编号）。下表第 11 步复用第 7 步的文件，所以这里只出现一次 `7.agents_module.md`。
