@@ -39,6 +39,14 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+# 本地 embedding 后端（EMBEDDING_BACKEND=local）用：`uv sync --extra local`
+# ⚠️ 刻意【不做】默认依赖：它会把 torch 拉进默认环境（约 2 GB），而默认的 API 后端（litellm）根本不需要它。
+#    代码侧也必须配合：sentence_transformers 只能在函数内 import，否则没装 extras 的环境
+#    连 `import app.llm` 都会失败（API 后端也跟着用不了）。
+#    选型与两种后端的取舍见 docs/runbook/5.llm-runbook.md §7.2、docs/modules/5.llm.md 第 4 节第 7 条。
+local = [
+    "sentence-transformers>=3.0",
+]
 
 # dev 依赖的 uv 原生写法（PEP 735 依赖组）：
 # `uv sync` 默认就会装上 dev 组，不需要 `--extra dev`；等价于 pip 侧的 `-e ".[dev]"`

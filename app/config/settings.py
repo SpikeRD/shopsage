@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from dotenv import dotenv_values
-from pydantic import SecretStr, field_serializer, model_validator
+from pydantic import Field, SecretStr, field_serializer, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 不添加任何 handler：日志交给应用层（app/config/logging.py）配置，
@@ -201,14 +201,35 @@ class Settings(BaseSettings):
     jwt_secret: SecretStr = SecretStr("")
 
     # LLM（多模型路由：主 + 备）
+    # ⚠️ 密钥按用途分层：主模型 / 降级模型 / embedding 各一把，**不共用**。
+    #    理由见 docs/runbook/5.llm-runbook.md §1.2.1：降级链天生跨厂商（主 DeepSeek、备 OpenAI
+    #    之类），拿 A 家的 key 打 B 家的端点必然 401，而降级发生的时刻正是主模型已经不可用的时候，
+    #    此刻失败＝直接对用户报错。此外还带来故障隔离（主 key 被限流时备路径仍可用）、独立轮换、账单可归属。
     llm_primary: str = ""
     llm_fallback: str = ""
     llm_api_key: SecretStr = SecretStr("")
+    # 降级模型**专用**密钥（留空 = 没配，此时用 fallback 模型会明确报错，见 _resolve_credentials）
+    llm_fallback_api_key: SecretStr = SecretStr("")
+    # 降级模型的端点覆盖（仅当备模型走 OpenAI 兼容网关/自建代理时需要）
+    llm_fallback_api_base: str = ""
 
-    # 向量化模型（第 5 步 llm 的 embed() 用；第 10 步 rag 检索、第 13 步 cache 判相似都走它）。
-    # 与 llm_primary 分开配置：embedding 端点常常不是同一个厂商/同一个模型族
-    # （见 docs/runbook/5.llm-runbook.md §7.4），所以不能共用 llm_primary。
+    # 向量化（第 5 步 llm 的 embed() 用；第 10 步 rag 检索、第 13 步 cache 判相似都走它）。
+    # 与 llm_primary 分开配置：embedding 端点常常不是同一个厂商/同一个模型族。
+    # 支持两种后端（接口完全一样，调用方不感知）：
+    #   litellm → 调 API：按 token 计费、文本出网、可能 429/超时（可重试）
+    #   local   → 本地 sentence-transformers：零边际成本、文本不出网、吃本机 CPU/内存
+    #             需要可选依赖 `uv sync --extra local`；选型判据见 runbook §7.2
+    embedding_backend: Literal["litellm", "local"] = "litellm"
     embedding_model: str = "openai/text-embedding-3-small"
+    # embedding 单独密钥；留空 = 复用 llm_api_key（**厂商与主模型不同时必须单独填**）
+    embedding_api_key: SecretStr = SecretStr("")
+    # 期望向量维度：>0 时实际维度不符**直接报错**（0 = 不校验）。
+    # 防的是「换了模型/后端后维度变了」——最坏情况不是维度不一致（写库会响），
+    # 而是**维度恰好相同但向量空间不相容**：检索看着正常、结果全是乱码，掉分时你会先去怀疑 prompt。
+    embedding_dim: int = Field(default=0, ge=0)
+    # 仅 local 后端：离线环境的本地模型目录；device 写 cpu 最稳（避免无 CUDA 机器上刷 warning）
+    embedding_local_path: str = ""
+    embedding_device: str = ""
 
     # 可观测
     otel_endpoint: str = ""
@@ -278,6 +299,29 @@ class Settings(BaseSettings):
                 "llm_fallback 不能与 llm_primary 相同：降级会变成重复打同一个模型，"
                 "既拿不到可用性收益，还会让故障时的重试量翻倍。"
             )
+
+        # 密钥分层的一致性检查（见 docs/runbook/5.llm-runbook.md §1.2.1）：
+        #  ① 配了 fallback 却**没有**它自己的 key → 降级会以 401 结束，且 401 属不可恢复错误，
+        #     既不会重试也不会再降级，可用性比不加降级还差。dev 只告警（开发时常留空 fallback），
+        #     prod 由 _validate_prod_requirements 直接拒绝启动 —— 宁可开不了机，也不要故障时才暴露。
+        #  ② 两把 key **相同** → 不是错误（同厂商两个模型确实可能共用一把），但意味着**没有故障隔离**，
+        #     值得在启动日志里说一句。
+        fallback_key = self.llm_fallback_api_key.get_secret_value()
+        primary_key = self.llm_api_key.get_secret_value()
+        if fallback and not fallback_key:
+            logger.warning(
+                "配置了 llm_fallback=%s 但没有 LLM_FALLBACK_API_KEY："
+                "降级时会拿主模型的密钥去打备用端点，跨厂商必然 401，"
+                "而降级正是主模型不可用的时候。请补上备用模型的独立密钥。",
+                fallback,
+            )
+        elif fallback_key and fallback_key == primary_key:
+            logger.warning(
+                "LLM_FALLBACK_API_KEY 与 LLM_API_KEY 相同：可以工作，但没有故障隔离 ——"
+                "主密钥被限流/超额时，备用路径会一起失效。"
+                "若两个模型属于不同厂商，请换成各自的密钥。"
+            )
+
         return self
 
     @model_validator(mode="after")
@@ -316,6 +360,17 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"ENV=prod 缺少必填配置: {', '.join(missing)}"
                 "（请通过环境变量或 .env 注入）"
+            )
+
+        # 配了降级模型却没有它自己的密钥：prod **拒绝启动**。
+        # 理由：降级链跨厂商时拿主密钥去打备用端点必然 401，而 401 属不可恢复错误，
+        # 既不会重试也不会再降级 —— 可用性反而比「干脆不配降级」更差。
+        # 这条不能只告警：prod 的告警没人看，故障时才暴露（见 runbook §1.2.1）。
+        if self.llm_fallback and not self.llm_fallback_api_key.get_secret_value():
+            raise ValueError(
+                f"ENV=prod 配置了 llm_fallback={self.llm_fallback}，"
+                "但缺少 llm_fallback_api_key（LLM_FALLBACK_API_KEY）："
+                "降级模型的密钥必须独立配置，不能复用 llm_api_key。"
             )
 
         # 不 fail-fast：降级链也可能由代码内置（见 llm.md 第 13 步），所以只告警。

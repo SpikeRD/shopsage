@@ -31,6 +31,9 @@ def test_prod_ok_when_required_present(monkeypatch):
     monkeypatch.setenv("ENV", "prod")
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
     monkeypatch.setenv("LLM_API_KEY", "sk-secret-123")
+    # 显式给 fallback 的独立密钥：仓库 .env 里若配了 LLM_FALLBACK，prod 下缺这把钥匙会拒绝启动
+    # （见 _validate_prod_requirements 与 runbook §1.2.1）。这条断言的就是「全都配好 → 能启动」。
+    monkeypatch.setenv("LLM_FALLBACK_API_KEY", "sk-fallback-secret-456")
     s = Settings()
     assert s.env == "prod"
     assert s.database_url == "postgresql://u:p@localhost/db"
@@ -381,17 +384,24 @@ def test_read_dotenv_values_candidate_list_order(tmp_path):
 
 
 def test_extra_keys_are_accepted_not_rejected(tmp_path,monkeypatch):
-    """extra="allow"：.env 里属于其他模块的键（如 EMBEDDING_MODEL）不得导致启动失败。
+    """extra="allow"：.env 里**不属于本组件**的键不得导致启动失败。
 
     这是刻意选择：各模块会各自往 .env 加键，本组件不认识就报错，会让「加一个
     无关配置项」直接崩掉启动。注意 `.env` 的键不会进进程环境变量，所以放宽 extra
     并没有放宽配置来源。
+
+    ⚠️ 这里用的键必须是一个**真实存在**的「别人的键」。本用例原先拿 `EMBEDDING_MODEL` 当例子，
+    但它在第 5 步（llm 模块）已经被 `Settings` **正式声明**了 —— 于是它不再进 `__pydantic_extra__`，
+    断言变成 `None == '...'`。这不是回归，而是这条用例的**例子过期了**：
+    凡是「拿某个键举例」的用例，都要在它被正式声明时一起改。
     """
     p = tmp_path / ".env"
-    p.write_text("EMBEDDING_MODEL=text-embedding-3-small\n", encoding="utf-8")
+    p.write_text("RAG_CHUNK_SIZE=800\nLANGFUSE_HOST=http://localhost:3000\n", encoding="utf-8")
     monkeypatch.setenv("LLM_PRIMARY", "deepseek")
     s = Settings(_env_file=p)
-    assert (s.__pydantic_extra__ or {}).get("embedding_model") == "text-embedding-3-small"
+    extra = s.__pydantic_extra__ or {}
+    assert extra.get("rag_chunk_size") == "800"
+    assert extra.get("langfuse_host") == "http://localhost:3000"
 
 
 # --- frozen：配置启动即定型，运行期不得改写 ---
@@ -481,11 +491,17 @@ def test_llm_primary_must_not_be_blank(blank):
 
 
 def test_llm_fallback_must_differ_from_primary():
-    """备模型等于主模型 → 「降级」变成重复打同一个模型，静默丧失可用性收益。"""
+    """备模型等于主模型 → 「降级」变成重复打同一个模型，静默丧失可用性收益。
+
+    ⚠️ 这里**必须显式传 llm_primary**：不传就会读仓库根 `.env` 的 `LLM_PRIMARY`，
+    于是这条用例会随环境变化而失效（实测踩到：把 .env 的 primary 改成 `deepseek/deepseek-flash`
+    后，`llm_fallback="deepseek"` 不再相等，用例变成「DID NOT RAISE」）。
+    凡是断言「两个字段之间的关系」的用例，两个字段都要显式给。
+    """
     with pytest.raises(ValidationError):
-        Settings(llm_fallback="deepseek")  # 默认 primary
+        Settings(llm_primary="deepseek", llm_fallback="deepseek")
     with pytest.raises(ValidationError):
-        Settings(llm_fallback="  deepseek  ")  # 去空格后仍相等
+        Settings(llm_primary="deepseek", llm_fallback="  deepseek  ")  # 去空格后仍相等
 
 
 def test_llm_fallback_empty_is_legal():
@@ -530,6 +546,8 @@ def test_prod_without_fallback_warns_but_starts(caplog):
             env="prod",
             database_url="postgresql://u:p@localhost:5432/db",
             llm_api_key=SecretStr("sk-LEAK-CANARY-999"),
+            # 显式清空：仓库 .env 里若配了 LLM_FALLBACK，这条用例测的就不是「无降级链」了
+            llm_fallback="",
         )
     assert s.env == "prod"
     joined = " | ".join(r.getMessage() for r in caplog.records)
@@ -540,14 +558,125 @@ def test_prod_without_fallback_warns_but_starts(caplog):
 
 
 def test_prod_with_fallback_does_not_warn(caplog):
+    """配齐降级链（模型 + **独立密钥**）→ 不该有 fallback 相关告警。"""
     with caplog.at_level("WARNING", logger="app.config.settings"):
         Settings(
             env="prod",
             database_url="postgresql://u:p@localhost:5432/db",
             llm_api_key=SecretStr("sk-x"),
             llm_fallback="gpt-4o",
+            llm_fallback_api_key=SecretStr("sk-fallback-y"),
         )
     assert not [r for r in caplog.records if "llm_fallback" in r.getMessage()]
+
+
+# --- 降级模型的独立密钥（docs/runbook/5.llm-runbook.md §1.2.1） ---
+
+
+def test_prod_rejects_fallback_without_its_own_key():
+    """prod：配了 fallback 却没有 fallback 的独立密钥 → **拒绝启动**。
+
+    理由：降级链跨厂商时复用主密钥必然 401，而 401 属「不可恢复」→ 不重试也不再降级，
+    可用性反而比不配降级更差。prod 的告警没人看，所以必须 fail-fast。
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(
+            env="prod",
+            database_url="postgresql://u:p@localhost:5432/db",
+            llm_api_key=SecretStr("sk-primary"),
+            llm_fallback="gpt-4o",
+            llm_fallback_api_key=SecretStr(""),
+        )
+    message = str(excinfo.value)
+    assert "llm_fallback_api_key" in message
+    assert "sk-primary" not in message, "报错里不得出现密钥明文"
+
+
+def test_dev_warns_when_fallback_has_no_own_key(caplog):
+    """dev：同样情形只**告警**并正常构造（开发时常先配模型名、后配密钥）。"""
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        s = Settings(
+            llm_primary="deepseek/deepseek-flash",
+            llm_fallback="gpt-4o",
+            llm_api_key=SecretStr("sk-primary"),
+            llm_fallback_api_key=SecretStr(""),
+            _env_file=None,  # 不读仓库 .env：这条用例只测关系，不测本机配置
+        )
+    assert s.llm_fallback == "gpt-4o"
+    joined = " | ".join(r.getMessage() for r in caplog.records)
+    assert "LLM_FALLBACK_API_KEY" in joined
+    assert "401" in joined, "告警要说清后果（跨厂商 401），否则没人会去补这把钥匙"
+
+
+def test_same_key_for_primary_and_fallback_warns_but_works(caplog):
+    """两把 key 相同 → 可以工作，但**没有故障隔离**，应当告警（不是错误）。"""
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        s = Settings(
+            llm_primary="deepseek/deepseek-flash",
+            llm_fallback="deepseek/deepseek-chat",
+            llm_api_key=SecretStr("sk-same"),
+            llm_fallback_api_key=SecretStr("sk-same"),
+            _env_file=None,
+        )
+    assert s.llm_fallback_api_key.get_secret_value() == "sk-same"
+    joined = " | ".join(r.getMessage() for r in caplog.records)
+    assert "故障隔离" in joined
+    assert "sk-same" not in joined, "告警泄露了密钥"
+
+
+def test_fallback_key_is_masked_everywhere():
+    """新密钥字段必须走既有的掩码出口（repr/str/json/dump_for_logging）。"""
+    s = Settings(
+        llm_primary="a",
+        llm_fallback="b",
+        llm_api_key=SecretStr("sk-PRIMARY-CANARY"),
+        llm_fallback_api_key=SecretStr("sk-FALLBACK-CANARY"),
+        embedding_api_key=SecretStr("sk-EMBED-CANARY"),
+        _env_file=None,
+    )
+    for rendered in (repr(s), str(s), s.model_dump_json(), json.dumps(s.dump_for_logging())):
+        for canary in ("sk-PRIMARY-CANARY", "sk-FALLBACK-CANARY", "sk-EMBED-CANARY"):
+            assert canary not in rendered, f"{canary} 泄漏到了 {rendered[:80]}"
+    # 功能出口仍必须是真值（否则连不上/调不通）
+    assert s.llm_fallback_api_key.get_secret_value() == "sk-FALLBACK-CANARY"
+
+
+def test_embedding_backend_only_accepts_two_values():
+    """embedding_backend 是 Literal：写错值启动即失败（而不是等到第一次检索）。
+
+    ⚠️ 每条都要显式给 `llm_primary` + `_env_file=None`：`Settings()` 不读 .env 时
+    `llm_primary` 是空串，会被「主模型不许为空」先拦下 —— 那时这条用例测的就不是 backend 了。
+    """
+    base = {"llm_primary": "deepseek/deepseek-flash", "_env_file": None}
+    assert Settings(embedding_backend="litellm", **base).embedding_backend == "litellm"
+    assert Settings(embedding_backend="local", **base).embedding_backend == "local"
+    with pytest.raises(ValidationError):
+        Settings(embedding_backend="sentence-transformers", **base)
+    with pytest.raises(ValidationError):
+        Settings(embedding_backend="", **base)
+
+
+def test_embedding_dim_defaults_to_zero_meaning_no_check(monkeypatch):
+    """embedding_dim=0 表示「不校验维度」；正数表示强校验（守卫在 client 侧）；负数直接拒绝。
+
+    ⚠️ 断言「默认值」的用例**必须同时挡住 .env 与环境变量**（实测踩到两次）：
+      · 不挡 `.env`：有人按文档把 `EMBEDDING_DIM` 设成 1024 后，用例报 `assert 1024 == 0`；
+      · 只挡 `.env`（`_env_file=None`）**还不够**：环境变量优先级本来就高于 `.env` 与默认值，
+        本机若设了 `$env:EMBEDDING_DIM`，`Settings(_env_file=None)` 依然会拿到 1024 ——
+        实测就是这么红的。所以还要 `delenv`。
+    这条也顺带说明：`_env_file=None` 只关掉「文件来源」，不等于「干净环境」。
+    """
+    monkeypatch.delenv("EMBEDDING_DIM", raising=False)
+
+    # 默认值本身也应该被钉住（读的是字段定义，不依赖任何 .env / 环境变量）
+    assert Settings.model_fields["embedding_dim"].default == 0
+
+    base = {"llm_primary": "deepseek/deepseek-flash", "_env_file": None}
+    assert Settings(**base).embedding_dim == 0, "既无环境变量也无 .env 时必须是默认值 0（= 不校验）"
+    assert Settings(embedding_dim=1024, **base).embedding_dim == 1024  # 显式给值就走显式值
+
+    with pytest.raises(ValidationError):
+        Settings(embedding_dim=-1, **base)
 
 
 

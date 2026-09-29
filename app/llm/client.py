@@ -13,6 +13,7 @@ fallback 链、熔断器、Langfuse 回调属第 13 步 —— 所以 `llm_call`
 import asyncio
 import logging
 import random
+import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -117,6 +118,10 @@ class LLMResponse:
     total_tokens: int
     cost_usd: float | None
     latency_ms: int
+    # `finish_reason`（如 "stop" / "length"）：**推理模型**（deepseek-*、o1 系等）会先把 token
+    # 花在 `reasoning_content` 上，`max_tokens` 给小了就会出现「content 为空但调用成功」——
+    # 有它就分得清「模型真的没说话」和「被截断了」（实测踩到，见 runbook §10.1 坑 8）。
+    finish_reason: str = ""
 
 
 def _translate(exc: Exception, *, max_retries: int) -> LLMError:
@@ -176,9 +181,22 @@ def _to_response(response: Any, latency_ms: int) -> LLMResponse:
 
     choices = getattr(response, "choices", None) or []
     content = ""
+    finish_reason = ""
     if choices:
-        message = getattr(choices[0], "message", None)
+        choice = choices[0]
+        message = getattr(choice, "message", None)
         content = (getattr(message, "content", None) or "") if message is not None else ""
+        finish_reason = str(getattr(choice, "finish_reason", "") or "")
+
+    if not content and finish_reason == "length":
+        # 不是「模型没说话」，而是被 max_tokens 截断了。推理模型（deepseek-* 等）会先把
+        # token 花在 reasoning 上，`max_tokens` 太小就会走到这里 —— 这条日志能让排查少绕一大圈。
+        logger.warning(
+            "LLM 返回内容为空但 finish_reason=length（被 max_tokens 截断）："
+            "model=%s completion_tokens=%s —— 推理模型会把 token 先花在 reasoning 上，请调大 max_tokens。",
+            getattr(response, "model", "?"),
+            getattr(usage, "completion_tokens", "?"),
+        )
 
     return LLMResponse(
         content=content,
@@ -188,7 +206,164 @@ def _to_response(response: Any, latency_ms: int) -> LLMResponse:
         total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
         cost_usd=cost,
         latency_ms=latency_ms,
+        finish_reason=finish_reason,
     )
+
+
+def _resolve_credentials(model: str, settings: Any) -> tuple[str, str | None]:
+    """按**最终要打的模型**解析凭据，返回 `(api_key, api_base)`。
+
+    ⚠️ 为什么必须「按模型」而不是「在函数入口拿一次 llm_api_key」：
+    降级链里 `used_model` 会在运行期从主模型切成备模型，若密钥在入口解析一次，
+    降级那一刻用的仍是**主模型的钥匙** —— 跨厂商时必然 401，而 401 被判为不可恢复错误，
+    于是「重试不重试、降级也不再降级」，可用性比不加降级还差。
+    详见 docs/runbook/5.llm-runbook.md §1.2.1 与 §8.1。
+
+    规则：
+      - 模型 == `llm_fallback` → 用 `llm_fallback_api_key`（+ `llm_fallback_api_base`）；
+        该 key 没配就**明确报错**（而不是静默回落到主密钥 —— 那正是要防的 401）。
+      - 其它模型 → 用 `llm_api_key`。
+    """
+    fallback_key = settings.llm_fallback_api_key.get_secret_value()
+    if settings.llm_fallback and model == settings.llm_fallback:
+        if not fallback_key:
+            raise PermanentLLMError(
+                f"模型 {model!r} 是降级模型（llm_fallback），但没有配置 llm_fallback_api_key"
+                "（LLM_FALLBACK_API_KEY）。降级模型必须用独立密钥：跨厂商复用主密钥必然 401，"
+                "而降级正是主模型不可用的时候。"
+            )
+        return fallback_key, (settings.llm_fallback_api_base or None)
+    return settings.llm_api_key.get_secret_value(), None
+
+
+def _embedding_api_key(settings: Any) -> str:
+    """embedding 的密钥：单独配了就用它，否则复用主模型密钥。
+
+    允许复用是刻意的（同厂商时确实没必要多配一把），但**厂商不同就必须单独配** ——
+    错误信息里会把这一点说清楚，避免只看到一句 401。
+    """
+    dedicated = settings.embedding_api_key.get_secret_value()
+    return dedicated or settings.llm_api_key.get_secret_value()
+
+
+# ── 本地 embedding 后端（EMBEDDING_BACKEND=local）────────────────────────
+#
+# 三件事必须做对，否则「本地免费」会变成线上事故：
+#   ① `sentence_transformers` 只能在**函数内** import（可选依赖）：
+#      顶层 import 会让没装 extras 的环境连 `import app.llm` 都失败 ——
+#      那时连 API 后端都用不了了。
+#   ② `encode()` 是同步 CPU 密集调用 → 必须 `asyncio.to_thread`，
+#      否则会阻塞事件循环，症状是「并发一上来**所有**接口都变慢」。
+#   ③ 模型加载很慢（几百 MB~2 GB），必须**懒加载 + 进程内单例**，绝不能每个请求加载一次。
+
+_local_model: Any = None
+_local_model_name: str | None = None
+_local_model_lock = threading.Lock()  # 加载与 encode 都靠它串行（实例不是线程安全的）
+
+
+def _missing_local_dependency_error() -> PermanentLLMError:
+    """缺可选依赖时的报错：**必须能照着修**，不能是裸 ModuleNotFoundError。"""
+    return PermanentLLMError(
+        "本地 embedding 后端需要可选依赖 sentence-transformers（含 torch，约 2 GB）。"
+        "请执行 `uv sync --extra local`；或把 EMBEDDING_BACKEND 切回 litellm 用 API 后端。"
+        "详见 docs/runbook/5.llm-runbook.md §7.4。"
+    )
+
+
+def _load_local_model(model_name: str, *, device: str = "") -> Any:
+    """懒加载 + 进程内单例。首次调用会下载权重（这是「第一个请求很慢」的原因）。"""
+    global _local_model, _local_model_name
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:  # noqa: PERF203 - 可选依赖
+        raise _missing_local_dependency_error() from exc
+
+    with _local_model_lock:
+        if _local_model is None or _local_model_name != model_name:
+            logger.info("加载本地 embedding 模型：%s（device=%s）", model_name, device or "auto")
+            _local_model = SentenceTransformer(model_name, device=device or None)
+            _local_model_name = model_name
+        return _local_model
+
+
+async def _embed_local(items: list[str], model_name: str, settings: Any) -> list[list[float]]:
+    """本地后端：把 encode 丢进线程，避免阻塞事件循环（runbook §7.3.2 的头号坑）。"""
+    path = settings.embedding_local_path.strip()
+    resolved = path or model_name  # 离线环境用本地目录覆盖 HF 仓库名
+
+    # ⚠️ 前置检查是**确定性**的，必须放在第一次尝试之前 —— 它抛 PermanentLLMError，
+    #    由 `_run_with_retry` 原样抛出（不会重试）。实测踩到过反例：缺少可选依赖时
+    #    ImportError 被当成「未识别异常 → 不可恢复」，但**模型名写错**（HF 401/404）却被
+    #    当成可恢复错误重试 3 次，每次真的去请求 HuggingFace，最后抛 RetryableLLMError ——
+    #    把「配置错」伪装成「暂时不可用」，用户会去重排队列而不是改配置。
+    _validate_local_backend(resolved, settings)
+
+    def _run() -> list[list[float]]:
+        model = _load_local_model(resolved, device=settings.embedding_device.strip())
+        with _local_model_lock:  # encode 串行（并发调用会互相踩；吞吐靠多进程/GPU 解决）
+            vectors = model.encode(items, normalize_embeddings=True, convert_to_numpy=True)
+        # numpy 数组 → 纯 Python 列表：跨进程/JSON 边界更安全（numpy 是本地后端的传递依赖）
+        return [[float(x) for x in row] for row in vectors]
+
+    return await asyncio.to_thread(_run)
+
+
+def _validate_local_backend(model_name: str, settings: Any) -> None:
+    """本地后端的**前置检查**：把能确定性判断的配置错误在第一次尝试之前报出来。
+
+    只做三件能确定性判断的事（不去猜配置）：
+      ① 可选依赖是否装了；
+      ② 模型名是否为空 / 首尾带空白；
+      ③ 名字里是否混进了说明文字（`.env` 取值行抄了示例注释的典型症状：
+         `EMBEDDING_MODEL=BAAI/bge-m3    # ...` → 下游拿着不存在的仓库名报 401/404）。
+    """
+    try:
+        import sentence_transformers  # noqa: F401
+    except ImportError as exc:
+        raise _missing_local_dependency_error() from exc
+
+    if not model_name.strip():
+        raise PermanentLLMError(
+            "本地 embedding 后端的模型名为空：请设置 EMBEDDING_MODEL（如 BAAI/bge-m3）"
+            "或 EMBEDDING_LOCAL_PATH（本地模型目录）。"
+        )
+    if model_name != model_name.strip():
+        raise PermanentLLMError(
+            f"本地 embedding 模型名首尾带空白：{model_name!r} —— 检查 .env 的取值行"
+            "（取值行只写「键=值」，说明文字要单独成行）。"
+        )
+    if "#" in model_name or "（" in model_name:
+        raise PermanentLLMError(
+            f"本地 embedding 模型名疑似混入说明文字：{model_name!r} ——"
+            "检查 .env 的取值行只写「键=值」（注释单独成行）。"
+        )
+
+
+def _assert_embedding_dim(
+    vectors: list[list[float]], *, expected: int, model: str, backend: str
+) -> None:
+    """维度守卫：同批维度必须一致；配了 `embedding_dim` 就强校验（runbook §7.6）。
+
+    为什么值得拦：换模型最坏的情况不是「维度不一致」（写库会直接响），
+    而是**维度恰好相同但向量空间不相容** —— 检索看起来正常、结果全是乱码，
+    评测掉分时你会先去怀疑 prompt。API ↔ 本地 之间**必然**属于后者。
+    """
+    if not vectors:
+        return
+    dims = {len(row) for row in vectors}
+    if len(dims) > 1:
+        raise PermanentLLMError(
+            f"embedding 同批维度不一致：{sorted(dims)}（model={model}）——"
+            "通常意味着批量被截断或混了模型。"
+        )
+    actual = dims.pop()
+    if expected and actual != expected:
+        raise PermanentLLMError(
+            f"embedding 维度不符：期望 {expected}，实际 {actual}（model={model}, backend={backend}）。"
+            "换模型/换后端必须同步三处：① 改 EMBEDDING_DIM；"
+            "② 改 10.rag.md 的 vector(n) 列并重建索引；③ 重灌全部向量。"
+        )
 
 
 async def llm_call(
@@ -212,13 +387,16 @@ async def llm_call(
     """
     settings = get_settings()
     used_model = model or settings.llm_primary
+    # 凭据按**最终模型**解析（见 _resolve_credentials 的说明：入口拿一次会在降级时用错密钥）
+    api_key, api_base = _resolve_credentials(used_model, settings)
 
     async def _call() -> LLMResponse:
         t0 = time.perf_counter()
+        extra: dict[str, Any] = {"api_base": api_base} if api_base else {}
         response = await litellm.acompletion(
             model=used_model,
             messages=messages,
-            api_key=settings.llm_api_key.get_secret_value(),  # 唯一密钥入口
+            api_key=api_key,  # 唯一密钥入口（按模型解析，见上）
             timeout=timeout,
             # ⚠️ 必须显式关掉 litellm 自带重试，否则一次业务调用会是「两层重试」
             #    （4 × (1+N) 个请求），退避时间失控且会主动放大限流压力。
@@ -226,6 +404,7 @@ async def llm_call(
             #    所以参数名写错不会报错、只会静默不生效 —— 唯一的哨兵是
             #    tests/test_llm_client_retry.py 里的计数断言。
             num_retries=0,
+            **extra,
             **kwargs,
         )
         return _to_response(response, int((time.perf_counter() - t0) * 1000))
@@ -242,16 +421,20 @@ async def embed(
 ) -> list[list[float]]:
     """把一批文本向量化；**顺序与入参严格一致**（调用方依赖这一点做对齐）。
 
-    embedding 也必须在门面里：它同样花钱、同样有延迟，第 10 步 rag 检索与第 13 步 cache 判相似
-    都会高频调用。若各处自行 `openai.embeddings.create(...)`，就会出现改不了超时、加不了重试、
-    计不了费、也没有「切换 embedding 模型」的单一开关。
+    两种后端，**同一个签名**（调用方不感知差异，配置项是 `embedding_backend`）：
+      - `"litellm"`（默认）：`litellm.aembedding` —— 按 token 计费、文本出网、可能 429/超时
+      - `"local"`：本地 sentence-transformers —— 零边际成本、文本不出网、吃本机 CPU/内存
+        （需要可选依赖 `uv sync --extra local`；首次调用会下模型权重，见 runbook §7.5）
 
     ⚠️ **保序**：litellm 响应里每个 data 项带 `index`，这里**按 index 排序**后返回，
     而不是假定返回顺序（批量并发时顺序不保证 —— 这是最隐蔽的一类 bug，
     症状是「检索偶尔答非所问」）。同时校验条数：数量对不上就抛错，
     绝不返回一个「长度不对但顺序看着对」的列表。
 
-    抛出：同 `llm_call`。
+    ⚠️ **维度守卫**（`embedding_dim > 0` 时生效）：换模型/换后端会让维度或向量空间变化，
+    最坏情况是「维度恰好相同但空间不相容」——检索看着正常、结果全是乱的。所以不符就报错。
+
+    抛出：同 `llm_call`（`PermanentLLMError` / `RetryableLLMError`）。
     """
     items = [str(text) for text in texts]
     if not items:
@@ -260,26 +443,33 @@ async def embed(
 
     settings = get_settings()
     used_model = model or settings.embedding_model
+    backend = settings.embedding_backend
 
-    async def _call() -> list[list[float]]:
-        response = await litellm.aembedding(
-            model=used_model,
-            input=items,
-            api_key=settings.llm_api_key.get_secret_value(),  # 唯一密钥入口
-            timeout=timeout,
-            num_retries=0,  # 同上：两层重试必须避免
-        )
-        data = list(getattr(response, "data", None) or [])
-        if len(data) != len(items):
-            raise PermanentLLMError(
-                f"embedding 返回条数与入参不一致：期望 {len(items)}，实际 {len(data)}"
-                "（不猜顺序，避免向量与文本错配）"
+    if backend == "local":
+        # 本地后端：显式 timeout 无意义（不涉及网络），保留参数只为签名一致
+        call = lambda: _embed_local(items, used_model, settings)  # noqa: E731
+    else:
+
+        async def call() -> list[list[float]]:
+            response = await litellm.aembedding(
+                model=used_model,
+                input=items,
+                api_key=_embedding_api_key(settings),  # 单独的一把，或复用主模型密钥
+                timeout=timeout,
+                num_retries=0,  # 同上：两层重试必须避免
             )
-        # 按 index 排序后再取值：litellm 批量返回的顺序不保证与入参一致
-        ordered = sorted(data, key=lambda item: item["index"])
-        return [list(item["embedding"]) for item in ordered]
+            data = list(getattr(response, "data", None) or [])
+            if len(data) != len(items):
+                raise PermanentLLMError(
+                    f"embedding 返回条数与入参不一致：期望 {len(items)}，实际 {len(data)}"
+                    "（不猜顺序，避免向量与文本错配）"
+                )
+            # 按 index 排序后再取值：litellm 批量返回的顺序不保证与入参一致
+            return [list(item["embedding"]) for item in sorted(data, key=lambda i: i["index"])]
 
-    return await _run_with_retry(_call, max_retries=max_retries)
+    vectors = await _run_with_retry(call, max_retries=max_retries)
+    _assert_embedding_dim(vectors, expected=settings.embedding_dim, model=used_model, backend=backend)
+    return vectors
 
 
 __all__ = [
