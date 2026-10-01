@@ -21,6 +21,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -166,6 +167,9 @@ class Refund(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="requested", server_default="requested")
     reason: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[dt.datetime] = mapped_column(TimestampTZ, nullable=False, server_default=func.now())
+    # 幂等键（第 6 步 tools 落地，A2）：同一「用户 + 幂等键」的重复请求不重复建退款单。
+    # 唯一性由下面的**复合唯一约束**保证（见 app/tools/refund.py 为什么必须带 user_id）。
+    idempotency_key: Mapped[str | None] = mapped_column(String(64))
 
     order: Mapped[Order] = relationship(back_populates="refunds")
     user: Mapped[User] = relationship(back_populates="refunds")
@@ -175,6 +179,7 @@ class Refund(Base):
         CheckConstraint("amount > 0", name="amount_positive"),
         Index("ix_refunds_user_id_created_at", "user_id", "created_at"),
         Index("ix_refunds_order_id", "order_id"),
+        UniqueConstraint("user_id", "idempotency_key", name="uq_refunds_user_id_idempotency_key"),
     )
 
 
@@ -219,6 +224,9 @@ class Ticket(Base):
         BigInteger, ForeignKey("employees.emp_id", ondelete="SET NULL"), index=True
     )
     created_at: Mapped[dt.datetime] = mapped_column(TimestampTZ, nullable=False, server_default=func.now())
+    # 幂等键（第 6 步 tools 落地，A2）：同一「用户 + 幂等键」的重复请求不重复建工单。
+    # 唯一性由下面的**复合唯一约束**保证（见 app/tools/ticket.py 为什么必须带 user_id）。
+    idempotency_key: Mapped[str | None] = mapped_column(String(64))
 
     user: Mapped[User] = relationship(back_populates="tickets")
     assignee: Mapped[Employee | None] = relationship(back_populates="tickets")
@@ -227,6 +235,7 @@ class Ticket(Base):
         CheckConstraint(_in_list("type", TICKET_TYPES), name="type_valid"),
         CheckConstraint(_in_list("status", TICKET_STATUSES), name="status_valid"),
         Index("ix_tickets_user_id_created_at", "user_id", "created_at"),
+        UniqueConstraint("user_id", "idempotency_key", name="uq_tickets_user_id_idempotency_key"),
     )
 
 
