@@ -18,6 +18,8 @@ env/
 .pytest_cache/
 # 受限环境（沙箱）下 pytest 可能在此建临时目录且无法清理，见 docs/config-guide.md §3.2
 pytest-cache-files-*/
+# 手工把 TEMP 指到工作区时用的目录（见 docs/runbook/7.agents-runbook.md §11）
+.pytest-tmp/
 .mypy_cache/
 .ruff_cache/
 .coverage
