@@ -12,7 +12,9 @@
 > [`4.security-runbook.md`](../runbook/4.security-runbook.md)（SQL 白名单 / 越权拦截 / 脱敏 / 鉴权 / 只读角色）、
 > [`5.llm-runbook.md`](../runbook/5.llm-runbook.md)（LiteLLM 门面 / 429 指数退避重试 / `embed()`；含依赖安装与离线 mock 测法）、
 > [`6.tools-runbook.md`](../runbook/6.tools-runbook.md)（只读 SQL 执行器 / 审计日志 / 图表 spec / 检索溯源 / 工单与退款幂等）、
-> [`7.agents-runbook.md`](../runbook/7.agents-runbook.md)（六个 Agent：NL→SQL 的报错回喂重试 / 权限只在 router 注入 / 三套合成模板 / 护栏双向拦截 / 假 LLM 注入测法），
+> [`7.agents-runbook.md`](../runbook/7.agents-runbook.md)（六个 Agent：NL→SQL 的报错回喂重试 / 权限只在 router 注入 / 三套合成模板 / 护栏双向拦截 / 假 LLM 注入测法）、
+> [`8.graph-runbook.md`](../runbook/8.graph-runbook.md)（图装配 / `durability="sync"` / 断点重放与幂等 / 闸门与 `interrupt` / 十二个实测坑）、
+> [`9.api-runbook.md`](../runbook/9.api-runbook.md)（第一个端到端切片：鉴权与 `thread_id` 派生 / WebSocket 五类帧与首帧 <1s / 滑动窗口限流与 429 / 审批通道 202→200→409 / 错误映射表 / 十个实测坑），
 > 另有不绑定某一步的底座命令手册 [`4.uv-pytest-basics.md`](../runbook/4.uv-pytest-basics.md)（uv 环境与 pytest 选用例）。
 >
 > 📌 **本目录文件已按「建议开发顺序」编号**（`1.config.md` … `16.web.md`，与下表 `#` 一致；

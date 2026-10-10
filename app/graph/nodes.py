@@ -54,6 +54,7 @@ import logging
 from typing import Any, Final
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import interrupt
 
 from app.agents.agent_llm import JsonLLM
 from app.agents.analysis import analysis_node
@@ -63,7 +64,7 @@ from app.agents.rag import rag_node
 from app.agents.router import router_node
 from app.agents.state import GraphState as AgentGraphState
 from app.agents.synthesis import synthesis_node
-from app.graph.config import REJECTED_REASON, GraphRuntime
+from app.graph.config import APPROVAL_QUESTION, REJECTED_REASON, GraphRuntime
 from app.graph.routing import should_gate
 from app.graph.state import (
     NODE_ANALYSIS,
@@ -260,19 +261,40 @@ def make_guardrail_output(runtime: GraphRuntime) -> Any:
     """
 
     async def node(state: AgentGraphState) -> dict[str, Any]:
+        # ⚠️ 这一行是「人工审批拒绝」能如实送达用户的前提（实测踩到，见 runbook §10.1 坑 9）：
+        # 闸门把这一轮标死（`blocked=True` + refusal）之后，图还会走到这里，而
+        # `guardrail_node` 在**通过**时会顺手写 `blocked=False` —— 于是
+        # `turn.blocked` 变回 False，第 9 步的 API 据此返回 `delivered`，
+        # 用户看到的是「这一轮正常答完了」，而实际上敏感操作**没有执行**。
+        #
+        # 第一版把「守住结论」写成「blocked 为真时直接返回护栏输出」——**没用**：
+        # 输出侧护栏在**通过**时返回的就是 `{"blocked": False, ...}`，
+        # 于是「跳过合并」跳掉的正是要守的那个值（`probe` 实测：守卫生效了，
+        # 但出口仍是 `blocked=False`）。正确做法是**记住上游结论再原样写回**。
+        already_blocked = bool(state.get("blocked"))
         outcome = await guardrail_node(state, stage=OUTPUT_STAGE, llm=runtime.llm)
+        if already_blocked and not outcome.get("blocked"):
+            # 守上游结论（见上面的长注释）。这一轮**不进历史**：
+            # checkpointer 里的 state 会留下 `blocked=True` 与安全话术，
+            # 但 `messages` 不受影响 —— 下一轮读不出「答过了」的假历史。
+            return {**outcome, "blocked": True}
         if outcome.get("blocked"):
-            # 被拦下的一轮**不追加**历史：安全话术要是进了 messages，
-            # 下一轮的 router 会把它当成「答过了」，多轮对话从此建立在假历史上。
+            # 被输出侧护栏拦下的一轮同样**不追加**历史（理由同上）：
+            # 安全话术要是进了 messages，下一轮的 router 会把它当成「答过了」。
             return outcome
-        append = _answer_message(state)
-        return {**outcome, **append}
+        # 通过时：历史里存的必须是**真正出网的那段文本**（= outcome 里的 answer）
+        return {**outcome, **_answer_message({**state, **outcome})}
 
     return safe_node(_named(node, NODE_GUARDRAIL_OUTPUT))
 
 
 def _answer_message(state: AgentGraphState) -> dict[str, Any]:
-    """把这一轮的回答包成一条待追加的 assistant 消息（没有回答就什么都不追加）。"""
+    """把这一轮的回答包成一条待追加的 assistant 消息（没有回答就什么都不追加）。
+
+    ⚠️ 调用方传进来的必须是**合并了本节点产出之后**的状态：输出侧护栏拦下时
+    `answer` 已被换成安全话术，历史里该存的是那段话术（真正出网的文本），
+    而不是被拦下的原文。
+    """
     answer = str(state.get("answer") or "")
     if not answer:
         return {}
@@ -283,30 +305,44 @@ def make_gate(runtime: GraphRuntime) -> Any:
     """人工审批闸门（human-in-the-loop，`8.graph.md` §5 第四条）。
 
     它只在 `InterruptPolicy.enabled` 为真时被注册进图（`builder.build_graph`）。
-    两件事，**顺序不能换**：
+    三条分支，**顺序不能换**：
 
-    1. 先看策略要不要停（`should_gate`）—— 不停就原样放行；
-    2. 需要停时**先落 `refusals` 再停**：`interrupt()` 会让本次执行在这一点挂起，
-       恢复时整个函数从头重跑，所以「写 refusal」与「暂停」之间不能有别的副作用，
-       否则重放会把那条 refusal 写两遍（幂等是重放的配套前提，§5 第三条）。
+    1. **不需要停** → 原样放行（`blocked=False`）；
+    2. **需要停且还没批** → `interrupt({"question": ...})`：本次执行在这一点**挂起**，
+       checkpoint 记下 `next=('gate',)`，等批准通道用 `Command(resume=...)` 恢复；
+    3. **恢复时**：`interrupt()` 的返回值就是批准通道传进来的决策（本项目传一个 dict）。
+       批准 → 放行；拒绝 → 落 `REJECTED_REASON` 并标 `blocked`（fail-closed）。
 
-    ⚠️ 本步骤只交付**策略与挂点**，不默认开启：第 9 步的 API 拿到批准结果后，
-    把 `enabled=True`，并把下面这句 `return` 换成
-    `interrupt({"question": APPROVAL_QUESTION})` —— 那一刻才真正需要 saver 支持恢复。
-    现在开启时走的是「记录 + 拒绝」的完整路径，它**已经是可用的**：闸门开了却没有
-    批准通道时，正确处理就是不放行（fail-closed），而不是「没人批就默认放行」。
+    ⚠️ 第 3 条里「写 refusal」必须在**恢复之后**才发生 —— 这是 LangGraph 的语义决定的：
+    `interrupt()` 抛出的控制流会丢弃本次调用的返回值，且恢复时**整个函数从头重跑**。
+    若在 `interrupt()` 之前写状态，那条 refusal 要么丢失、要么被写两遍
+    （幂等是重放的配套前提，§5 第三条）。所以状态只在「有结论」的那两个分支里写。
+
+    ⚠️ 挂起时**不写** `blocked=True`：挂起不是拒绝。把它标成 blocked 会让
+    「等人工点头」与「已被拦下」在状态上无法区分 —— 第 9 步的 API 于是没法决定
+    该返回 202（等批准）还是 200（被拦）。挂起的事实由 `Turn.interrupt` 表达
+    （它是从流的 `__interrupt__` 块里读出来的，见 `app/graph/run.py`）。
     """
 
     async def node(state: AgentGraphState) -> dict[str, Any]:
         if not should_gate(runtime, state):
             return {"blocked": False}
-        logger.info(
-            "gate：route=%r 属敏感分支且未获批准，记录 refusal 并跳过处理节点",
-            state.get("route"),
-        )
+        decision = interrupt({"question": APPROVAL_QUESTION, "route": str(state.get("route") or "")})
+        approved = bool(decision.get("approved")) if isinstance(decision, dict) else bool(decision)
+        if approved:
+            logger.info(
+                "gate：route=%r 已获人工批准（approver=%s），放行到处理节点",
+                state.get("route"),
+                (decision or {}).get("approver_user_id") if isinstance(decision, dict) else "?",
+            )
+            return {"blocked": False}
+        reason = str(
+            (decision or {}).get("reason") if isinstance(decision, dict) else ""
+        ) or REJECTED_REASON
+        logger.info("gate：route=%r 未获人工批准，记录 refusal 并跳过处理节点", state.get("route"))
         return {
             "blocked": True,
-            "refusals": list(state.get("refusals") or []) + [REJECTED_REASON],
+            "refusals": list(state.get("refusals") or []) + [reason],
         }
 
     return safe_node(_named(node, NODE_GATE))

@@ -34,14 +34,16 @@ from app.graph.checkpointer import (
 )
 from app.graph.config import (
     APPROVAL_QUESTION,
+    GATED_ROLES,
     REJECTED_REASON,
     SENSITIVE_ROUTES,
     GraphRuntime,
     InterruptPolicy,
+    interrupt_policy_for,
 )
 from app.graph.nodes import FALLBACK_MESSAGE, failure_update, normalize_input
 from app.graph.routing import route_by_intent
-from app.graph.run import DEFAULT_REPLAY_BUDGET, GraphTurnFailed, Turn, run_turn
+from app.graph.run import DEFAULT_REPLAY_BUDGET, INTERRUPT_KEY, GraphTurnFailed, Turn, run_turn
 from app.graph.state import (
     NODE_ANALYSIS,
     NODE_DATA,
@@ -63,11 +65,13 @@ __all__ = [
     "CheckpointUnavailable",
     "DEFAULT_REPLAY_BUDGET",
     "FALLBACK_MESSAGE",
+    "GATED_ROLES",
     "GRAPH_NAME",
     "GraphRuntime",
     "GraphState",
     "GraphStateDoc",
     "GraphTurnFailed",
+    "INTERRUPT_KEY",
     "InterruptPolicy",
     "NODE_ANALYSIS",
     "NODE_DATA",
@@ -87,6 +91,7 @@ __all__ = [
     "ensure_compatible_event_loop",
     "failure_update",
     "graph_config",
+    "interrupt_policy_for",
     "normalize_input",
     "open_checkpointer",
     "route_by_intent",

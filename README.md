@@ -36,6 +36,12 @@
 | 1 config | ✅ 完成 | `app/config/` | `uv run pytest -q tests/test_config.py` |
 | 2 infra（仅开发依赖） | ✅ 依赖栈在 Linux VM 上跑通 | `infra/docker-compose.dev.yml` | `docs/runbook/2.infra-runbook.md` |
 | 3 **db** | ✅ **完成**（8 张表 / 迁移 / 种子 / 行级过滤 / 连接池） | `app/db/`、`alembic/`、`scripts/` | `uv run alembic upgrade head` → `uv run python -m scripts.seed` → `uv run python -m scripts.db_check --check` → `uv run pytest -q`（**97 passed, 1 skipped**） |
+| 4–8 security / llm / tools / agents / graph | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/security/`、`app/llm/`、`app/tools/`、`app/agents/`、`app/graph/` | `uv run pytest -q -k "graph or agents or tools or llm or security"`；第 8 步口径：`79 passed, 1 skipped`（图）+ 全量 `730 passed` |
+| 9 **api** | ✅ **完成**（**首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答；含 WebSocket 流式、限流、审批通道） | `app/api/`、`app/main.py`、`scripts/api_demo.py` | `uv run pytest -q tests/api`（**138 passed**）；`uv run python -m scripts.api_demo`（七个场景，首帧 **10~13ms**）；全量 **870 passed** |
+
+> 📌 第 9 步的启动方式：`uv run uvicorn app.main:app --reload --port 8000`
+> （`/docs` 看 OpenAPI、`/health` 看依赖状态、`WS /api/chat/stream` 走流式；
+> 逐步操作与排障见 [`docs/runbook/9.api-runbook.md`](docs/runbook/9.api-runbook.md)）。
 
 常用命令（都在**仓库根**执行；本机无 Docker，数据库在 VMware-Linux 上）：
 

@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 from langgraph.errors import GraphRecursionError
 
@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 
 #: 一轮最多重放多少次（理由见模块 docstring）。
 DEFAULT_REPLAY_BUDGET: int = 1
+
+#: LangGraph 把 `interrupt()` 的载荷放在这个保留键下（`stream_mode="updates"` 的一整块）。
+#:
+#: ⚠️ 它**不是** state 里的键 —— `aget_state().values` 里没有它（实测），
+#: 载荷只出现在流的增量块与 `snapshot.tasks[*].interrupts` 里。
+#: 所以「谁挂起了、挂起了什么」必须由驱动这一轮的人（本模块）从流里捞出来。
+INTERRUPT_KEY: Final[str] = "__interrupt__"
 
 
 class GraphTurnFailed(RuntimeError):
@@ -85,6 +92,13 @@ class Turn:
     fallback: dict[str, Any] | None = None
     #: 最后一次失败的异常（排障用；已经在 state 的 `refusals` 里留了话术）
     error: Exception | None = None
+    #: 这一轮**挂起等人工批准**时的中断载荷（`{"question": ..., "interrupt_id": ...}`）。
+    #:
+    #: 为什么要在这一层记它：`interrupt()` 的载荷**不在** state 里
+    #: （实测：`astream(stream_mode="updates")` 会单独吐一个 `{"__interrupt__": (Interrupt(...),)}` 块），
+    #: 所以「谁挂起了、挂起了什么」只有跑这一轮的人看得见。第 9 步的 API 要把它翻成
+    #: HTTP 202 + 一句给审批人看的问题；漏掉它的话用户得到的是一条「什么都没发生」的 200。
+    interrupt: dict[str, Any] | None = None
 
     @property
     def answer(self) -> str:
@@ -94,11 +108,17 @@ class Turn:
     def blocked(self) -> bool:
         return bool(self.state.get("blocked"))
 
+    @property
+    def pending_approval(self) -> bool:
+        """这一轮是否停在人工审批闸门上（**不是**失败、也不是答完了）。"""
+        return self.interrupt is not None
+
     def summary(self) -> str:
         """一行排障摘要（日志与演示脚本都用它，避免各处自己拼）。"""
         stages = "→".join(self.visited) or "(空)"
         tail = f" | 重放：{self.replayed}" if self.replayed else ""
         tail += " | 预算用尽" if self.exhausted else ""
+        tail += " | 等人工批准" if self.pending_approval else ""
         return f"thread={self.thread_id} 路径={stages} 结论={'拦截' if self.blocked else '正常'}{tail}"
 
 
@@ -133,6 +153,13 @@ async def run_turn(
         try:
             async for chunk in graph.astream(payload, config, stream_mode="updates"):
                 for node, update in (chunk or {}).items():
+                    if node == INTERRUPT_KEY:
+                        # 闸门挂起：`interrupt()` 的载荷是**单独一块**（不在任何节点的增量里），
+                        # 而且**不算「跑过一个节点」**。所以这里既记录载荷、也不往 visited 里塞，
+                        # 否则「这一轮真正执行了哪几个节点」会被一条伪节点名污染
+                        # （它还会连带影响 `_failed_node` 的兜底推断与第 11 步的埋点归并）。
+                        turn.interrupt = _interrupt_payload(update)
+                        break
                     turn.visited.append(str(node))
                     if on_event is not None:
                         on_event(str(node), update)
@@ -183,6 +210,12 @@ async def run_turn(
             # 网络型节点的失败则要继续驱动（图从 `target` 的下游接着跑）。
             continue
 
+        if turn.pending_approval:
+            # 挂起了：`astream` 那一轮已经结束（图停在这个节点上，checkpoint 里 `next` 就是它），
+            # 再驱动一次只会再次挂起。恢复必须由**批准通道**用 `Command(resume=...)` 发起。
+            logger.info("闸门挂起：%s（等待人工批准）", turn.summary())
+            break
+
         snapshot = await graph.aget_state(config)
         if not tuple(snapshot.next or ()):
             break
@@ -211,6 +244,29 @@ async def run_turn(
     return turn
 
 
+def _interrupt_payload(chunk: Any) -> dict[str, Any]:
+    """把 `{"__interrupt__": (Interrupt(...),)}` 里的载荷翻成一个普通 dict。
+
+    为什么要在图这一层翻译（而不是让 API 去认识 `Interrupt`）：
+
+    * `Interrupt` 是 LangGraph 的类型，它的 `value` 只承诺是 JSON 可序列化对象，
+      形状由**我们自己的节点**（`make_gate`）决定 —— 「闸门长什么样」是图的事；
+    * API 层要的是「一句能展示给审批人的问题 + 一个能回传的中断 id」，
+      这两个字段的取舍（哪个进日志、哪个回给前端）放在这里最省事。
+
+    ⚠️ 载荷里的值**不保证是 dict**（节点可以 `interrupt("一句话")`），
+    所以非 dict 载荷被包成 `{"value": ...}` 而不是直接 `dict(...)`（那会抛 TypeError，
+    把一次正常的挂起变成 500）。
+    """
+    first = (chunk[0] if isinstance(chunk, (list, tuple)) and chunk else chunk)
+    value = getattr(first, "value", None)
+    if value is None and isinstance(first, dict):
+        value = first.get("value")
+    payload: dict[str, Any] = dict(value) if isinstance(value, dict) else {"value": value}
+    payload["interrupt_id"] = str(getattr(first, "id", "") or "")
+    return payload
+
+
 def _failed_node(error: Exception, pending: tuple[str, ...], visited: list[str]) -> str:
     """认出「失败的是哪个节点」。
 
@@ -229,4 +285,4 @@ def _failed_node(error: Exception, pending: tuple[str, ...], visited: list[str])
     return visited[-1] if visited else "unknown"
 
 
-__all__ = ["DEFAULT_REPLAY_BUDGET", "GraphTurnFailed", "Turn", "run_turn"]
+__all__ = ["DEFAULT_REPLAY_BUDGET", "INTERRUPT_KEY", "GraphTurnFailed", "Turn", "run_turn"]

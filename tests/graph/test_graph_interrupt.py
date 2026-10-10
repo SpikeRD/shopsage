@@ -2,11 +2,18 @@
 
 分两半：
 
-* **策略与位置**（本步的交付）：`InterruptPolicy` 决定要不要停、闸门挂在 router 之后；
-  停下来的语义是「记录 refusal + 不执行处理节点」（fail-closed，而不是「没人批就放行」）。
+* **策略与位置、以及中断语义**（本步的交付 + 第 9 步的收紧）：`InterruptPolicy` 决定要不要停、
+  闸门挂在 router 之后；停下来的语义是 `interrupt()` **真挂起**（checkpoint 停在 `gate`），
+  由批准通道用 `Command(resume=...)` 决定放行还是拒绝（fail-closed）。
 * **框架级中断**（接缝的可用性证明）：LangGraph 的 `interrupt()` 能在**带 checkpointer** 的
-  图上真正挂起，并用 `Command(resume=...)` 恢复 —— 第 9 步的 API 落地批准通道时用的是它。
-  这一半用一张最小图来验：主图的 ticket 节点属第 9 步，现在没有可中断的写操作。
+  图上真正挂起，并用 `Command(resume=...)` 恢复 —— 主图的闸门用的就是同一套能力，
+  这里再用一张最小图独立验一次（版本升级时它是第一道警报）。
+
+> ⚠️ 第 9 步对闸门的改动：`make_gate` 从「记录 refusal + 拒绝」改成**真 `interrupt()`**，
+> 因为批准通道（`POST /api/chat/approve`）已经落地。挂起与拒绝是**两种状态**：
+> 前者还没人做决定（API 返回 202），后者已有结论（200 + `blocked`）。
+> 因此「谁进了 `visited`」的断言也随之变化：`interrupt()` 的那一步**不算跑完一个节点**
+> （节点没有返回增量），所以 `visited` 里没有 `gate`。
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from app.graph import (
     NODE_DATA,
     NODE_GATE,
     NODE_GUARDRAIL_INPUT,
+    NODE_GUARDRAIL_OUTPUT,
     NODE_ROUTER,
     NODE_SYNTHESIS,
     GraphRuntime,
@@ -85,23 +93,82 @@ def test_gate_appears_only_where_the_policy_says_so() -> None:
 # ── 端到端：闸门开着的图上跑一条敏感分支 ──────────────────────────────────────
 
 
-async def test_sensitive_route_is_gated_and_the_write_path_is_never_touched() -> None:
-    """开闸门后：敏感分支**不进处理节点**，落一条 refusal 由 synthesis 如实转述。
+async def test_sensitive_route_is_gated_until_someone_approves() -> None:
+    """开闸门后：敏感分支**停在闸门上等人工点头**（不落 refusal、不进处理节点）。
 
-    这是「fail-closed」的可观察形式：没有批准通道时**不放行**。
+    这是「fail-closed」的可观察形式：**没有批准就什么都不做**。
     对客路径上一句「这件事没办成」远好于「悄悄办成了但没人批」。
+
+    ⚠️ 与第 8 步交付时的差别（第 9 步改的）：那时闸门是「记录 + 拒绝」，
+    因为还没有批准通道；现在 `POST /api/chat/approve` 落地了，闸门改成
+    **真的 `interrupt()` 挂起** —— 挂起时 checkpoint 停在 `gate`，
+    `Turn.interrupt` 带出「问审批人的那句话」，用户得到的是一句
+    「需要人工确认」而不是「已按未执行处理」（后者是**没人批**的结论，
+    而现在还没人做出决定）。
     """
-    fake = _llm("ticket", answer="这项操作需要人工确认，暂时没有为你执行。")
+    fake = _llm("ticket", answer="这项操作已经为你执行。")
     graph = compile_graph(
         InMemorySaver(),
         GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True)),
     )
     turn = await run_turn(graph, customer_state("帮我投诉物流"), thread_id="t-ticket")
 
-    assert turn.visited == [NODE_GUARDRAIL_INPUT, NODE_ROUTER, NODE_GATE, NODE_SYNTHESIS, "guardrail_output"]
-    assert any(REJECTED_REASON in reason for reason in turn.state["refusals"])
+    assert turn.visited == [NODE_GUARDRAIL_INPUT, NODE_ROUTER], (
+        f"实际路径：{turn.visited}（`interrupt()` 的那一步不算跑完一个节点，"
+        "所以 gate 不在 visited 里：它没有返回增量，而是把控制流交给了批准通道）"
+    )
+    assert turn.pending_approval is True
+    assert turn.interrupt is not None
+    assert turn.interrupt["question"].strip(), "挂起时必须给审批人一句能读懂的问题"
+    assert turn.interrupt["interrupt_id"], "中断 id 要能被回传（批准通道用它对齐）"
+    assert NODE_SYNTHESIS not in turn.visited, "挂起时不该合成回答（这一轮还没结论）"
     assert "data" not in turn.visited, "闸门之后不该再查库（敏感操作还没被批准）"
-    assert turn.answer.startswith("这项操作")
+
+    snapshot = await graph.aget_state(graph_config("t-ticket"))
+    assert snapshot.next == (NODE_GATE,), "checkpoint 必须停在闸门上（这是可恢复的前提）"
+
+
+@pytest.mark.parametrize(
+    ("approved", "expect_blocked", "expect_refusal"),
+    [(True, False, False), (False, True, True)],
+)
+async def test_resuming_the_gate_decides_the_outcome(
+    approved: bool, expect_blocked: bool, expect_refusal: bool
+) -> None:
+    """批准 / 不批准 → 两条**不同**的收尾（`Command(resume=...)` 的语义在图上生效）。
+
+    | 决策 | `blocked` | `refusals` | 用户的回答 |
+    |---|---|---|---|
+    | 批准 | False | 无 | 正常回答（图继续跑到 synthesis） |
+    | 不批准 | **True** | **有** `REJECTED_REASON` | 由 synthesis 如实转述「没执行」 |
+
+    ⚠️ 「不批准」这条最容易出错：闸门标死之后图**还会走完 synthesis 与输出护栏**，
+    而 `guardrail_output` 在通过时会写 `blocked=False` —— 那会把「没执行」伪装成
+    「答完了」（实测踩到，见 runbook §10.1 坑 9）。所以这里对 `blocked` 的断言
+    是**必须**的，不能只断言 `refusals`。
+    """
+    from langgraph.types import Command
+
+    fake = _llm("ticket", answer="这项操作已经为你执行。")
+    graph = compile_graph(
+        InMemorySaver(),
+        GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True)),
+    )
+    thread = f"t-gate-{'yes' if approved else 'no'}"
+    await run_turn(graph, customer_state("帮我投诉物流"), thread_id=thread)
+
+    turn = await run_turn(
+        graph,
+        Command(resume={"approved": approved, "reason": "", "approver_user_id": 9}),
+        thread_id=thread,
+    )
+
+    assert turn.visited == [NODE_GATE, NODE_SYNTHESIS, NODE_GUARDRAIL_OUTPUT], f"实际路径：{turn.visited}"
+    assert turn.blocked is expect_blocked
+    assert bool(turn.state.get("refusals")) is expect_refusal
+    if not approved:
+        assert any(REJECTED_REASON in reason for reason in turn.state["refusals"])
+    assert turn.answer.strip(), "无论批准与否，用户都要拿到一句话"
 
 
 async def test_non_sensitive_route_bypasses_the_gate_entirely(monkeypatch: pytest.MonkeyPatch) -> None:

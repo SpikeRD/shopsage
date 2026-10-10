@@ -14,6 +14,7 @@ from typing import Any, Final
 from app.agents.analysis import MAX_ANALYSIS_ROWS
 from app.agents.data import DEFAULT_ROW_LIMIT, MAX_SQL_ATTEMPTS
 from app.agents.rag import DEFAULT_MIN_SCORE, DEFAULT_TOP_K
+from app.security.policy import CUSTOMER_ROLE
 
 #: 需要人工批准的 `route` 取值域（`8.graph.md` §5 第四条：退款/工单等敏感写操作）。
 #:
@@ -53,6 +54,30 @@ class InterruptPolicy:
         return str((state or {}).get("route") or "") in self.routes
 
 
+#: 「人工审批闸门」按角色开关的规则（第 9 步落地）：**对客路径开**、内部只读路径关。
+#:
+#: 为什么按**角色**而不是全局开：
+#:
+#: * 对客路径上，敏感分支（`ticket` 这类写操作的入口）由客户自己发起，
+#:   没有人工确认就直接执行 = 一个人可以反复触发写操作；
+#: * 内部角色走的是标准作业流程（员工本来就是「被授权的人」），每一步都停下来等批准
+#:   会把「分析一下上月退款率」变成一次审批流程 —— 那是流程倒退，不是安全加固。
+#:
+#: 这条规则放在 `graph/config.py` 而不是 API 层：它描述的是「图该怎么跑」，
+#: 与 `SENSITIVE_ROUTES` 是同一类知识；API 层只负责**问**它，不负责定义它。
+GATED_ROLES: Final[frozenset[str]] = frozenset({CUSTOMER_ROLE})
+
+
+def interrupt_policy_for(role: str, *, enabled: bool = True) -> InterruptPolicy:
+    """按角色造闸门策略（对客开、内部关）。
+
+    `enabled=False` 是「这次调用完全不用闸门」（例如离线评测、只读探活），
+    与「角色不在 `GATED_ROLES` 里」是两件事：前者连节点都不注册（图更小、更省），
+    后者注册了节点但永远放行。两者在 `build_graph` 里的表现不同，所以不能合成一个参数。
+    """
+    return InterruptPolicy(enabled=bool(enabled) and str(role) in GATED_ROLES)
+
+
 @dataclass(frozen=True)
 class GraphRuntime:
     """跑一次图所需的全部外部依赖与预算（**全部可注入**）。
@@ -83,8 +108,10 @@ class GraphRuntime:
 
 __all__ = [
     "APPROVAL_QUESTION",
+    "GATED_ROLES",
     "REJECTED_REASON",
     "SENSITIVE_ROUTES",
     "GraphRuntime",
     "InterruptPolicy",
+    "interrupt_policy_for",
 ]
