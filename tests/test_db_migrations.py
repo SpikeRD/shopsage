@@ -28,6 +28,7 @@ from app.config import get_settings
 from app.db.base import Base
 from app.db.session import engine
 from app.db.urls import to_sqlalchemy_url
+from app.graph.checkpointer import CHECKPOINT_TABLES
 from scripts.db_check import BUSINESS_TABLES, snapshot
 
 # 必须显式 import 模型模块：`Base.metadata.tables` 在被测模型 import 之前是空的。
@@ -113,12 +114,37 @@ def test_no_pending_migration_against_models():
     """库结构与模型一致：`compare_metadata` 没有差异 = 没有「改了模型没生成迁移」。
 
     这条是防「忘记 revision --autogenerate」的那道闸（也是 3.db-runbook §3.4 的自动化版）。
+
+    ⚠️ **必须排除 LangGraph checkpointer 的四张表**（第 8 步引入）：它们由
+    `AsyncPostgresSaver.setup()` 建库时自建，却同时被注册进了 SQLAlchemy 的全局
+    `Base.metadata`。不排除的后果是这条用例在「跑过图相关的真库用例之后」开始红，
+    而 diff 的内容是「删掉这四张表」—— 那正是我们**不**想做的（会删掉会话状态）。
+    `alembic/env.py` 的 `include_object` 用同一份常量做同样的排除：
+    自动化迁移与人工 `alembic revision --autogenerate` 口径必须一致，否则
+    「测试绿了，人手工生成的迁移却是删表」。
     """
     with engine.connect() as conn:
-        ctx = MigrationContext.configure(conn, opts={"compare_type": True, "compare_server_default": True})
+        ctx = MigrationContext.configure(
+            conn,
+            opts={
+                "compare_type": True,
+                "compare_server_default": True,
+                "include_object": _include_object,
+            },
+        )
         diffs = compare_metadata(ctx, Base.metadata)
     # 只关心「表/列/约束」级别的差异；把差异打印出来便于排障
     assert not diffs, "库与模型不一致（模型改了但没生成迁移？）：\n" + "\n".join(str(d) for d in diffs)
+
+
+def _include_object(object_, name, type_, reflected, compare_to) -> bool:  # noqa: ANN001
+    """与 `alembic/env.py::_include_object` 同口径：排除 checkpointer 的表与索引。"""
+    if getattr(object_, "name", None) in CHECKPOINT_TABLES:
+        return False
+    table = getattr(object_, "table", None)
+    if table is not None and getattr(table, "name", None) in CHECKPOINT_TABLES:
+        return False
+    return True
 
 
 def test_naming_convention_applied_in_database():

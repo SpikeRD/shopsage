@@ -24,6 +24,12 @@ import app.db.models  # noqa: F401  （仅为把模型注册进 Base.metadata）
 from app.db.base import Base
 from app.db.urls import to_sqlalchemy_url
 
+# LangGraph checkpointer 的表名（第 8 步）：它们会被 langgraph 注册进 Base.metadata，
+# 但不是本仓的模型，必须排除在迁移比对之外（见 `_include_object`）。
+# ⚠️ 只 import 常量所在的模块，**不** import `app.graph` 本体：
+# 那个包会连带 import 整张图（含 litellm 链路），而迁移环境应当尽可能轻。
+from app.graph.checkpointer import CHECKPOINT_TABLES
+
 def _process_revision_directives(context, revision, directives) -> None:  # noqa: ANN001
     """两道护栏，防止「静默生成一个没用的迁移」。
 
@@ -82,6 +88,31 @@ DB_URL = to_sqlalchemy_url(
 )
 
 
+def _include_object(object_, name, type_, reflected, compare_to) -> bool:  # noqa: ANN001
+    """把**不属于本仓模型**的表排除在 autogenerate / compare 之外。
+
+    目前只有一类：LangGraph checkpointer 的四张表（`checkpoints` / `checkpoint_blobs` /
+    `checkpoint_writes` / `checkpoint_migrations`）。它们由 `AsyncPostgresSaver.setup()`
+    建库时自建，但**同时被注册进了 SQLAlchemy 的全局 metadata**（那是
+    `langgraph-checkpoint-postgres` 的实现方式）。不排除的后果：
+
+    * `alembic revision --autogenerate` 会生成一个「删掉这四张表」的迁移 —— 跑下去就是
+      **把会话状态全删了**（而它在评审里长得完全像一次正常的清理）；
+    * `tests/test_db_migrations.py` 的一致性用例在跑过图相关的真库用例之后开始红。
+
+    为什么不干脆把这四张表写进我们的迁移：它们的结构由 langgraph 的版本决定，
+    写进自己的迁移就把「升级依赖」变成了「手写迁移」，而 `saver.setup()` 本来就负责这件事。
+    """
+
+    if getattr(object_, "name", None) in CHECKPOINT_TABLES:
+        return False
+    # 索引也要一起排除：否则「表被排除了、它上面的索引还在比」会报出一堆 remove_index
+    table = getattr(object_, "table", None)
+    if table is not None and getattr(table, "name", None) in CHECKPOINT_TABLES:
+        return False
+    return True
+
+
 def _configure(connection=None, url: str | None = None, **extra: object) -> None:
     """统一的 context.configure：离线/在线两条路共用，选项不会漂移。
 
@@ -91,6 +122,8 @@ def _configure(connection=None, url: str | None = None, **extra: object) -> None
     """
     options: dict[str, object] = {
         "target_metadata": target_metadata,
+        # 非本仓模型的表一律不参与比对（LangGraph checkpointer 的四张表，见 _include_object）
+        "include_object": _include_object,
         # 类型变更（如 VARCHAR(16) → VARCHAR(32)）也纳入 diff，否则改列类型要手写迁移
         "compare_type": True,
         # 服务端默认值变更也纳入 diff；PG 会重写 now() 这类表达式，
