@@ -472,20 +472,53 @@ def _parent_section(section: str | None) -> str | None:
     return section.rsplit(" > ", 1)[0]
 
 
+def _looks_like_heading_text(text: str) -> bool:
+    """这个块的文本**是不是一条标题**（而不是一段正文）。
+
+    判据（三条都要满足）：单行、长度 < `_NUMBERED_TITLE_MAX_CHARS`（30）、不以句末标点结尾。
+
+    为什么必须单独判它（本仓实测踩到的**第三个**合并方向的坑，见 §10.1 坑 13）：
+    「共享父级」这条回退判据原本不带这个约束，于是「两个短条款」也被判为可合并 ——
+    一份这样的文档：
+
+        # 演示政策
+        第 1 条：第一段占位内容。
+        第 2 条：第二段占位内容。
+
+    会被合**成一块**（区块的 `section` 还变成了 `演示政策 > 2 条`，溯源指向第 2 条，
+    而块里第 1/3 条的内容都在）。后果是「一条一款一块」这条承诺静默失效：
+    问「第 1 条」会连同第 2、3 条一起返回，rerank 也因此无从下手。
+
+    为什么标题能靠这三条区分出来：`## 二、质量问题退换货`（12 字、单行、无句末标点）
+    是标题；`第 2 条：第二段占位内容。`（13 字、单行、**以「。」结尾**）是正文。
+    最关键的区分点是**句末标点**：中文文档里正文几乎总是以句号/分号结尾，标题不会。
+    """
+    stripped = text.strip()
+    if not stripped or "\n" in stripped:
+        return False
+    if len(stripped) > _NUMBERED_TITLE_MAX_CHARS:
+        return False
+    return not _NOT_A_TITLE_TAIL.search(stripped)
+
+
 def _attachable(previous: TextChunk, chunk: TextChunk) -> bool:
-    """两个相邻块能不能合：同章节，或**共享同一个父章节**。
+    """两个相邻块能不能合：同章节；或「上一块是下一块的章节祖先」；
+    或「上一块是标题、下一块是它的第一个子块」。
 
-    为什么需要「共同父级」这一条：Markdown 小标题（`## 二、质量问题退换货`）单独成块时
-    只有 12 个字 —— 它没有答案、却要占一个向量位与一次 rerank，是纯粹的浪费。
-    而它后面紧跟的正文（`第 5 条…`）的章节路径是 `父级 > 5 条`：与标题的路径
-    `父级 > 二、质量问题退换货` **既不相等、也不是对方的前缀**（两边的最后一段不同），
-    所以判据必须回退到「父级是否相同」。实测（本仓）：只比相等/前缀时，
-    四个章节标题一个都没合上，而失败是**静默**的（合并只是优化，不报错）。
+    三段判据各自的来历：
 
-    为什么不能放宽到「任何相邻块都能合」：`第 1 条` 与 `第 2 条` 的父级也相同，
-    合并会把两条条款粘成一块 —— 而条款检索恰恰要求它们各自独立
-    （问「第 1 条」不该返回第 2 条的内容）。所以下面的合并还额外要求
-    **小块自身 < min_chars**（标题才会那么短，条款正文不会）。
+    1. **同章节**：同一段落被 `max_chars` 限制切开的相邻块（正常情况）。
+    2. **祖先/前缀**：`## 一、无理由退货`（路径 `父级 > 一、无理由退货`）后面跟着
+       `第 1 条…`（路径 `父级 > 1 条`）—— 两者的最后一段不同，靠这条判据才能合上。
+    3. **标题 + 首个兄弟**：Markdown 小标题单独成块时只有十几个字 —— 它没有答案、
+       却要占一个向量位与一次 rerank，是纯粹的浪费。而它后面那段正文的路径是
+       `父级 > 5 条`，与标题的路径**既不相等、也不是对方的前缀**，所以必须回退到
+       「父级相同」这一层。
+
+    ⚠️ 第 3 条必须额外要求 `_looks_like_heading_text(previous)` **且下一块更长**：
+    否则「父级相同」会把两个短条款也合起来（实测坑 13：一份三条款的短文档被合成了 1 块）。
+    加约束之后，「标题 + 正文」仍然合得上（标题 12 字、正文更长），
+    而「条款 + 条款」合不上（两者都以句号结尾、长度相当）。
     """
     if previous.section == chunk.section:
         return True
@@ -493,12 +526,17 @@ def _attachable(previous: TextChunk, chunk: TextChunk) -> bool:
         return True
     if chunk.section and previous.section and previous.section.startswith(f"{chunk.section} > "):
         return True
-    # 同级兄弟：父章节相同（只有小块会被合并，见调用方对 min_chars 的检查）
+    # 同级兄弟：父章节相同 —— **只允许「上一块是标题、且比下一块短」**这一种。
+    # 「上一块必须是标题」用 `_looks_like_heading_text` 判（单行 + 短 + 无句末标点）；
+    # 「比下一块短」是第二道保险：标题天然比它的正文短，而两条条款正文长度相当。
+    # 两道都不加时，一份「三条款各一句」的短文档会被合成**一块**（实测坑 13）。
     return bool(
         previous.section
         and chunk.section
         and _parent_section(previous.section) == _parent_section(chunk.section)
         and previous.section != chunk.section
+        and _looks_like_heading_text(previous.text)
+        and len(previous.text) < len(chunk.text)
     )
 
 

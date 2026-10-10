@@ -111,6 +111,57 @@ def test_heading_never_merges_into_the_previous_clause(policy_document):
             assert len(markdown_heads) <= 1, f"条款块里混进了额外标题：{chunk.text!r}"
 
 
+def test_short_sibling_clauses_are_not_merged(document_factory):
+    """坑 13 回归：**两条短条款**不许被合并（这是「标题 + 首个兄弟」判据的必要约束）。
+
+    实测症状（用户跑 runbook §2.2 的命令时发现）：这样一份文档
+
+        # 演示政策
+        第 1 条：第一段占位内容。
+        第 2 条：第二段占位内容。
+        第 3 条：第三段占位内容。
+
+    会被合成**一块**（而且区块的 `section` 变成 `演示政策 > 2 条`，溯源指向第 2 条）。
+    根因：「共享父级」那条合并判据没有要求「上一块必须长得像标题」——
+    而 `第 1 条：…。` 与 `第 2 条：…。` 都以句号结尾（是正文），却都短于 `min_chars`，
+    于是被反复向前合并。后果是「一条一款一块」静默失效：问「第 1 条」会把三条一起返回。
+    """
+    document = document_factory(
+        "# 演示政策\n\n"
+        "第 1 条：第一段占位内容。\n\n"
+        "第 2 条：第二段占位内容。\n\n"
+        "第 3 条：第三段占位内容。\n"
+    )
+    chunks = chunk_document(document, ChunkingConfig(strategy="policy"))
+    assert len(chunks) == 3, f"三条短条款应当各自成块，实际：{[chunk.text for chunk in chunks]}"
+    assert [chunk.section for chunk in chunks] == [
+        "演示政策 > 1 条",
+        "演示政策 > 2 条",
+        "演示政策 > 3 条",
+    ]
+    # 每个块里只出现一个条款号（不能把两条粘在一起）
+    assert all(chunk.text.count("第 ") == 1 for chunk in chunks)
+    # 第一条与它的标题合在一起（这是允许的合并方向）
+    assert chunks[0].text.startswith("# 演示政策")
+
+
+def test_heading_lookalike_helper_distinguishes_titles_from_sentences():
+    """`_looks_like_heading_text` 的判据边界：单行 + 短 + 无句末标点。
+
+    这三条是「标题 + 正文可以合」与「条款 + 条款不能合」的唯一分界线，
+    所以它的边界必须被钉住（否则坑 13 会以另一种形式回来）。
+    """
+    from app.rag.chunking import _looks_like_heading_text
+
+    assert _looks_like_heading_text("## 二、质量问题退换货") is True
+    assert _looks_like_heading_text("一、无理由退货") is True
+    assert _looks_like_heading_text("第 2 条：第二段占位内容。") is False  # 以句号结尾 → 正文
+    assert _looks_like_heading_text("第 2 条 无理由退货的运费由买家承担；") is False  # 分号结尾
+    assert _looks_like_heading_text("标题\n正文都在一块里") is False  # 多行
+    assert _looks_like_heading_text("这是一个非常长的标题" * 5) is False  # 超过 30 字
+    assert _looks_like_heading_text("   ") is False
+
+
 def test_chunks_are_not_duplicated(policy_document):
     """没有重复内容（重叠窗口只用于超长单元，普通段落不该重复）。"""
     chunks = chunk_document(policy_document, ChunkingConfig(strategy="policy"))
