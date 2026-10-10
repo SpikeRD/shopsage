@@ -151,14 +151,42 @@ def test_extra_metadata_is_preserved():
     assert results[0].extra == {"updated_at": "2026-09-01", "section": "3.2"}
 
 
-def test_missing_rag_backend_is_actionable():
-    """`rag/` 未落地时报错要能照着修：说明属第 10 步、并给出三种当下可走的做法。"""
+def test_missing_rag_backend_is_actionable(monkeypatch):
+    """`rag/` 未落地时报错要能照着修：说明属第 10 步、并给出三种当下可走的做法。
+
+    ⚠️ 第 10 步（rag）落地后，**默认路径不再报错** —— 所以本用例改成显式模拟
+    「模块不存在」这一种情况（把 `RAG_MODULE` 指向一个不存在的模块）。
+    这样两件事都被钉住：
+      ① 报错话术仍然可照做（新环境/裁剪过的部署里仍会遇到）；
+      ② 默认路径**确实**已经接通（见 `test_default_backend_is_the_real_rag_module`）。
+    """
+    from app.tools import retriever as tools_retriever
+
+    monkeypatch.setattr(tools_retriever, "RAG_MODULE", "app.rag.retriever_not_here")
     with pytest.raises(ToolNotAvailableError) as excinfo:
         retrieve_docs("退货政策", caller=CALLER)
     message = str(excinfo.value)
-    assert "app.rag.retriever" in message
+    assert "app.rag.retriever_not_here" in message
     assert "第 10 步" in message
     assert "search=" in message  # 注入点
+
+
+def test_default_backend_is_the_real_rag_module():
+    """第 10 步落地后，默认后端必须解析到 `app.rag.retriever.hybrid_search`。
+
+    这条断言的意义：**防止有人把默认后端悄悄改回"抛错"或"返回空"**。
+    返回空比抛错更危险 —— 空结果会被上层理解成「知识库里没有这条」。
+    """
+    from app.rag.retriever import hybrid_search
+    from app.tools.retriever import RAG_FUNCTION, RAG_MODULE, _default_searcher
+
+    import importlib
+
+    module = importlib.import_module(RAG_MODULE)
+    searcher = _default_searcher()
+    assert callable(searcher)
+    assert getattr(module, RAG_FUNCTION) is hybrid_search
+    assert searcher.__module__ == RAG_MODULE
 
 
 def test_invalid_arguments_raise_contract_error():

@@ -115,12 +115,24 @@ def seed(seed_value: int = DEFAULT_SEED, *, truncate: bool = True) -> dict[str, 
 
 
 def _truncate_business_tables(db: Session) -> None:
-    """清空 8 张业务表并重置自增 id。
+    """清空 8 张业务表并重置自增 id。**刻意不动向量库**（见下）。
 
     用一条 `TRUNCATE ... RESTART IDENTITY CASCADE` 而不是逐表 DELETE：
     · CASCADE 自动处理外键顺序（不用手工排 `delete()` 的先后）；
     · RESTART IDENTITY 让 id 从 1 开始 —— 重复执行后的数据**完全一致**，便于 diff；
     · 比逐表 delete 少 8 条语句，几十万行时差别明显。
+
+    ⚠️ **第 10 步（rag）实测踩到的连带事故**：`CASCADE` 会顺着外键**删掉向量库**。
+    `rag_chunks.doc_id → rag_documents.doc_id ON DELETE CASCADE` —— 而
+    `TRUNCATE rag_documents CASCADE` 会把 `rag_chunks` 一起清空。也就是说：
+    「跑一次 `scripts.seed.py`（或跑一次带 `seeded` 装置的全量测试）」→
+    **知识库全部消失**，随后 `tests/rag/test_rag_live.py` 会以「向量库是空的」而 skip，
+    而现象看起来完全像「检索坏了」。
+
+    所以本函数显式**只 TRUNCATE 业务表**，把向量表排除在外：
+    向量库的内容来自 `docs/kb`（可重新灌，但要花 embedding 的钱与时间），
+    而它与种子数据**没有任何依赖关系**（业务表里没有 chunk_id 的外键，反过来也一样）。
+    `tests/rag/test_rag_seed_isolation.py` 钉住这条 —— 否则下一个人会顺手把它"统一"回去。
     """
     tables = ", ".join(f'"{t}"' for t in BUSINESS_TABLES)
     db.execute(text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE"))

@@ -26,6 +26,29 @@ def pytest_configure(config) -> None:
         "markers",
         f"{DB_MARKER}: 需要真实 PostgreSQL 的用例（连不上会自动跳过；用 -m 'not db' 排除）",
     )
+    config.addinivalue_line(
+        "markers",
+        "rag_live: 需要真实 embedding/rerank 模型（~20s 加载）的端到端用例；依赖缺失会自动跳过",
+    )
+
+
+def pytest_addoption(parser) -> None:
+    """`--rag-live`（第 10 步）：显式打开真模型用例。
+
+    ⚠️ 必须注册在**根 conftest** 里，不能只写在 `tests/rag/conftest.py` 里（本仓踩过）：
+    pytest 报 `error: unrecognized arguments: --rag-live` —— 因为根 conftest 的加载发生在
+    参数解析期间，而子目录 conftest 要到「收集该目录的用例」时才加载。
+    于是 `uv run pytest -q -m "not llm_live" --rag-live`（全量 + 真模型）这条命令
+    会直接启动失败，而 `uv run pytest -q tests/rag --rag-live`（只跑子目录）却是好的 ——
+    这种「只有某种用法可用」的开关最容易被误认为「参数没生效」。
+    """
+    group = parser.getgroup("rag")
+    group.addoption(
+        "--rag-live",
+        action="store_true",
+        default=False,
+        help="跑需要真实 embedding/rerank 模型的用例（~20s 加载 + 真算力）",
+    )
 
 
 @pytest.fixture(autouse=True)

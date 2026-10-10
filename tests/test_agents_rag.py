@@ -68,16 +68,40 @@ async def test_rag_node_clamps_top_k() -> None:
     assert search.calls[1]["top_k"] == 1
 
 
-async def test_rag_node_without_backend_records_refusal(caplog) -> None:
-    """第 10 步未落地：落 `refusals`（而不是空结果）。"""
+async def test_rag_node_without_backend_records_refusal(caplog, monkeypatch) -> None:
+    """后端未就绪：落 `refusals`（而不是空结果）。
+
+    ⚠️ 第 10 步（rag）落地后，**默认路径已经接通** —— 这条用例改成显式模拟
+    「`app.rag.retriever` 不存在」这一种情况（把 `RAG_MODULE` 指向不存在的模块）。
+    这样两件事都被钉住：
+      ① 「没就绪」与「没命中」必须被区分（前者是能力问题、后者是数据事实）；
+      ② 报错话术仍然可照做（裁剪过的部署里仍会遇到）。
+    """
+    from app.tools import retriever as tools_retriever
+
+    monkeypatch.setattr(tools_retriever, "RAG_MODULE", "app.rag.retriever_not_here")
     with caplog.at_level(logging.WARNING, logger="app.agents.rag"):
         out = await rag_node(state_of("退货政策是什么"))
 
     assert out["docs"] == [] and out["citations"] == []
     assert len(out["refusals"]) == 1
     assert "知识库检索暂不可用" in out["refusals"][0]
-    assert "app.rag.retriever" in out["refusals"][0], "报错要能照着修（说清缺哪一步的交付物）"
+    assert "app.rag.retriever_not_here" in out["refusals"][0], "报错要能照着修"
     assert any("后端未就绪" in r.getMessage() for r in caplog.records)
+
+
+async def test_rag_node_default_backend_is_wired_to_the_real_rag_package() -> None:
+    """默认后端已经接上 `app/rag`（第 10 步的交付物）——防止有人把它改回「抛错/返回空」。
+
+    「返回空」比「抛错」更危险：空结果会被上层理解成「知识库里没有这条」。
+    这里只断言**接线**（`_default_searcher()` 解析到真函数），不查库、不跑检索。
+    """
+    from app.rag.retriever import hybrid_search
+    from app.tools import retriever as tools_retriever
+
+    searcher = tools_retriever._default_searcher()
+    assert searcher is hybrid_search
+    assert tools_retriever.RAG_MODULE == "app.rag.retriever"
 
 
 async def test_rag_node_empty_hits_is_not_a_refusal() -> None:

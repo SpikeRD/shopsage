@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import io
 import textwrap
+import warnings
 from typing import TextIO
 
 from alembic import command
@@ -22,6 +23,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect as sa_inspect, text
+from sqlalchemy.exc import SAWarning
 from sqlalchemy.engine import make_url
 
 from app.config import get_settings
@@ -115,11 +117,14 @@ def test_no_pending_migration_against_models():
 
     这条是防「忘记 revision --autogenerate」的那道闸（也是 3.db-runbook §3.4 的自动化版）。
 
-    ⚠️ **必须排除 LangGraph checkpointer 的四张表**（第 8 步引入）：它们由
-    `AsyncPostgresSaver.setup()` 建库时自建，却同时被注册进了 SQLAlchemy 的全局
-    `Base.metadata`。不排除的后果是这条用例在「跑过图相关的真库用例之后」开始红，
-    而 diff 的内容是「删掉这四张表」—— 那正是我们**不**想做的（会删掉会话状态）。
-    `alembic/env.py` 的 `include_object` 用同一份常量做同样的排除：
+    ⚠️ **必须排除「不是本仓 ORM 模型」的表**，目前两类：
+      · LangGraph checkpointer 的四张表（第 8 步）：由 `AsyncPostgresSaver.setup()` 自建，
+        却同时被注册进 `Base.metadata`；
+      · 第 10 步 rag 的三张向量表：纯 DDL 建的（`vector(n)` / `tsvector` / HNSW / 触发器），
+        刻意没有等价的 SQLAlchemy 模型。
+    不排除的后果是这条用例开始红，而 diff 的内容是「删掉这些表」——
+    那正是我们**不**想做的（会删掉会话状态与整个知识库）。
+    `alembic/env.py` 的 `include_object` 用同一份实现做同样的排除（本文件直接复用它的函数）：
     自动化迁移与人工 `alembic revision --autogenerate` 口径必须一致，否则
     「测试绿了，人手工生成的迁移却是删表」。
     """
@@ -132,19 +137,36 @@ def test_no_pending_migration_against_models():
                 "include_object": _include_object,
             },
         )
-        diffs = compare_metadata(ctx, Base.metadata)
+        # 反射 `rag_chunks.embedding`（pgvector 的 `vector` 类型）时 SQLAlchemy 会打一条
+        # `SAWarning: Did not recognize type 'vector'`：本仓**没装** pgvector 的 Python 包
+        # （DDL 是手写的），所以 `apply_reflection_adapters()` 是空操作。
+        # 精确抑制这一条（而不是全局 `filterwarnings = ignore`）：
+        # 告警全静音之后，真告警也就没人看了。
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=".*Did not recognize type 'vector'.*", category=SAWarning
+            )
+            diffs = compare_metadata(ctx, Base.metadata)
     # 只关心「表/列/约束」级别的差异；把差异打印出来便于排障
     assert not diffs, "库与模型不一致（模型改了但没生成迁移？）：\n" + "\n".join(str(d) for d in diffs)
 
 
 def _include_object(object_, name, type_, reflected, compare_to) -> bool:  # noqa: ANN001
-    """与 `alembic/env.py::_include_object` 同口径：排除 checkpointer 的表与索引。"""
-    if getattr(object_, "name", None) in CHECKPOINT_TABLES:
-        return False
-    table = getattr(object_, "table", None)
-    if table is not None and getattr(table, "name", None) in CHECKPOINT_TABLES:
-        return False
-    return True
+    """与 `alembic/env.py::_include_object` **同一份实现**（不是抄一份）。
+
+    第 10 步（rag）把三张向量表也纳入了排除，而 rag 表是**纯 DDL 建的、没有 ORM 模型** ——
+    抄一份到这个文件里就必然漂移（然后这条用例开始报「库里多了三张表」，
+    而人手工 `alembic revision --autogenerate` 生成的是「删掉知识库」）。
+
+    ⚠️ 不能直接 `import alembic.env` 或读文件执行 `env.py`：那个模块在 import 期就读
+    `context.config`（`AttributeError: module 'alembic.context' has no attribute 'config'`），
+    它只能由 alembic 自己加载。所以把「要排除哪些表」抽成 `app.db.base.EXCLUDED_TABLES`
+    这类**不依赖 alembic 运行时**的常量，两边都用它 —— 口径只有一个来源。
+    """
+    from app.db.excluded import apply_reflection_adapters, is_excluded_from_autogenerate
+
+    apply_reflection_adapters()  # 认识 pgvector 的 `vector` 类型（否则有 SAWarning 噪音）
+    return not is_excluded_from_autogenerate(object_, name, type_)
 
 
 def test_naming_convention_applied_in_database():
@@ -169,6 +191,15 @@ def test_migration_round_trip_is_repeatable():
     实测踩过：跑完本用例后 `tests/test_db_queries.py` 全线
     `permission denied for table orders`。所以这里显式重放（幂等，可重复调用），
     详见 `scripts/db_readonly.py::regrant` 与 `docs/runbook/4.security-runbook.md` §3.4。
+
+    ⚠️⚠️ **第 10 步（rag）起还有一个副作用**：`downgrade base` 会连 `rag_*` 三张表
+    一起删掉，upgrade 建回来的是**空表** —— 也就是说跑完本用例，**向量库就空了**。
+    这不影响本用例的断言（它只管业务表），但会让
+    `tests/rag/test_rag_live.py::live_retriever` 因为「向量库是空的」而 skip。
+    处置：跑完本用例后再执行一次 `uv run python -m scripts.load_knowledge_base`
+    （或只跑 `uv run pytest -q tests/rag`，那时不需要本用例）。
+    刻意**不**在这里自动灌库：那会把「跑一次全量测试」变成「每次重算 59 个片段的向量」
+    （本地 bge-m3 上约 38 秒），而它验证的是迁移可重复，不是检索质量。
     """
     cfg = _alembic_config()
 

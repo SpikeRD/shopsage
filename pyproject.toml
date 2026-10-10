@@ -57,6 +57,7 @@ local = [
 # `uv sync` 默认就会装上 dev 组，不需要 `--extra dev`；等价于 pip 侧的 `-e ".[dev]"`
 [dependency-groups]
 dev = [
+    "pypdf>=6.20.0",
     "pytest>=8.0",
     "pytest-asyncio>=1.4.0",
 ]

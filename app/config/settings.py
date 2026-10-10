@@ -231,6 +231,37 @@ class Settings(BaseSettings):
     embedding_local_path: str = ""
     embedding_device: str = ""
 
+    # ── RAG（第 10 步 rag）：检索层的配置面 ────────────────────────────────────
+    # ⚠️ 这三个字段（backend / model / dim）**必须与向量表的 `vector(n)` 一致**，
+    #    顺序是先定它们、再写迁移（`10.rag.md` 第 3 节）。改任何一项都要重建索引 + 重灌向量。
+    #
+    # 三个数值必须成套修改，所以在这里放一条启动期校验（_validate_rag_vector_space）：
+    # 维度不一致最坏的形态不是写库报错，而是「维度恰好相同但向量空间不相容」。
+    #
+    # 表维度：0 = 不校验（只用于「只想跑不碰库的单测」这类场景）；>0 时与实际建表维度比对。
+    rag_vector_dim: int = Field(default=0, ge=0)
+    # 混合检索的初召回条数（rerank 的输入池）。太小 → rerank 无料可选；太大 → rerank 变慢（E2）。
+    rag_candidates: int = Field(default=30, ge=1, le=200)
+    # RRF 融合常数 k（`1/(k + rank)`）。60 是 Cormack 等人的经验值：k 越大越"平权"两路召回。
+    rag_rrf_k: int = Field(default=60, ge=1, le=1000)
+    # 关键词腿的覆盖率门槛：命中 2-gram / 已知 2-gram 的比例（见 app/rag/textkit.py）。
+    # 定得太低 → 关键词腿变成"只要一个字相同就召回"（低精度）；太高 → 少打一个字就召回不到。
+    rag_keyword_min_ratio: float = Field(default=0.6, ge=0.0, le=1.0)
+    # 关键词腿的 BM25 参数（k1 控 tf 饱和、b 控长度归一化；1.2/0.75 是经典默认值）。
+    rag_bm25_k1: float = Field(default=1.2, gt=0.0)
+    rag_bm25_b: float = Field(default=0.75, ge=0.0, le=1.0)
+    # rerank 后端：off = 关掉（离线/评测对照）；local = 本地 CrossEncoder；api = 兼容 /rerank 的 HTTP 端点。
+    # 默认 local：本仓 .env 的 embedding 也走本地（文本不出网），rerank 与它口径一致才谈得上"零边际成本"。
+    rag_rerank: Literal["off", "local", "api"] = "local"
+    rag_rerank_model: str = "BAAI/bge-reranker-base"
+    rag_rerank_api_base: str = ""
+    rag_rerank_api_key: SecretStr = SecretStr("")
+    # 单次检索最多取回多少条（对客 top-k 的上限；LLM 要 "Top 500" 时由这里兜底，见 E2）
+    rag_max_top_k: int = Field(default=20, ge=1, le=200)
+    # 分块参数：max_chars 是硬上限（超长必切），overlap 是相邻块的重叠字符数（防止答案被切在缝上）。
+    rag_chunk_max_chars: int = Field(default=600, ge=80, le=8000)
+    rag_chunk_overlap: int = Field(default=80, ge=0, le=2000)
+
     # 可观测
     otel_endpoint: str = ""
     langfuse_public_key: str = ""

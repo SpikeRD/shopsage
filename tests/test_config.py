@@ -159,9 +159,24 @@ def test_masking_is_display_only(monkeypatch):
 
 # --- 守卫：名字像密钥的字段必须声明为 SecretStr ---
 
+# ⚠️ 判据是「**以下划线分隔的最后一段**像密钥」，不是「名字里含 key」——
+# 第 10 步（rag）加进来的 `rag_keyword_min_ratio`（关键词腿的覆盖率阈值，一个 float 比例）
+# 会被「含 key」的判据误判成密钥，而它显然不是（同类还有 `max_tokens` 这种参数名）。
+# 收紧成后缀判据之后，`smtp_password` / `api_token` / `llm_api_key` 仍然会被抓到，
+# 而「参数名里恰好有 key 这个词」的字段不再误报。
 _SECRET_NAME_HINTS = ("key", "password", "passwd", "secret", "token", "credential")
 # 本就是公开值、允许不是 SecretStr 的字段（如 Langfuse 的 public key）
 _PUBLIC_BY_DESIGN = frozenset({"langfuse_public_key"})
+
+
+def _looks_like_secret_name(name: str) -> bool:
+    """字段名是否「看起来像密钥」：末段是 key/password/token/secret/credential。
+
+    例：`llm_api_key` → True（末段 key）；`rag_rerank_api_key` → True；
+    `rag_keyword_min_ratio` → False（末段是 ratio）；`max_tokens` → False。
+    """
+    tail = name.lower().split("_")[-1]
+    return tail in _SECRET_NAME_HINTS
 
 
 def _audit_secret_named_fields(model) -> list[tuple[str, object]]:
@@ -170,7 +185,7 @@ def _audit_secret_named_fields(model) -> list[tuple[str, object]]:
     for name, field in model.model_fields.items():
         if name in _PUBLIC_BY_DESIGN:
             continue
-        if not any(h in name.lower() for h in _SECRET_NAME_HINTS):
+        if not _looks_like_secret_name(name):
             continue
         if field.annotation is not SecretStr:
             offenders.append((name, field.annotation))

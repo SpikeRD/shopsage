@@ -56,6 +56,14 @@ READONLY_PASSWORD_ENV = "SHOPSAGE_READONLY_PASSWORD"
 # 只读角色需要的授权（顺序即执行顺序；每条都写成可重复执行的形式）
 WRITE_PRIVILEGES = ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
 
+# 第 10 步（rag）的向量表。**为什么只读角色需要它们的 SELECT**：
+# `app/rag/store.py` 的读路径走 `get_read_engine()`（= 只读角色），
+# 这是刻意的设计 —— 检索是读操作，顺手证明「检索不会写库」。
+# 代价就是这里必须补一次授权：迁移建的表归 `shopuser` 所有，只读角色默认一张也读不了。
+# 实测踩到：第 10 步首次跑通入库后，检索在 `document_state()` 上直接
+# `permission denied for table rag_documents` —— 而报错离「少了一次 GRANT」很远。
+RAG_TABLES = ("rag_documents", "rag_chunks", "rag_corpus_stats")
+
 
 def _admin_dsn() -> str:
     """用**写**角色连接（建角色、授权都需要管理权限）。"""
@@ -80,7 +88,7 @@ def _mask(dsn: str) -> str:
 
 
 def role_grants_summary(tables: list[str]) -> str:
-    return f"{READONLY_ROLE} ← SELECT on {', '.join(tables)}"
+    return f"{READONLY_ROLE} ← SELECT on {len(tables)} 张表：{', '.join(tables)}"
 
 
 def regrant(role: str = READONLY_ROLE) -> list[str]:
@@ -96,8 +104,9 @@ def regrant(role: str = READONLY_ROLE) -> list[str]:
     `permission denied for table orders` 而红。所以「建表之后要重放授权」必须是个
     **可重复调用的一等操作**，而不是靠人记得再跑一次 bootstrap。
     """
+    targets = _existing_tables(BUSINESS_TABLES + RAG_TABLES)
     with psycopg.connect(_admin_dsn(), autocommit=True) as conn, conn.cursor() as cur:
-        for table in sorted(BUSINESS_TABLES):
+        for table in targets:
             cur.execute(
                 sql.SQL("GRANT SELECT ON TABLE {tbl} TO {role}").format(
                     tbl=sql.Identifier(table), role=sql.Identifier(role)
@@ -111,7 +120,27 @@ def regrant(role: str = READONLY_ROLE) -> list[str]:
                         role=sql.Identifier(role),
                     )
                 )
-    return sorted(BUSINESS_TABLES)
+    return targets
+
+
+def _existing_tables(candidates: tuple[str, ...]) -> list[str]:
+    """过滤掉「还不存在的表」。
+
+    为什么需要：第 10 步的 `rag_*` 三张表要跑过迁移才有；在只跑到第 9 步的环境里，
+    `GRANT SELECT ON rag_chunks` 会直接 `relation "rag_chunks" does not exist` 并中止
+    整个 bootstrap —— 一个「第 10 步还没做」的环境连第 4 步的授权都跑不完。
+    （与 `BUSINESS_TABLES` 的区别：那 8 张表是第 3 步的交付物，缺了就说明环境不对，该报错。）
+    """
+    with psycopg.connect(_admin_dsn(), autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "select tablename from pg_tables where schemaname = 'public' and tablename = any(%s)",
+            (list(candidates),),
+        )
+        present = {row[0] for row in cur.fetchall()}
+    missing = [table for table in candidates if table not in present]
+    if missing:
+        print(f"  （跳过 {len(missing)} 张尚不存在的表：{', '.join(missing)}）")
+    return [table for table in candidates if table in present]
 
 
 def bootstrap(password: str, *, downgrade_superuser: bool = False) -> str:
@@ -151,17 +180,18 @@ def bootstrap(password: str, *, downgrade_superuser: bool = False) -> str:
         )
         print(f"[2/5] CONNECT on {db_name} + USAGE on schema public 已授权")
 
-        # ③ 8 张业务表的 SELECT（逐表授权，顺便把「白名单表」变成可核对的清单）
-        for table in sorted(BUSINESS_TABLES):
+        # ③ 8 张业务表 + 3 张向量表的 SELECT（逐表授权，顺便把「白名单表」变成可核对的清单）
+        read_tables = list(sorted(BUSINESS_TABLES)) + _existing_tables(RAG_TABLES)
+        for table in read_tables:
             cur.execute(
                 sql.SQL("GRANT SELECT ON TABLE {tbl} TO {role}").format(
                     tbl=sql.Identifier(table), role=sql.Identifier(READONLY_ROLE)
                 )
             )
-        print(f"[3/5] SELECT 已授权：{', '.join(sorted(BUSINESS_TABLES))}")
+        print(f"[3/5] SELECT 已授权（{len(read_tables)} 张）：{', '.join(read_tables)}")
 
         # ④ 显式收回写权限（不依赖「新版 PG 默认就不给」）+ 收回建表权限
-        for table in sorted(BUSINESS_TABLES):
+        for table in read_tables:
             cur.execute(
                 sql.SQL("REVOKE {privs} ON TABLE {tbl} FROM {role}").format(
                     privs=sql.SQL(", ").join(sql.SQL(p) for p in WRITE_PRIVILEGES),
@@ -239,9 +269,11 @@ def verify() -> int:
 
         # ⚠️ 必须**逐表**试读：`GRANT SELECT` 是挂在表对象上的，表被 DROP 重建后授权会一起消失。
         # 只抽查一张表会漏掉「别的表没授权」这种状态（实测踩过：迁移回环之后只有部分表读不了）。
+        # 第 10 步起把向量表也算进来：检索走的就是这条只读连接。
+        check_tables = sorted(BUSINESS_TABLES) + _existing_tables(RAG_TABLES)
         unreadable: list[str] = []
         readable = 0
-        for candidate in sorted(BUSINESS_TABLES):
+        for candidate in check_tables:
             try:
                 cur.execute(
                     sql.SQL("SELECT count(*) FROM {tbl}").format(tbl=sql.Identifier(candidate))
@@ -252,7 +284,7 @@ def verify() -> int:
         if unreadable:
             print(f"  ❌ 这 {len(unreadable)} 张表读不了（授权丢了？跑 --regrant-only）：{', '.join(unreadable)}")
         else:
-            print(f"  ✅ {readable}/{len(BUSINESS_TABLES)} 张业务表全部可读")
+            print(f"  ✅ {readable}/{len(check_tables)} 张表（业务 + 向量）全部可读")
 
         # 逐条尝试写操作，**每条都在独立事务里**，避免一条失败影响后续判定
         attempts = [
@@ -299,13 +331,13 @@ def verify() -> int:
     print()
     if failures == len(attempts) and not unreadable and engine_ok:
         print(
-            f"验收通过：{readable}/{len(BUSINESS_TABLES)} 张表可读，"
+            f"验收通过：{readable}/{len(check_tables)} 张表（业务 + 向量）可读，"
             f"{failures}/{len(attempts)} 条写操作全部被数据库拒绝（权限错误），"
             f"且应用读引擎落在 {READONLY_ROLE} 上。"
         )
         return 0
     print(
-        f"验收未通过：可读 {readable}/{len(BUSINESS_TABLES)}，写操作被拒 {failures}/{len(attempts)}，"
+        f"验收未通过：可读 {readable}/{len(check_tables)}，写操作被拒 {failures}/{len(attempts)}，"
         f"读引擎就位={engine_ok}。",
         file=sys.stderr,
     )

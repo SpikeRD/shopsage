@@ -28,7 +28,12 @@ from app.db.urls import to_sqlalchemy_url
 # 但不是本仓的模型，必须排除在迁移比对之外（见 `_include_object`）。
 # ⚠️ 只 import 常量所在的模块，**不** import `app.graph` 本体：
 # 那个包会连带 import 整张图（含 litellm 链路），而迁移环境应当尽可能轻。
-from app.graph.checkpointer import CHECKPOINT_TABLES
+from app.db.excluded import EXCLUDED_TABLES, apply_reflection_adapters, is_excluded_from_autogenerate
+
+# 让 SQLAlchemy 认识 pgvector 的 `vector` 类型：否则反射到 `rag_chunks.embedding` 时
+# 会打 `SAWarning: Did not recognize type 'vector'`（虽然被 `_include_object` 排除了比对，
+# 但**反射本身**仍会发生）。返回值忽略：pgvector 的 Python 包没装时不该让迁移失败。
+apply_reflection_adapters()
 
 def _process_revision_directives(context, revision, directives) -> None:  # noqa: ANN001
     """两道护栏，防止「静默生成一个没用的迁移」。
@@ -91,26 +96,28 @@ DB_URL = to_sqlalchemy_url(
 def _include_object(object_, name, type_, reflected, compare_to) -> bool:  # noqa: ANN001
     """把**不属于本仓模型**的表排除在 autogenerate / compare 之外。
 
-    目前只有一类：LangGraph checkpointer 的四张表（`checkpoints` / `checkpoint_blobs` /
-    `checkpoint_writes` / `checkpoint_migrations`）。它们由 `AsyncPostgresSaver.setup()`
-    建库时自建，但**同时被注册进了 SQLAlchemy 的全局 metadata**（那是
-    `langgraph-checkpoint-postgres` 的实现方式）。不排除的后果：
+    目前有两类：
 
-    * `alembic revision --autogenerate` 会生成一个「删掉这四张表」的迁移 —— 跑下去就是
-      **把会话状态全删了**（而它在评审里长得完全像一次正常的清理）；
-    * `tests/test_db_migrations.py` 的一致性用例在跑过图相关的真库用例之后开始红。
+    1. **LangGraph checkpointer 的四张表**（`checkpoints` / `checkpoint_blobs` /
+       `checkpoint_writes` / `checkpoint_migrations`）。它们由 `AsyncPostgresSaver.setup()`
+       建库时自建，但**同时被注册进了 SQLAlchemy 的全局 metadata**（那是
+       `langgraph-checkpoint-postgres` 的实现方式）。不排除的后果：
 
-    为什么不干脆把这四张表写进我们的迁移：它们的结构由 langgraph 的版本决定，
-    写进自己的迁移就把「升级依赖」变成了「手写迁移」，而 `saver.setup()` 本来就负责这件事。
+       * `alembic revision --autogenerate` 会生成一个「删掉这四张表」的迁移 —— 跑下去就是
+         **把会话状态全删了**（而它在评审里长得完全像一次正常的清理）；
+       * `tests/test_db_migrations.py` 的一致性用例在跑过图相关的真库用例之后开始红。
+
+    2. **第 10 步 rag 的三张向量表**（`rag_documents` / `rag_chunks` / `rag_corpus_stats`）。
+       它们是**纯 DDL 建的**（含 `vector(n)` / `tsvector` / HNSW / GIN / PL/pgSQL 触发器），
+       刻意没有等价的 SQLAlchemy 模型 —— 把 pgvector 与 tsvector 用 ORM 类型重写一遍，
+       只会多一份可能漂移的「第二真相」。代价是：不排除的话，autogenerate 会认为
+       「库里有、模型里没有」→ 生成一串 `drop_table`，跑下去**把整个知识库删掉**。
+       （这条与第 1 类同一个道理：`compare_to is None` 且不是我们声明的表。）
+
+    为什么不用 `include_schemas=False` 或其他开关来回避：那些是**全局**开关，
+    关掉会让真正的漂移也检测不出来。这里要的是「精确地少看几张表」。
     """
-
-    if getattr(object_, "name", None) in CHECKPOINT_TABLES:
-        return False
-    # 索引也要一起排除：否则「表被排除了、它上面的索引还在比」会报出一堆 remove_index
-    table = getattr(object_, "table", None)
-    if table is not None and getattr(table, "name", None) in CHECKPOINT_TABLES:
-        return False
-    return True
+    return not is_excluded_from_autogenerate(object_, name, type_)
 
 
 def _configure(connection=None, url: str | None = None, **extra: object) -> None:
