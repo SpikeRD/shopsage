@@ -30,8 +30,7 @@ from app.llm.errors import (
     is_permanent,
     is_retryable,
 )
-from app.observability.instrument import record_llm_call
-from app.observability.tracing import trace_llm, trace_span
+from app.observability.instrument import embed_span, llm_span, record_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -404,7 +403,7 @@ async def llm_call(
         # 所以「重试了 3 次」在 trace 里就是 3 条 `llm.call`。
         # 若把 span 开在 `llm_call` 外面，重试会被折叠成一条 —— 而「这次请求到底打了几次模型」
         # 正是成本与延迟归因的关键（看不到重试次数，就看不出「退避把 P99 推高了」）。
-        with trace_llm(used_model, attributes={"backend": "litellm"}) as span:
+        with llm_span(used_model, attributes={"backend": "litellm"}) as span:
             try:
                 response = await litellm.acompletion(
                     model=used_model,
@@ -520,11 +519,7 @@ async def embed(
     from app.rag.textkit import approx_tokens
 
     approx = sum(approx_tokens(text) for text in items)
-    with trace_span(
-        "llm.embed",
-        kind="llm",
-        attributes={"model": used_model, "backend": backend, "tokens": approx, "rows": len(vectors)},
-    ) as span:
+    with embed_span(used_model, backend=backend, input_tokens=approx, rows=len(vectors)) as span:
         span.set_ok()
     return vectors
 

@@ -77,7 +77,7 @@ from app.graph.state import (
     NODE_SYNTHESIS,
     to_openai_messages,
 )
-from app.observability.tracing import trace_span
+from app.observability.instrument import node_span
 
 logger = logging.getLogger(__name__)
 
@@ -194,10 +194,13 @@ def safe_node(fn: Any) -> Any:
 
     async def node(state: AgentGraphState, config: RunnableConfig) -> dict[str, Any]:
         del config  # 图会把 RunnableConfig 透传进来；六个节点的契约里没有它
-        # `trace_span` 是**同步**上下文管理器，而本函数是 async —— 这里可以正常 `with`：
+        # ⚠️ 用 `instrument.node_span(...)` 而**不是**直接调 `tracing.trace_span`：
+        # span 名的构造规约必须只有一处（漏一个字母不会报错，只会让那条 span 的耗时
+        # 静默地不进任何指标）。见 `instrument.node_span` 的说明。
+        # 它是**同步**上下文管理器，而本函数是 async —— 这里可以正常 `with`：
         # span 的存活期就是 `await fn(...)` 这一段，OTEL 用 contextvars 传递，
         # 所以 `await` 期间 span 仍是「当前 span」，六个节点内部的 LLM/检索 span 会自动挂到它下面。
-        with trace_span(f"node.{node_name}", kind="node", attributes={"node": node_name}) as handle:
+        with node_span(node_name) as handle:
             # `stage` 记路由结论（`""` = 还没路由，`data`/`rag`/… = 已知分支）。
             # 一次请求的 span 树里有了它，「这一步为什么跑」不用再去翻 state。
             handle.set_attributes({"stage": str(state.get("route") or "")})

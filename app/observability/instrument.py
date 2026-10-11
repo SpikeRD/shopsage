@@ -62,6 +62,7 @@ from app.observability.tracing import (
     TRACE_COUNT,
     TraceHandle,
     telemetry,
+    trace_llm,
     trace_span,
 )
 
@@ -373,6 +374,43 @@ def node_span_attributes(*, node: str, **extra: Any) -> dict[str, Any]:
     return {"node": node, **extra}
 
 
+def node_span(node: str) -> Any:
+    """一次图节点的 span（`node.<节点名>`）；`with` 包住这一跳的执行。
+
+    为什么需要它（而不是让 `app/graph/nodes.py` 直接调 `tracing.trace_span`）：
+    **span 名的构造规约必须只有一处**。`node.` / `tool.` / `sql.` / `llm.` / `retrieval.`
+    这五个前缀决定了耗时进哪条指标（`tracing._duration_series` 是唯一的映射处），
+    而调用点自己拼 `f"node.{name}"` 时，拼错一个字母不会报错 ——
+    只会让那条 span 的耗时**静默地不进任何指标**（症状是「这个节点的 P99 怎么没有」）。
+    所以：业务代码只调 `instrument` 的具名入口，`tracing` 是它的实现层。
+    """
+    return trace_span(f"{NODE_PREFIX}{node}", kind="node", attributes={"node": str(node)})
+
+
+def embed_span(model: str, *, backend: str, input_tokens: int, rows: int) -> Any:
+    """一次 embedding 的 span（`llm.embed`）；`with` 包住调用之后的那一段。
+
+    ⚠️ token 用 `input_tokens`（近似口径：本地后端拿不到真实 usage），
+    所以它**只进 span 属性，不进 `LLM_TOKENS` counter** ——
+    把估算值混进计费口径的 counter 会让那个数字永久失真（而它看起来仍然精确）。
+    """
+    return trace_span(
+        "llm.embed",
+        kind="llm",
+        attributes={"model": model, "backend": backend, "tokens": input_tokens, "rows": rows},
+    )
+
+
+def llm_span(model: str, *, attributes: Mapping[str, Any] | None = None) -> Any:
+    """一次 LLM 调用的 span（`llm.call`，`kind="llm"` → 耗时进 `LLM_DURATION`）。
+
+    与 `tracing.trace_llm` 是同一个东西，这里再包一层只为**让 `app/llm/client.py`
+    只依赖 `instrument` 一个模块**（否则它要从两个模块各 import 一次，
+    而「埋点归谁管」这件事就有了两个答案）。
+    """
+    return trace_llm(model, attributes=attributes)
+
+
 def current_trace_id() -> str:
     """当前 trace id（没有活跃 span 时为空串）。
 
@@ -411,6 +449,9 @@ __all__ = [
     "count_trace",
     "current_trace_id",
     "describe",
+    "embed_span",
+    "llm_span",
+    "node_span",
     "node_span_attributes",
     "record_llm_call",
     "record_request",
