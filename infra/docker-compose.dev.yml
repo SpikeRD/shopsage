@@ -82,6 +82,13 @@ services:
       # 第 11 步：业务代码跑在 Windows 宿主，Prometheus 在容器里。
       # 172.17.0.1 是默认网桥下「宿主机」的地址（Linux 上是 docker0 的 IP）；
       # 业务与 Prometheus 同机时改成 host.docker.internal（下面 extra_hosts 已配好）。
+      #
+      # ⚠️ 这一行是 `${VAR:-default}` 语法，**只有这里能用** —— compose 负责替换 compose 文件。
+      #    它替换出来的值再作为【容器环境变量】交给 Prometheus，由 Prometheus 用
+      #    `${SHOPSAGE_API_TARGET}`（只认 `$VAR`/`${VAR}`，**不认 `:-`**）去替换
+      #    prometheus.yml 里的引用。所以默认值必须留在这一行，
+      #    **prometheus.yml 里只能写纯 `${SHOPSAGE_API_TARGET}`**；写反了不报错，
+      #    只会让 scrapeUrl 变成 http://${SHOPSAGE_API_TARGET:-...}/metrics → target 永久 down。
       SHOPSAGE_API_TARGET: ${SHOPSAGE_API_TARGET:-172.17.0.1:8000}
     extra_hosts:
       # 让 `host.docker.internal` 在 Linux 上也能用（Docker Desktop 自带，原生 Linux 不自带）

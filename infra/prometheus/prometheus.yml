@@ -43,7 +43,18 @@ scrape_configs:
   - job_name: shopsage-api
     metrics_path: /metrics
     static_configs:
-      - targets: ["${SHOPSAGE_API_TARGET:-172.17.0.1:8000}"]
+      # ⚠️⚠️ 这里**只能写 `${SHOPSAGE_API_TARGET}`**，绝对不能写 `${SHOPSAGE_API_TARGET:-172.17.0.1:8000}`。
+      #   Prometheus 的配置替换语法只有 `$VAR` / `${VAR}` 两种，**不支持 `:-default`**
+      #   （那是 shell / docker compose 的语法）。写成带默认值的样子时 Prometheus **不报配置错**，
+      #   而是把整个 `${...}` 当成主机名去解析 —— 结果是一条 target，
+      #   `scrapeUrl` 长这样：http://${SHOPSAGE_API_TARGET:-172.17.0.1:8000}/metrics
+      #   （URL 编码后是 %7B...%7D），`lastError` 是 `parse ... invalid port`，
+      #   症状是「一个 up 一个 down」而**日志里什么都没有**（配置本身是合法的）。
+      #   默认值的归属在 compose 的 `environment:`（那里用 compose 语法 ${VAR:-default}），
+      #   两边分工：**compose 管默认值，这个文件只管引用**。
+      #   兜底判断：`docker exec shopsage-dev-prometheus cat /etc/prometheus/prometheus.yml`
+      #   看到字面量 `${` 就是没替换成功。
+      - targets: ["${SHOPSAGE_API_TARGET}"]
         labels:
           service: api
 

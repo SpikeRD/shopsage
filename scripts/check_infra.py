@@ -38,6 +38,10 @@ DASHBOARD = "infra/grafana/provisioning/dashboards/shopsage-observability.json"
 #: 允许出现在记录规则表达式里的指标名前缀（我们这个项目自己的指标）。
 METRIC_RE = re.compile(r"\b(shopsage[a-z0-9_]*)\b")
 
+#: shell/compose 的「带默认值」变量语法。Prometheus 的配置替换**不支持**它，
+#: 但也不会因此报错 —— 它会把整个 `${...}` 当字面量主机名，于是 target 永久 down。
+_SHELL_DEFAULT_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-")
+
 
 def _load_yaml(relative: str) -> tuple[dict | None, str]:
     path = ROOT / relative
@@ -98,6 +102,18 @@ def check_prometheus_scrape() -> list[str]:
                     problems.append(
                         f"job {job.get('job_name')} 的 target 是 {target!r}："
                         "Prometheus 在容器里，localhost 指的是它自己（业务在宿主机上）"
+                    )
+                # 实测踩过：写成 `${VAR:-default}` 时 Prometheus **不报配置错**，
+                # 而是把整个 `${...}` 当主机名 → scrapeUrl 变成 http://${VAR:-x}/metrics、
+                # lastError 是 URL 解析失败，症状是「一个 target up、一个 down」而日志干净。
+                # Prometheus 的替换语法只有 `$VAR` / `${VAR}`（不支持 `:-`），
+                # 默认值必须留在 compose 的 environment 里（那里才有 compose 语法）。
+                if _SHELL_DEFAULT_RE.search(str(target)):
+                    problems.append(
+                        f"job {job.get('job_name')} 的 target 是 {target!r}，用了 `:-` 默认值语法 —— "
+                        "Prometheus 只支持 `$VAR`/`${VAR}`，不认 `:-`：它不会报错，"
+                        "只会把字面量当主机名 → 该 target 永久 down。"
+                        "默认值请留在 compose 的 environment 里，这里只写纯 `${VAR}`"
                     )
     return problems
 
