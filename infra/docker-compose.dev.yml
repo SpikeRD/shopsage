@@ -78,20 +78,25 @@ services:
       - "--storage.tsdb.retention.time=15d"
       # 允许通过 UI 调 scrape 目标，方便第 11 步现场排查
       - "--web.enable-lifecycle"
-    environment:
-      # 第 11 步：业务代码跑在 Windows 宿主，Prometheus 在容器里。
-      # 172.17.0.1 是默认网桥下「宿主机」的地址（Linux 上是 docker0 的 IP）；
-      # 业务与 Prometheus 同机时改成 host.docker.internal（下面 extra_hosts 已配好）。
-      #
-      # ⚠️ 这一行是 `${VAR:-default}` 语法，**只有这里能用** —— compose 负责替换 compose 文件。
-      #    它替换出来的值再作为【容器环境变量】交给 Prometheus，由 Prometheus 用
-      #    `${SHOPSAGE_API_TARGET}`（只认 `$VAR`/`${VAR}`，**不认 `:-`**）去替换
-      #    prometheus.yml 里的引用。所以默认值必须留在这一行，
-      #    **prometheus.yml 里只能写纯 `${SHOPSAGE_API_TARGET}`**；写反了不报错，
-      #    只会让 scrapeUrl 变成 http://${SHOPSAGE_API_TARGET:-...}/metrics → target 永久 down。
-      SHOPSAGE_API_TARGET: ${SHOPSAGE_API_TARGET:-172.17.0.1:8000}
+    # ⚠️ 这里**故意不设 `environment:`**（曾经有个 SHOPSAGE_API_TARGET，已删除）：
+    #    prom/prometheus:v2.55.1 **不会**替换 scrape 目标里的 `${...}` —— 配置文件的环境变量
+    #    展开在 2.x 只作用于 `external_labels`（靠 expand-external-labels 特性开关），
+    #    Prometheus 3.0 移除该 flag 后才成为默认行为。
+    #    留着那个变量只会让人以为「改它的值就能改采集地址」，而实际完全没被读取：
+    #    症状是 target 永久 down（`invalid URL escape "%7B"` 或 `invalid port ":8000%7D"`）
+    #    而日志干净、配置校验也通过。采集地址现在写死在
+    #    infra/prometheus/prometheus.yml 的 `targets:` 那一行。
+    #    ➡️ 以后要加环境变量进这个容器，先确认目标程序**真的会读它**。
     extra_hosts:
-      # 让 `host.docker.internal` 在 Linux 上也能用（Docker Desktop 自带，原生 Linux 不自带）
+      # 让 `host.docker.internal` 在 Linux 上也能解析（Docker Desktop 自带，原生 Linux 不自带）。
+      #
+      # ⚠️ 但它在**本仓的开发拓扑下不能用来指 Windows**（实测 2026-10-11）：
+      #    在原生 Docker Engine 上 `host-gateway` 解析成的是 **Linux VM 自己**的网关
+      #    （本栈实测 172.18.0.1），不是 Windows 开发者机。
+      #    → 采集 Windows 上的业务必须写 Windows 的真实网卡 IP
+      #      （实测 192.168.167.148:8000），见 infra/prometheus/prometheus.yml 末尾的拓扑说明。
+      #    这条 extra_hosts 保留的意义：将来「业务也搬到 Linux 上跑」时，
+      #    host.docker.internal 就等于那台 Linux，比写死网桥 IP 更耐改网络配置。
       - "host.docker.internal:host-gateway"
     ports:
       - "${PROMETHEUS_BIND_IP:-0.0.0.0}:${PROMETHEUS_PORT:-9090}:9090"

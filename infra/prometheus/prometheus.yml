@@ -2,9 +2,18 @@
 #
 # 关键点：Prometheus 跑在 Linux 虚拟机的容器里，而**业务代码跑在 Windows 宿主机**，
 # 所以 scrape target 不能写 "localhost"（那是容器自己）。
-# Docker 网桥下 Windows 宿主机的地址是容器的默认网关（通常 172.17.0.1）；
-# 若业务与 Prometheus 同在一台 Linux 上，用 `extra_hosts: host.docker.internal:host-gateway`
-# 后写 `host.docker.internal:8000` 更稳（见 compose 里 prometheus 服务的注释）。
+#
+# ⚠️ 那该写什么地址？**不要凭记忆写「宿主机=172.17.0.1」** —— 这句话只在
+#    「业务也在 Linux VM 上、且容器在默认 bridge（docker0）里」时才成立。
+#    本仓的开发拓扑是【Windows 开发者机 + 独立的 Linux 依赖机】两台机器，
+#    此时唯一正确的地址是 **Windows 在 VMware 网段上的那张网卡 IP**（本仓实测 192.168.167.148，
+#    见文件末尾的「本机实测拓扑」）。取法（在 Windows 上执行）：
+#      Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' }
+#    判据是它必须与 Linux 的 `ip -4 -o addr show` 里 ens33/eth0 那张网卡**在同一个 /24**。
+#
+# ⚠️ 也不要写 `host.docker.internal`：compose 里配的 `extra_hosts: host.docker.internal:host-gateway`
+#    只对 **Docker Desktop** 才等于「Windows 主机」；原生 Docker Engine（本仓的 Linux VM 就是）
+#    会把它解析成 **Linux VM 自己**的网关，指向的仍然是那台 Linux，不是 Windows。
 #
 # ⚠️ 第 11 步落地后，`shopsage-api` 这个 job **默认打开**（在此之前它是注释状态，
 #    理由写在原注释里：metrics_server 尚未实现时打开只会让 Prometheus 一直刷 target down）。
@@ -43,18 +52,25 @@ scrape_configs:
   - job_name: shopsage-api
     metrics_path: /metrics
     static_configs:
-      # ⚠️⚠️ 这里**只能写 `${SHOPSAGE_API_TARGET}`**，绝对不能写 `${SHOPSAGE_API_TARGET:-172.17.0.1:8000}`。
-      #   Prometheus 的配置替换语法只有 `$VAR` / `${VAR}` 两种，**不支持 `:-default`**
-      #   （那是 shell / docker compose 的语法）。写成带默认值的样子时 Prometheus **不报配置错**，
-      #   而是把整个 `${...}` 当成主机名去解析 —— 结果是一条 target，
-      #   `scrapeUrl` 长这样：http://${SHOPSAGE_API_TARGET:-172.17.0.1:8000}/metrics
-      #   （URL 编码后是 %7B...%7D），`lastError` 是 `parse ... invalid port`，
-      #   症状是「一个 up 一个 down」而**日志里什么都没有**（配置本身是合法的）。
-      #   默认值的归属在 compose 的 `environment:`（那里用 compose 语法 ${VAR:-default}），
-      #   两边分工：**compose 管默认值，这个文件只管引用**。
-      #   兜底判断：`docker exec shopsage-dev-prometheus cat /etc/prometheus/prometheus.yml`
-      #   看到字面量 `${` 就是没替换成功。
-      - targets: ["${SHOPSAGE_API_TARGET}"]
+      # ⚠️ 这里**必须写死地址**，不要用 `${...}` —— 实测过两次，结论是：
+      #   本仓钉的 prom/prometheus:v2.55.1 **不会**替换 scrape 目标里的环境变量。
+      #   * 官方文档（2.55 的 feature_flags）里 `expand-external-labels` 只作用在
+      #     `external_labels` 上；该 flag 在 3.0 被移除后才成为默认行为
+      #     （见 Prometheus 3.0 迁移指南）—— 也就是说 2.x 的 static_configs 不参与展开。
+      #   * 两种写法的症状（都会让 target 永久 down，且**配置本身合法、日志干净**）：
+      #       "${VAR:-1.2.3.4:8000}" → 整个字面量当主机名，lastError: invalid port ":8000%7D"
+      #       "${VAR}"               → 展开成空主机名，scrapeUrl 变成 http://:80/metrics，
+      #                                lastError: invalid URL escape "%7B"
+      #     （`%7B`/`%7D` 就是 `{`/`}` 的 URL 编码，是「没替换成功」的指纹。）
+      #   * 改地址的两种情形（**看你在哪儿跑业务**）：
+      #       ① 业务在 Windows 开发者机（本仓开发拓扑）→ 写 Windows 在 VMware 网段的网卡 IP，
+      #          即下面这个 192.168.167.148:8000。它必须与 Linux 的 ens33 同网段。
+      #       ② 业务也搬到 Linux VM 上跑（.env 里 host 改回 localhost）→ 写 172.18.0.1:8000，
+      #          即**容器 `ip route` 里 `default via` 那个地址**（compose 自定义网桥的网关，
+      #          不是 docker0 的 172.17.0.1）。
+      #   * 想让地址可配置：部署期生成/替换这个文件，或升级到 Prometheus 3.x ——
+      #     **不是**在这里写 `${...}`。scripts/check_infra.py 会把这类写法直接判为错误。
+      - targets: ["192.168.167.148:8000"]
         labels:
           service: api
 
@@ -67,6 +83,29 @@ scrape_configs:
   #         service: otel-collector
 
   # Arq worker（第 12 步启用，队列深度/失败数在 B1 验收里要看）
+  # ⚠️ 地址口径同上：worker 也跑在 Windows 上，所以用 Windows 的 VMware 网卡 IP，
+  #    不是 172.17.0.1（那是 docker0，本栈没用它）。
   # - job_name: shopsage-worker
   #   static_configs:
-  #     - targets: ["172.17.0.1:9100"]
+  #     - targets: ["192.168.167.148:9100"]
+
+# ── 本机实测拓扑（2026-10-11 排障时逐条验证过，改地址前先读这段）─────────────
+#
+#   Windows 开发者机（业务 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000）
+#     Ethernet0                192.168.167.148/24     ← 业务实际监听的地址
+#   Linux 依赖机（Docker Engine + compose 全套依赖）
+#     ens33                    192.168.167.130/24     ← 与 Windows 同 /24，双向可达
+#     docker0                  172.17.0.1/16          ← 默认 bridge，**本栈没用它**
+#     br-40dcd5210154          172.18.0.1/16          ← compose 自定义网桥，本栈用这张
+#   容器内（shopsage-dev-prometheus）
+#     `ip route` → default via 172.18.0.1 dev eth0，src 172.18.0.2
+#
+#   所以「容器 → 172.17.0.1:8000」会走：容器 → 172.18.0.1 → Linux 的 docker0 网卡
+#   →（Linux 上没有任何进程听 8000）→ **内核立刻回 RST** → `connection refused`（实测 63ms）。
+#   那个 RST 根本没到 Windows，所以查 Windows 防火墙是白费功夫 —— 判据永远是
+#   容器里的 `ip route`（网关是谁）+ 对端真实网卡 IP，两边夹出地址。
+#
+#   验证顺序（每次改完地址都照这个跑）：
+#     docker exec shopsage-dev-prometheus wget -qO- -T 3 http://<地址>:8000/metrics | head -5
+#     curl -s 'http://localhost:9090/api/v1/targets?state=any' | grep -o '"health":"[a-z]*"' | sort | uniq -c
+#     期望：2 个 up

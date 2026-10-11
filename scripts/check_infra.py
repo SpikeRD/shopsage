@@ -38,9 +38,13 @@ DASHBOARD = "infra/grafana/provisioning/dashboards/shopsage-observability.json"
 #: 允许出现在记录规则表达式里的指标名前缀（我们这个项目自己的指标）。
 METRIC_RE = re.compile(r"\b(shopsage[a-z0-9_]*)\b")
 
-#: shell/compose 的「带默认值」变量语法。Prometheus 的配置替换**不支持**它，
-#: 但也不会因此报错 —— 它会把整个 `${...}` 当字面量主机名，于是 target 永久 down。
-_SHELL_DEFAULT_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-")
+#: 任何 `${VAR}` / `$VAR` 形式出现在 scrape 目标地址里 —— 一律判错。
+#: 实测结论（踩过两次）：prom/prometheus:v2.55.1 **不会**替换 static_configs 里的环境变量
+#: （`expand-external-labels` 在 2.x 只作用于 external_labels，3.0 移除该 flag 后才默认生效）。
+#: 两种写法的症状都是「配置合法、日志干净、target 却永久 down」：
+#:   `${VAR:-1.2.3.4:8000}` → invalid port ":8000%7D"
+#:   `${VAR}`               → 展开成空主机名，http://:80/metrics → invalid URL escape "%7B"
+_ENV_REF_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _load_yaml(relative: str) -> tuple[dict | None, str]:
@@ -98,22 +102,24 @@ def check_prometheus_scrape() -> list[str]:
     for job in data.get("scrape_configs") or []:
         for config in job.get("static_configs") or []:
             for target in config.get("targets") or []:
+                # 实测踩过两次：`static_configs.targets` 里写 `${...}` 时，
+                # prom/prometheus:v2.55.1 **不做替换也不报错**，而是把字面量当主机名
+                # （或展开成空主机名）→ target 永久 down、日志干净、config -q 也通过。
+                # 所以这类写法一律判错：地址必须写死（可配置的话请换文件或升级 3.x）。
+                if _ENV_REF_RE.search(str(target)):
+                    problems.append(
+                        f"job {job.get('job_name')} 的 target 是 {target!r}，里面含环境变量引用 —— "
+                        "Prometheus 2.x 不替换 static_configs 里的 `${...}`（只作用于 external_labels，"
+                        "3.0 才默认生效），它既不报错也不替换：target 会永久 down"
+                        "（`invalid URL escape \"%7B\"` 或 `invalid port \":8000%7D\"`）。"
+                        "请把地址写死，例如 targets: [\"192.168.167.148:8000\"]（Windows 网卡 IP，"
+                        "地址取法见 11.observability-runbook.md §6.2）；"
+                        "需要可配置就在部署期生成这个文件，或升级 Prometheus 3.x"
+                    )
                 if "localhost" in str(target) and job.get("job_name") != "prometheus":
                     problems.append(
                         f"job {job.get('job_name')} 的 target 是 {target!r}："
                         "Prometheus 在容器里，localhost 指的是它自己（业务在宿主机上）"
-                    )
-                # 实测踩过：写成 `${VAR:-default}` 时 Prometheus **不报配置错**，
-                # 而是把整个 `${...}` 当主机名 → scrapeUrl 变成 http://${VAR:-x}/metrics、
-                # lastError 是 URL 解析失败，症状是「一个 target up、一个 down」而日志干净。
-                # Prometheus 的替换语法只有 `$VAR` / `${VAR}`（不支持 `:-`），
-                # 默认值必须留在 compose 的 environment 里（那里才有 compose 语法）。
-                if _SHELL_DEFAULT_RE.search(str(target)):
-                    problems.append(
-                        f"job {job.get('job_name')} 的 target 是 {target!r}，用了 `:-` 默认值语法 —— "
-                        "Prometheus 只支持 `$VAR`/`${VAR}`，不认 `:-`：它不会报错，"
-                        "只会把字面量当主机名 → 该 target 永久 down。"
-                        "默认值请留在 compose 的 environment 里，这里只写纯 `${VAR}`"
                     )
     return problems
 
