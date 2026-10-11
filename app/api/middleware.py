@@ -40,9 +40,14 @@ import uuid
 from typing import Any, Final
 
 from app.api.ratelimit import RateLimitRuntime, caller_bucket
+from app.observability.instrument import record_request, trace_request_span
 
 logger = logging.getLogger(__name__)
 access_logger = logging.getLogger("app.api.access")
+
+#: 状态码 → 低基数标签。**在本模块导入期取一次**（而不是在请求里 `import`）：
+#: 请求路径上的 import 会持有 import 锁，在多线程首请求时表现为「莫名慢一下」。
+from app.api.metrics import status_class  # noqa: E402 - 见上（刻意放在 logger 之后）
 
 #: 需要限流的**接口方法 + 路径**（显式登记，不做前缀脑补）。
 #:
@@ -180,12 +185,27 @@ class ApiMiddleware:
                 message = {**message, "headers": raw}
             await send(message)
 
-        try:
-            await self.app(scope, receive, send_wrapper)
-        finally:
-            # ⚠️ `finally` 而不是「正常路径」：下游抛异常时（500）也必须留下这条访问日志 ——
-            # 恰恰是出错的那次最需要它。计的是**真实**状态码（`send_wrapper` 里记的）。
-            await self._record(scope, method, path, status_holder["status"], started)
+        # ── 第 11 步：根 span 必须**包住整个请求**（否则就不是一棵树）───────────
+        #
+        # ⚠️ 这是本步实测踩到的一个**看起来对、其实完全没接上**的写法：
+        # 第一版在 `finally` 里调 `record_request_span(...)` —— 它开一条新 span、
+        # 立刻关掉，于是：
+        #   ① 它是**请求结束之后**才开的，不可能是任何节点 span 的父亲；
+        #   ② 每个节点 span 自己成了根 → **每个节点一个 trace**，
+        #      「按 trace 查一次请求」这条排障路径彻底失效（而每个节点看起来都埋了点）。
+        # 正确做法：在这里**持有**一个 span 直到请求结束，让下游所有 span 都挂在它下面
+        # （OTEL 用 contextvars 传递「当前 span」，所以 `await self.app(...)` 期间
+        # 下游一切埋点自动成为子 span，不需要它们知道中间件的存在）。
+        with trace_request_span(method, path) as request_span:
+            if request_id:
+                request_span.set_attribute("request_id", request_id)
+            try:
+                await self.app(scope, receive, send_wrapper)
+            finally:
+                # ⚠️ `finally` 而不是「正常路径」：下游抛异常时（500）也必须留下这条访问日志 ——
+                # 恰恰是出错的那次最需要它。计的是**真实**状态码（`send_wrapper` 里记的）。
+                request_span.set_attribute("status_class", status_class(status_holder["status"]))
+                await self._record(scope, method, path, status_holder["status"], started)
 
     def _check_limit(
         self, scope: dict[str, Any], headers: dict[str, str], method: str, path: str, *, ip: str
@@ -228,7 +248,21 @@ class ApiMiddleware:
         return caller_bucket(user_id=None, client_ip=ip)
 
     async def _record(self, scope: dict[str, Any], method: str, path: str, status: int, started: float) -> None:
-        """访问日志 + 指标（一处出口，HTTP 与 429 都从这里记）。"""
+        """访问日志 + 埋点（一处出口，HTTP 与 429 都从这里记）。
+
+        ## 第 11 步：为什么埋点分两处写（**这是有意的**）
+
+        | 写什么 | 写去哪 | 为什么 |
+        |---|---|---|
+        | 指标（计数/耗时） | `app.state.metrics` | 那是 `create_app(metrics=...)` 的注入点：**一个 app 一份注册表**，测试注入干净的一份，`/metrics` 渲染同一份 |
+        | 根 span（`http.<方法 路径>`） | `app.observability.tracing` | trace 属于**请求上下文**，它的归属由 lifespan 设的 telemetry 根决定（不是中间件能决定的） |
+
+        第 9 步的设计在这里正好用上：中间件**只依赖 `counter()` / `observe()` 两个写入口**，
+        所以「实现从手写注册表换成 prometheus_client」对它是透明的（见 `api/metrics.py`）。
+
+        访问日志仍然写在这里（日志不属于可观测性三件套的任何一件，它是第四件事：
+        「出事时最先看的东西」），且 `finally` 保证 4xx/5xx 也留下记录。
+        """
         duration = time.perf_counter() - started
         request_id = str((scope.get("state") or {}).get("request_id", ""))
         access_logger.info(
@@ -239,12 +273,21 @@ class ApiMiddleware:
             duration * 1000,
             request_id,
         )
+        # ⚠️ `endpoint` 用**折叠后**的 `方法 路径`：原始路径带 id 时
+        # （`/api/orders/12345`）每个 id 都是一条新时间序列（基数爆炸）。
+        # 折叠规则只有一处（这里），因为它只有在中间件里才拿得到「完整路径」。
+        endpoint = f"{method} {path}"
+        # 请求计数：写**两个名字**（`shopsage_requests_total` 是第 11 步的通用名，
+        # `shopsage_api_requests_total` 是第 9 步的对外契约名）。
+        # 同一次调用、同一个耗时值 → 两个名字不会漂移成两个数字；而
+        # 「第 9 步已经配好的看板/告警」与「第 11 步的通用出口」都能拿到数据。
+        # ⚠️ 写入方只有**这一处**（`instrument.record_request`）—— 一个量一个出口，
+        # 否则两份数据必然漂移，而漂移的看板比没有看板更危险。
+        record_request(endpoint=endpoint, seconds=duration, status=status, request_id=request_id)
         metrics = self._metrics_of(scope)
         if metrics is None:
             return
-        from app.api.metrics import status_class
-
-        labels = {"endpoint": f"{method} {path}", "status_class": status_class(status)}
+        labels = {"endpoint": endpoint, "status_class": status_class(status)}
         metrics.counter("shopsage_api_requests_total", labels)
         metrics.observe("shopsage_api_request_duration_seconds", duration, labels)
 

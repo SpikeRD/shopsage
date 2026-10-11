@@ -1,11 +1,16 @@
 # Grafana 数据源自动配置：容器起来就把 Prometheus 挂好，不需要手点 UI。
-# 第 12 步验收（「能从 Grafana 定位慢在哪一步」）依赖它开箱可用。
+# 第 11 步验收（「能从 Grafana 定位慢在哪一步」）依赖它开箱可用。
 apiVersion: 1
 
 datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
+    # ⚠️ `uid` 必须显式钉住：看板 JSON 里的面板写的是 `"uid": "prometheus"`。
+    #    不钉的话 Grafana 会自动生成一个随机 uid（如 `PBFA97CFB590B2093`），
+    #    症状是**看板全部面板显示 "Datasource not found"**（而数据源明明在列表里）。
+    #    这是 provisioned 看板最常见的坑（手点导入时 Grafana 会自动改写引用，所以不会遇到）。
+    uid: prometheus
     # 同 compose 网络内，直接用服务名解析
     url: http://prometheus:9090
     isDefault: true

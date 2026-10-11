@@ -1,0 +1,163 @@
+{
+  "__comment": "ShopSage 第 11 步的验收看板（provisioning 自动加载，见 infra/grafana/provisioning/dashboards/）。设计口径：黄金指标（QPS/P99/错误率）+ 分 Agent 耗时 + 队列深度 + 成本，前三个回答「健康吗 / 慢在哪」，第四个回答「花多少钱」。—— 数据源 uid 固定为 'prometheus'，与 datasources/prometheus.yml 里的 uid 对应（不写死会得到「Datasource not found」而面板全是空的）。",
+  "uid": "shopsage-observability",
+  "title": "ShopSage · 可观测性（第 11 步）",
+  "tags": ["shopsage", "observability", "runbook-step-11"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "Agent 节点",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(shopsage_agent_duration_seconds_count, node)", "refId": "A" },
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "① 黄金指标：健康吗（QPS / 错误率 / P99）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "QPS（按端点）",
+      "description": "来源：记录规则 shopsage:request_rate5m（表达式只写一处，避免面板之间漂移）。多副本时它是 sum by (endpoint)，所以看到的是总量。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "shopsage:request_rate5m", "legendFormat": "{{endpoint}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "错误率（5xx 占比）",
+      "description": "只看 5xx：4xx 是客户端的错，混进来会让一次爬虫扫描看起来像服务故障（那种告警会天天响）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "shopsage:error_ratio5m", "legendFormat": "{{endpoint}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "端到端 P99（HTTP）",
+      "description": "为什么必须看 P99 而不是均值：一个 P99=10s、均值=200ms 的系统，看均值会以为「很健康」，而最差的那 1% 用户已经走了。这是 B1 的第一张图。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 0, "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 3 }, { "color": "red", "value": 10 }] }
+        },
+        "overrides": []
+      },
+      "targets": [{ "refId": "A", "expr": "shopsage:request_p99_5m", "legendFormat": "{{endpoint}} P99" }]
+    },
+    {
+      "type": "row",
+      "title": "② 慢在哪：分 Agent 节点耗时（B1 的核心）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "type": "timeseries",
+      "title": "分节点 P50 / P95 / P99",
+      "description": "P50 与 P99 必须一起看：P50 也高 = 所有请求都慢（扩容/改实现）；P50 正常而 P99 高 = 长尾（查具体来源）。只看一个会得出相反的结论。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "shopsage:agent_p50_5m{node=~\"$node\"}", "legendFormat": "{{node}} P50" },
+        { "refId": "B", "expr": "shopsage:agent_p95_5m{node=~\"$node\"}", "legendFormat": "{{node}} P95" },
+        { "refId": "C", "expr": "shopsage:agent_p99_5m{node=~\"$node\"}", "legendFormat": "{{node}} P99" }
+      ]
+    },
+    {
+      "type": "barchart",
+      "title": "当前各节点 P99（对比谁最慢）",
+      "description": "一眼看出瓶颈节点。柱状图用 5 分钟窗口的 P99，鼠标悬停能拿到具体数值 —— 这就是「定位到具体瓶颈节点」的证据来源。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "orientation": "horizontal", "showValue": "always" },
+      "targets": [{ "refId": "A", "expr": "shopsage:agent_p99_5m", "legendFormat": "{{node}}", "instant": true }]
+    },
+    {
+      "type": "timeseries",
+      "title": "依赖侧 P99：LLM / SQL / 检索",
+      "description": "节点慢的时候，先看这三条：是模型慢（LLM）、库慢（SQL）、还是检索慢（向量/rerank）。三者的处置完全不同（换模型/加索引/调候选池）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "shopsage:llm_p99_5m", "legendFormat": "LLM" },
+        { "refId": "B", "expr": "shopsage:sql_p99_5m", "legendFormat": "SQL {{tool}}" },
+        { "refId": "C", "expr": "shopsage:retrieval_p99_5m", "legendFormat": "检索" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "工具结局 / span 错误率",
+      "description": "工具结局里最该盯的是 idempotent_hit：一直命中说明上游在重复投递（A2 的幂等保护在工作，但那是故障信号，不是成功）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "shopsage:tool_outcome_rate5m", "legendFormat": "{{tool}}/{{outcome}}" },
+        { "refId": "B", "expr": "shopsage:span_error_rate5m", "legendFormat": "span 错误 {{kind}}" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "③ 花多少钱 / 队列深度",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 }
+    },
+    {
+      "type": "timeseries",
+      "title": "成本（美元/小时，按模型）",
+      "description": "按模型分组是必须的：一次「总成本上升」要能立刻回答「是主力模型涨价，还是某次改动切到了贵模型」—— 不分组就答不了。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "shopsage:cost_usd_per_hour", "legendFormat": "{{model}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Token 速率（按模型 / prompt-completion）",
+      "description": "prompt 与 completion 分开看：prompt 飙升通常是上下文变长（E2 的问题），completion 飙升是模型话变多了（prompt 的问题）。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "shopsage:tokens_per_minute", "legendFormat": "{{model}} {{kind}}" }]
+    },
+    {
+      "type": "stat",
+      "title": "队列深度（第 12 步接入）",
+      "description": "第 11 步先把出口留好：`12.queue.md` 落地后由 worker 写 shopsage_queue_depth。现在没有数据是**预期**的（不是故障）—— 面板先存在，免得第 12 步又要新建一张看板。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 50 }, { "color": "red", "value": 200 }] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "refId": "A", "expr": "sum(shopsage_queue_depth)", "legendFormat": "队列深度" }]
+    },
+    {
+      "type": "text",
+      "title": "怎么用这张看板定位瓶颈（三步）",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
+      "options": {
+        "mode": "markdown",
+        "content": "### 从「P99 高」走到「因为 X」的三步\n\n1. **看 ①**：`端到端 P99` 高吗？高的话看 `QPS` 有没有同时飙升（容量问题）与 `错误率`（是慢还是错）。\n2. **看 ②**：`分节点 P50/P95/P99` 里哪个 `node` 最高 —— 那就是瓶颈节点。\n   注意：**P50 也高 = 普遍慢**（要扩容或改实现）；**P50 正常而 P99 高 = 长尾**（要查具体的慢请求）。\n3. **看 ② 下半**：瓶颈节点是慢在 `LLM` / `SQL` / `检索` 的哪一条上 —— 三者的处置完全不同。\n\n### 拿到 trace id 之后\n\n指标只告诉你「哪个节点慢」，**回答不了「这一次为什么慢」**（那是 trace 的事）。\n本步的 span 记在进程内存里（`app/observability/tracing.py` 的 `MemorySpanExporter`），\n外发需要配 `OTEL_ENDPOINT` 并起 collector（`infra/docker-compose.dev.yml` 的 `otel-collector`）。\n\n```powershell\n# 看某次请求的 span 树（开发机自检，不需要 collector）\nuv run python -m scripts.observability_demo --scenario trace\n```\n\n> ⚠️ **这张看板看不到单次请求**。凡是要回答「这一次为什么慢」，都必须去 trace 里看 ——\n> 不要试图用「加更多指标标签」来替代它（那是基数爆炸的标准路径）。"
+      }
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+# 记录规则：把「要反复查、又容易写错」的表达式固化下来。
+#
+# ⚠️ 为什么是 `record` 而不是「让每个面板自己写」：
+#   * 分位数表达式的正确性依赖**分组键**（`sum by (le, node)`）。
+#     漏掉 `node` 的症状是「每个节点都显示全局 P99」—— 图上完全正常，
+#     只是永远定位不到瓶颈，而 B1（「P99 高但不知道慢在哪」）会假装被解决了。
+#     这是最难自查的一类错，所以只允许存在一个实现。
+#   * 面板里的重复表达式**必然漂移**（同一张图两个面板算法不同，没人会发现）。
+#
+# 指标名与 `app/observability/metrics.py` 的常量一一对应；改那边必须同步这里
+# （`12.queue.md` 的队列深度也会加进这个文件）。
+
+groups:
+  # ── 黄金指标：QPS / 错误率 / P99（`11.observability.md` §5 的面板设计）────────
+  - name: shopsage-golden
+    interval: 15s
+    rules:
+      # 请求速率（按端点；`status_class` 不分组 —— 这一条回答「流量有多大」）
+      - record: shopsage:request_rate5m
+        expr: sum by (endpoint) (rate(shopsage_api_requests_total[5m]))
+
+      # 错误率（5xx 占比）。**只看 5xx**：4xx 是用户/客户端的错，
+      # 把它算进「错误率」会让一次爬虫扫描看起来像服务故障（而那条告警会天天响）。
+      - record: shopsage:error_ratio5m
+        expr: |
+          sum by (endpoint) (rate(shopsage_api_requests_total{status_class="5xx"}[5m]))
+            /
+          clamp_min(sum by (endpoint) (rate(shopsage_api_requests_total[5m])), 1e-9)
+
+      # 端到端 P99（HTTP 层）
+      - record: shopsage:request_p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, endpoint) (rate(shopsage_api_request_duration_seconds_bucket[5m]))
+          )
+
+      # **按 Agent 节点分组的 P99** —— B1 的答案就是这一条。
+      # 用 `sum by (le, node)` 而不是 `sum(rate(...))`：`le` 必须进分组键，
+      # 否则 `histogram_quantile` 拿不到完整的分桶（它会静默返回一个偏小的数）。
+      - record: shopsage:agent_p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, node) (rate(shopsage_agent_duration_seconds_bucket[5m]))
+          )
+
+      # 按节点分组的 P50 / P95：**只有把 P50 与 P99 放在一起看**，
+      # 才能区分「所有请求都慢」（P50 也高）与「少数请求很慢」（P50 正常、P99 高）。
+      # 这两种故障的处置完全不同（前者要扩容/改实现，后者要查长尾的具体来源）。
+      - record: shopsage:agent_p50_5m
+        expr: |
+          histogram_quantile(
+            0.5,
+            sum by (le, node) (rate(shopsage_agent_duration_seconds_bucket[5m]))
+          )
+      - record: shopsage:agent_p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, node) (rate(shopsage_agent_duration_seconds_bucket[5m]))
+          )
+
+  # ── 依赖侧：LLM / SQL / 检索 ─────────────────────────────────────────────
+  - name: shopsage-dependencies
+    interval: 15s
+    rules:
+      # LLM 的 P99（按模型）：`11.observability.md` §4 第 3 条要的「分位数而非均值」
+      - record: shopsage:llm_p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(shopsage_llm_duration_seconds_bucket[5m]))
+          )
+
+      # SQL 的 P99（按工具）
+      - record: shopsage:sql_p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, tool) (rate(shopsage_sql_duration_seconds_bucket[5m]))
+          )
+
+      # 检索的 P99
+      - record: shopsage:retrieval_p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(shopsage_retrieval_duration_seconds_bucket[5m]))
+          )
+
+  # ── 成本：token 与花费（`13.cache.md` / `14.eval.md` 的量化对比就靠这两条）──
+  - name: shopsage-cost
+    interval: 60s
+    rules:
+      # 每分钟 token 消耗（按模型、按 prompt/completion 分）
+      - record: shopsage:tokens_per_minute
+        expr: sum by (model, kind) (rate(shopsage_llm_tokens_total[5m])) * 60
+
+      # 每小时花费（美元）。**按模型分组**是必须的：一次「总成本上升」要能立刻回答
+      # 「是主力模型涨价了，还是某次改动切到了贵模型」—— 不分组就答不了。
+      - record: shopsage:cost_usd_per_hour
+        expr: sum by (model) (rate(shopsage_llm_cost_usd_total[5m])) * 3600
+
+  # ── 健康度：span 错误与工具结局 ───────────────────────────────────────────
+  - name: shopsage-health
+    interval: 30s
+    rules:
+      # 出错的 span（按类型：node/tool/sql/llm/retrieval）
+      - record: shopsage:span_error_rate5m
+        expr: sum by (kind) (rate(shopsage_span_errors_total[5m]))
+
+      # 工具结局（幂等命中率是队列健康度的核心数字，见 metrics.TOOL_OUTCOME 的说明）
+      - record: shopsage:tool_outcome_rate5m
+        expr: sum by (tool, outcome) (rate(shopsage_tool_outcome_total[5m]))

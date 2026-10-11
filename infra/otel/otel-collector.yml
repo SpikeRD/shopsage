@@ -1,0 +1,71 @@
+# OTel Collector 配置（开发环境）
+#
+# 定位：**接收本机业务的 span，落到文件里**（`infra/docker-compose.dev.yml` 的
+# `otel-collector` 服务读它）。
+#
+# 为什么开发环境要有它（而不是「有 Grafana 就够了」）：
+#   * Prometheus 回答「长期看是多少」，它**看不见单次请求的调用链**；
+#   * 第 11 步的验收要回答「那次 P99 尖峰到底卡在哪个节点」—— 那需要一条完整的
+#     trace，而它只存在于 OTEL 的 span 里；
+#   * `file` exporter 零依赖（不需要 Jaeger/Tempo 那一整套后端），
+#     `docker compose exec` 就能看，排障时不用再装东西。
+#
+# ⚠️ **端口必须分清**（本仓实测踩到过）：
+#   4317 = OTLP/**gRPC**；4318 = OTLP/**HTTP**。
+#   业务侧用的是 HTTP exporter（只依赖 httpx，不需要 grpcio），所以
+#   `OTEL_ENDPOINT` 必须写 **4318** —— 写成 4317 的后果不是报错，
+#   而是「trace 一条都不到」（`app/observability/tracing.py` 会把它变成启动期 WARNING）。
+
+receivers:
+  otlp:
+    protocols:
+      # HTTP：业务默认走这条（`OTEL_ENDPOINT=http://<host>:4318`）
+      http:
+        endpoint: 0.0.0.0:4318
+      # gRPC 同时开：别的服务（或将来换成 gRPC exporter）也能接
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # 批量发送：collector 自己也要攒批，否则每个 span 一次文件写
+  batch:
+    timeout: 2s
+    send_batch_size: 256
+  # 内存保护：本机开发环境的总量很小，但**必须设上限** ——
+  # 一个失控的导出端（比如某处循环发 span）会先把 collector 打死，
+  # 而 collector 死了以后业务侧的 BatchSpanProcessor 会开始重试堆积，
+  # 于是「监控故障」传染成「业务变慢」。
+  memory_limiter:
+    check_interval: 2s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+exporters:
+  # 落到容器内的 /data/traces.jsonl（compose 里把它挂成 named volume）
+  file:
+    path: /data/traces.jsonl
+    # 轮转：开发环境也别让它无限长（trace 是本机自检用的，不是长期存储）
+    rotation:
+      max_megabytes: 64
+      max_days: 3
+      max_backups: 3
+  # 把 collector 自己的日志打到 stdout（`docker compose logs otel-collector` 的第一手信息）
+  debug:
+    verbosity: normal
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      # collector 自身的指标暴露在 8888，便于「采集端自己健康吗」也能被抓
+      level: basic
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [file, debug]
+
+# 暴露 collector 自身的指标端点（Prometheus 那侧可以加一个 job 抓它）
+# 说明：collector 的 metrics 走它自己的监听地址，由 compose 的 8888:8888 映射出来
+extensions: {}

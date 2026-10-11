@@ -18,7 +18,36 @@ from __future__ import annotations
 
 import pytest
 
+from tests.api.conftest import (  # noqa: F401 - 这个 import 是**有意的**，见下
+    app,
+    app_factory,
+    client,
+    customer_token,
+    internal_token,
+    metrics,
+)
+
 DB_MARKER = "db"
+
+# ⚠️ **为什么把 `tests/api/conftest.py` 的装置导进根 conftest**（第 11 步的取舍）：
+#
+# `tests/observability/` 的接线用例要「跑一轮真 app」（假模型 + 内存 checkpointer），
+# 而 pytest 的装置可见性是**向下**的：子目录能用父目录的，父目录用不了子目录的。
+# `tests/api/` 的装置写得很具体（`app_factory` 默认注入假模型、小额度限流、
+# `patched_query`），正是那些用例需要的东西。
+#
+# 三个选项与取舍：
+#   ① 把装置复制一份到 `tests/observability/conftest.py` —— **不可选**：
+#      两份装置必然漂移（`DATA_REPLIES` 改一处忘一处，症状是「只有某一批用例
+#      拿着旧回执」，而它们看起来都在正常跑）；
+#   ② 搬到根 conftest 并让 `tests/api/` 也用它 —— 改动面大（第 9 步的 138 条用例
+#      都依赖那些装置的名字与默认值），而本步不该动第 9 步的验收基线；
+#   ③ **在这里 re-export**（本实现）—— 装置只有一处实现，`tests/api/` 完全不受影响，
+#      代价是根 conftest 多了一个「看着像越界」的 import，所以这段注释必须写清楚。
+#
+# 另一条纪律（第 9 步就定下的）也在这里被遵守：**只有用到 `TestClient` 的目录才付
+# 「读 .env、可能连 Redis」的代价**。上面这几个装置本身是惰性的（fixture 不调用就不执行），
+# 所以根 conftest 只是「登记了名字」，并不会让 700+ 条既有用例多出任何副作用。
 
 
 def pytest_configure(config) -> None:

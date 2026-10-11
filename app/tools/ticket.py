@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import TICKET_TYPES, Ticket, User
 from app.db.session import get_read_engine
+from app.observability.instrument import record_tool_call
 from app.security.rbac import PERM_WRITE_TICKET, PermissionDenied, has_permission
 from app.tools.audit import audit_tool_call
 from app.tools.errors import ToolContractError, translate_db_error
@@ -99,79 +100,91 @@ def create_ticket(
     # ⚠️ 审计包住**参数校验与权限判定**：被拒的调用（枚举写错、缺权限、越权）
     #    恰恰是最需要留痕的一类。「先校验、通过了才开始审计」会让 D1/D2 的证据链缺一大块 ——
     #    实测就是这么踩到的：越权用例抛了 PermissionDenied，日志里却一条记录都没有。
-    with audit_tool_call(
-        CREATE_TOOL,
-        caller=caller,
-        user_id=user_id,
-        ticket_type=ticket_type,
-        idempotency_key=idempotency_key,
-        role=role,
-        assignee_id=assignee_id,
-    ) as handle:
-        checked_type = _check_ticket_type(ticket_type)
-        checked_key = validate_idempotency_key(idempotency_key)
+    #
+    # 第 11 步：埋点包在**审计之外**（`with record_tool_call(...)` 再进 `with audit_tool_call(...)`）。
+    # 顺序有理由：审计只记「谁调了什么」（供取证），而埋点要记「这次调用花了多久、成没成」
+    # —— 后者必须包含**被拒的那条路径**（一次被拒的调用同样消耗了时间，
+    # 而「拒绝率突然升高」是权限配置出错的第一信号）。
+    # 所以埋点在外、审计在内：审计的 `__exit__` 先写完它的记录，埋点再收口。
+    with record_tool_call(tool=CREATE_TOOL) as call:
+        with audit_tool_call(
+            CREATE_TOOL,
+            caller=caller,
+            user_id=user_id,
+            ticket_type=ticket_type,
+            idempotency_key=idempotency_key,
+            role=role,
+            assignee_id=assignee_id,
+        ) as handle:
+            checked_type = _check_ticket_type(ticket_type)
+            checked_key = validate_idempotency_key(idempotency_key)
 
-        # 权限闸：与 SQL 守卫（拦 SQL 形态）性质不同 —— 这里拦的是「这个身份能不能做这件事」
-        if not has_permission(role, PERM_WRITE_TICKET):
-            raise PermissionDenied(
-                f"角色 {role or '(未提供)'} 缺少权限：{PERM_WRITE_TICKET}（建工单）",
-                role=role,
-                missing=[PERM_WRITE_TICKET],
-            )
-
-        try:
-            with write_session(session) as db:
-                if db.execute(select(User.user_id).where(User.user_id == user_id)).first() is None:
-                    # 先给一条能读懂的报错，而不是让外键约束抛 23503（那种报文对 agent 毫无信息量）
-                    raise ToolContractError(
-                        f"用户不存在：user_id={user_id}（工单必须挂在真实用户上）"
-                    )
-
-                ticket_id, created = insert_once(
-                    db,
-                    Ticket,
-                    {
-                        "user_id": user_id,
-                        "type": checked_type,
-                        "status": INITIAL_STATUS,
-                        "assignee_id": assignee_id,
-                        "idempotency_key": checked_key,
-                    },
-                    conflict_on=IDEMPOTENCY_SCOPE,
-                    lookup={"user_id": user_id, "idempotency_key": checked_key},
+            # 权限闸：与 SQL 守卫（拦 SQL 形态）性质不同 —— 这里拦的是「这个身份能不能做这件事」
+            if not has_permission(role, PERM_WRITE_TICKET):
+                raise PermissionDenied(
+                    f"角色 {role or '(未提供)'} 缺少权限：{PERM_WRITE_TICKET}（建工单）",
+                    role=role,
+                    missing=[PERM_WRITE_TICKET],
                 )
-                # 幂等命中时返回**既有行**的真实字段，而不是把本次请求参数回显成结果：
-                # 两次调用可能带着不同的 type/assignee，回显会让调用方以为「按我说的写进去了」。
-                row = db.execute(
-                    select(Ticket.type, Ticket.status, Ticket.user_id).where(
-                        Ticket.ticket_id == ticket_id
+
+            try:
+                with write_session(session) as db:
+                    if db.execute(select(User.user_id).where(User.user_id == user_id)).first() is None:
+                        # 先给一条能读懂的报错，而不是让外键约束抛 23503（那种报文对 agent 毫无信息量）
+                        raise ToolContractError(
+                            f"用户不存在：user_id={user_id}（工单必须挂在真实用户上）"
+                        )
+
+                    ticket_id, created = insert_once(
+                        db,
+                        Ticket,
+                        {
+                            "user_id": user_id,
+                            "type": checked_type,
+                            "status": INITIAL_STATUS,
+                            "assignee_id": assignee_id,
+                            "idempotency_key": checked_key,
+                        },
+                        conflict_on=IDEMPOTENCY_SCOPE,
+                        lookup={"user_id": user_id, "idempotency_key": checked_key},
                     )
-                ).one()
-                if session is None:
-                    db.commit()
-        except SQLAlchemyError as exc:
-            raise translate_db_error(exc, action=f"建工单（{CREATE_TOOL}）") from exc
-        # ToolContractError / PermissionDenied 直接冒泡：审计在 __exit__ 里照旧记一条 error
+                    # 幂等命中时返回**既有行**的真实字段，而不是把本次请求参数回显成结果：
+                    # 两次调用可能带着不同的 type/assignee，回显会让调用方以为「按我说的写进去了」。
+                    row = db.execute(
+                        select(Ticket.type, Ticket.status, Ticket.user_id).where(
+                            Ticket.ticket_id == ticket_id
+                        )
+                    ).one()
+                    if session is None:
+                        db.commit()
+            except SQLAlchemyError as exc:
+                raise translate_db_error(exc, action=f"建工单（{CREATE_TOOL}）") from exc
+            # ToolContractError / PermissionDenied 直接冒泡：审计在 __exit__ 里照旧记一条 error
 
-        handle.rows = 1
-        handle.details.update(
-            {
-                "created": created,  # ← 「本次是否新建」在这里，不在返回值里
-                "idempotent_hit": not created,
-                "ticket_id": int(ticket_id),
-                "requested_type": checked_type,
-                "stored_type": str(row.type),
-            }
-        )
-        if not created and str(row.type) != checked_type:
-            handle.details["idempotency_type_mismatch"] = True
+            handle.rows = 1
+            handle.details.update(
+                {
+                    "created": created,  # ← 「本次是否新建」在这里，不在返回值里
+                    "idempotent_hit": not created,
+                    "ticket_id": int(ticket_id),
+                    "requested_type": checked_type,
+                    "stored_type": str(row.type),
+                }
+            )
+            if not created and str(row.type) != checked_type:
+                handle.details["idempotency_type_mismatch"] = True
 
-        return TicketRef(
-            ticket_id=int(ticket_id),
-            user_id=int(row.user_id),
-            type=str(row.type),
-            status=str(row.status),
-        )
+            # 埋点的结果标签：**幂等命中要单独可见**（见 `TOOL_OUTCOME` 的说明）——
+            # 「一直在命中」是上游重复投递的信号，而它不该混在 `created` 里被平均掉。
+            call.outcome("idempotent_hit" if not created else "created", rows=1)
+            call.set_attributes({"stage": "write"})
+
+            return TicketRef(
+                ticket_id=int(ticket_id),
+                user_id=int(row.user_id),
+                type=str(row.type),
+                status=str(row.status),
+            )
 
 
 def get_ticket_status(

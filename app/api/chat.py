@@ -78,6 +78,7 @@ from app.api.schemas import (
 )
 from app.graph import graph_config, interrupt_policy_for, run_turn
 from app.graph.config import APPROVAL_QUESTION, REJECTED_REASON
+from app.observability.instrument import trace_request_span
 from app.security.auth import AuthError
 
 logger = logging.getLogger(__name__)
@@ -474,50 +475,62 @@ async def chat_stream(websocket: WebSocket) -> None:
             return
 
     seq = 0
-    while True:
-        try:
-            # ⚠️ `mode="text"` **必须显式给**：Starlette 1.7 的 `receive_json()` 默认
-            # `mode="text"`，但它内部用 `message["text"]` 取值；反过来 `mode="binary"` 才会
-            # 去取 `message["bytes"]`。显式写出来是为了让「我们只收文本帧」这条约定
-            # 出现在代码里 —— 客户端发二进制帧时会得到一条 `bad_frame` 错误帧而不是静默卡住。
-            raw = await websocket.receive_json(mode="text")
-        except WebSocketDisconnect:
-            logger.debug("WS 客户端断开（user=%s）", principal.user_id)
-            return
-        except json.JSONDecodeError:
-            seq += 1
-            await _send_frame(websocket, seq, FRAME_ERROR, {"code": "bad_json", "message": "消息不是合法 JSON"})
-            continue
-        except Exception as exc:  # noqa: BLE001 - 客户端发来非文本帧等
-            seq += 1
-            await _send_frame(websocket, seq, FRAME_ERROR, {"code": "bad_frame", "message": str(exc)})
-            continue
+    # ── 第 11 步：WS 的根 span（**中间件只管 HTTP，WS 要自己开**）──────────────
+    #
+    # ⚠️ 为什么 WebSocket 必须单独处理：`ApiMiddleware` 在 `scope["type"] != "http"`
+    # 时直接放行（WS 的限流在路由里做，那里才有身份）—— 于是 WS 请求**没有根 span**，
+    # 而 WS 正是 B2 的主入口（`WS /api/chat/stream`）：一次连接里的每一轮问答
+    # 都会各自成为一棵「没有根的树」。后果与其他路径上的同一个坑一样：
+    # 「按 trace 查这次流式问答」失效，而每个节点看起来都埋了点。
+    #
+    # ⚠️ 根 span 包住**整个连接的消息循环**（而不是每一轮）：一条 WS 连接是
+    # 多轮对话共用的（见模块 docstring），所以「连接」才是那个「一次请求」。
+    # 想按轮区分就看 `node.*` span 的时间顺序 —— 它们天然按轮分簇。
+    with trace_request_span("WS", "/api/chat/stream"):
+        while True:
+            try:
+                # ⚠️ `mode="text"` **必须显式给**：Starlette 1.7 的 `receive_json()` 默认
+                # `mode="text"`，但它内部用 `message["text"]` 取值；反过来 `mode="binary"` 才会
+                # 去取 `message["bytes"]`。显式写出来是为了让「我们只收文本帧」这条约定
+                # 出现在代码里 —— 客户端发二进制帧时会得到一条 `bad_frame` 错误帧而不是静默卡住。
+                raw = await websocket.receive_json(mode="text")
+            except WebSocketDisconnect:
+                logger.debug("WS 客户端断开（user=%s）", principal.user_id)
+                return
+            except json.JSONDecodeError:
+                seq += 1
+                await _send_frame(websocket, seq, FRAME_ERROR, {"code": "bad_json", "message": "消息不是合法 JSON"})
+                continue
+            except Exception as exc:  # noqa: BLE001 - 客户端发来非文本帧等
+                seq += 1
+                await _send_frame(websocket, seq, FRAME_ERROR, {"code": "bad_frame", "message": str(exc)})
+                continue
 
-        try:
-            session_id = deps.resolve_session_id(raw.get("session_id"))
-            message = str(raw.get("message") or "").strip()
-            if not message:
-                raise ApiError(422, "empty_message", "message 不能为空")
-            if len(message) > 2000:
-                raise ApiError(422, "message_too_long", f"message 长度上限 2000 字（收到 {len(message)}）")
-        except ApiError as exc:
-            seq += 1
-            await _send_frame(websocket, seq, FRAME_ERROR, {"code": exc.code, "message": exc.message})
-            continue
+            try:
+                session_id = deps.resolve_session_id(raw.get("session_id"))
+                message = str(raw.get("message") or "").strip()
+                if not message:
+                    raise ApiError(422, "empty_message", "message 不能为空")
+                if len(message) > 2000:
+                    raise ApiError(422, "message_too_long", f"message 长度上限 2000 字（收到 {len(message)}）")
+            except ApiError as exc:
+                seq += 1
+                await _send_frame(websocket, seq, FRAME_ERROR, {"code": exc.code, "message": exc.message})
+                continue
 
-        actor = deps.actor_from_principal(
-            principal,
-            session_id=session_id,
-            request_id=str(getattr(websocket.state, "request_id", "")),
-        )
-        seq = await _stream_turn(
-            websocket,
-            actor=actor,
-            message=message,
-            seq=seq,
-            settings=getattr(app_state, "settings", None),
-            metrics=getattr(app_state, "metrics", None),
-        )
+            actor = deps.actor_from_principal(
+                principal,
+                session_id=session_id,
+                request_id=str(getattr(websocket.state, "request_id", "")),
+            )
+            seq = await _stream_turn(
+                websocket,
+                actor=actor,
+                message=message,
+                seq=seq,
+                settings=getattr(app_state, "settings", None),
+                metrics=getattr(app_state, "metrics", None),
+            )
 
 
 async def _stream_turn(

@@ -49,6 +49,9 @@ from app.api.scope import SCOPE_BY_ROUTE
 from app.graph import GraphRuntime, compile_graph, ensure_compatible_event_loop, open_checkpointer
 from app.graph.checkpointer import CheckpointBackend
 from app.graph.config import GATED_ROLES, SENSITIVE_ROUTES
+from app.observability import setup_observability
+from app.observability.langfuse_cb import langfuse_handler
+from app.observability.tracing import reset_request_root, set_request_root
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +125,7 @@ def create_app(
     runtime: GraphRuntime | None = None,
     rate_limiter: Any = None,
     metrics: Any = None,
+    telemetry: Any = None,
     probe_timeout_value: float | None = None,
 ) -> FastAPI:
     """装配 FastAPI 应用（**所有外部依赖都可注入** —— 这是离线可测的前提）。
@@ -136,6 +140,7 @@ def create_app(
     | `runtime` | `GraphRuntime()` | 测试注入假模型（`llm=` / `search=`） |
     | `rate_limiter` | 按 `REDIS_URL` 自动选 | 测试注入小额度来验 429 |
     | `metrics` | 新 `MetricsRegistry` | 测试注入共享注册表来断言指标 |
+    | `telemetry` | 按 `settings` 新建 | 测试注入共享 telemetry 来断言 span（第 11 步） |
 
     ⚠️ **不把 `llm`/`search` 做成环境变量**：它们是「本次跑图用什么依赖」的语义选择
     （评测要注入假模型、对客要强制闸门），塞进全局配置会让「测试环境」与「生产环境」的行为
@@ -169,6 +174,18 @@ def create_app(
             else open_rate_limiter(redis_url=str(getattr(settings, "redis_url", "") or ""), rules=api_config.rate_limit_rules(settings))
         )
 
+        # ── 第 11 步：可观测性在**这里**装配（一次），而不是 import 期或每请求 ──
+        # 三件事同时被这一行定死：
+        #   ① trace 的归属（`TracerProvider` 是进程级对象，按 app 建一份）；
+        #   ② 指标进哪个 registry（把 app 的注册表交给它 → `/metrics` 一次抓全）；
+        #   ③ Langfuse client 的构造（没配密钥就完全不建，理由见 langfuse_cb 模块 docstring）。
+        # 放在 lifespan 而不是 import 期的硬理由：`create_app()` 在**模块 import 期**执行
+        # （`app = create_app()`），那时建 TracerProvider/读配置会让「import 一个模块」
+        # 变成「起一套监控」，而测试收集期的 import 就会连带发生这件事。
+        obs = telemetry if telemetry is not None else setup_observability(settings, metrics=app.state.metrics)
+        app.state.telemetry = obs
+        telemetry_token = set_request_root(obs)
+
         masked = getattr(settings, "dump_for_logging", lambda: {})()
         logger.info(
             "API 启动：env=%s prefix=%r backend=%s 限流=%s 调试载荷=%s 开发密钥=%s",
@@ -179,17 +196,30 @@ def create_app(
             api_config.debug_payload_enabled(settings),
             is_dev_secret(),
         )
+        logger.info(
+            "可观测性就绪：enabled=%s endpoint=%r langfuse=%s",
+            obs.enabled,
+            obs.otel_endpoint or "(未配，只留内存 span)",
+            ("开" if langfuse_handler().enabled else f"关（{langfuse_handler().disabled_reason}）"),
+        )
         logger.debug("生效配置（已掩码）：%s", masked)
 
-        async with factory() as checkpointer:
-            app.state.graph_factory = graph_factory or make_graph_factory(checkpointer)
-            logger.info(
-                "图已就绪：checkpointer=%s（thread_id 的隔离键由入口的鉴权结果派生）",
-                type(checkpointer).__name__,
-            )
-            yield
-
-        logger.info("API 关闭：checkpointer 已释放")
+        try:
+            async with factory() as checkpointer:
+                app.state.graph_factory = graph_factory or make_graph_factory(checkpointer)
+                logger.info(
+                    "图已就绪：checkpointer=%s（thread_id 的隔离键由入口的鉴权结果派生）",
+                    type(checkpointer).__name__,
+                )
+                yield
+        finally:
+            # ⚠️ `finally` 而不是平铺在 `yield` 之后：启动中途抛错时（例如 checkpointer
+            #    连不上）也要把 span 与 telemetry 根收干净 —— 否则「启动失败」会留下一份
+            #    活跃的 telemetry 根，让下一个 app（测试里很常见）的埋点写进上一个人的注册表。
+            obs.flush()  # 把还在缓冲里的 span 推出去（关服前的最后一件事）
+            langfuse_handler().flush()
+            reset_request_root(telemetry_token)
+            logger.info("API 关闭：checkpointer 已释放，telemetry 已 flush")
 
     app = FastAPI(
         title="ShopSage API",

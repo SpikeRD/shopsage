@@ -77,6 +77,7 @@ from app.graph.state import (
     NODE_SYNTHESIS,
     to_openai_messages,
 )
+from app.observability.tracing import trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +160,7 @@ def failure_update(node_name: str, error: Exception, state: Any) -> dict[str, An
 
 
 def safe_node(fn: Any) -> Any:
-    """把一个 Agent 节点包成图节点：**归一 state → 调用**。
+    """把一个 Agent 节点包成图节点：**归一 state → 埋点 → 调用**。
 
     输入位置参数**原样透传**（`xxxx_node(state)` / `guardrail_node(state, stage=...)`），
     返回值原样返回（**增量语义不变**），所以「谁写了哪个键」依然可断言。
@@ -174,12 +175,33 @@ def safe_node(fn: Any) -> Any:
     那么「图级兜底」在哪？在**回合边界**（`app/graph/run.py` 的 `Turn`）：
     调用方在那里决定「重放几次」「重放不成怎么对用户说」。这样两件事同时成立：
     状态可重放（异常穿出去），用户不会看到 500（边界兜底）。
+
+    ## 第 11 步：埋点为什么落在这里（而不是六个 Agent 各埋一次）
+
+    `safe_node` 是**七个节点唯一的共同入口**（`node_specs()` 把它们全交给它包装），
+    所以在这里包一层 span，就同时满足两件事：
+
+    * 文档 §4 第 1 条要的「每个 Agent 节点都埋点」是**结构性成立**的 ——
+      新增一个节点忘了埋点这件事**不可能发生**（没有别的入口）；
+    * 六个 Agent 模块继续保持「不知道可观测性存在」—— 它们的注入点里
+      没有 `telemetry=` 这种参数，于是「第 7 步的节点可独立测试」这条验收不受影响。
+
+    埋点的 span 名是 `node.<节点名>`，耗时进 `AGENT_DURATION{node=...}`。
+    B1（「P99 高但不知道慢在哪」）的答案就是这两样东西拼出来的：
+    **按 `node` 标签分组看 P99**，哪个节点高就去 trace 里看它内部那几步。
     """
     node_name = getattr(fn, "__node_name__", getattr(fn, "__name__", "node"))
 
     async def node(state: AgentGraphState, config: RunnableConfig) -> dict[str, Any]:
         del config  # 图会把 RunnableConfig 透传进来；六个节点的契约里没有它
-        return await fn(normalize_input(state))
+        # `trace_span` 是**同步**上下文管理器，而本函数是 async —— 这里可以正常 `with`：
+        # span 的存活期就是 `await fn(...)` 这一段，OTEL 用 contextvars 传递，
+        # 所以 `await` 期间 span 仍是「当前 span」，六个节点内部的 LLM/检索 span 会自动挂到它下面。
+        with trace_span(f"node.{node_name}", kind="node", attributes={"node": node_name}) as handle:
+            # `stage` 记路由结论（`""` = 还没路由，`data`/`rag`/… = 已知分支）。
+            # 一次请求的 span 树里有了它，「这一步为什么跑」不用再去翻 state。
+            handle.set_attributes({"stage": str(state.get("route") or "")})
+            return await fn(normalize_input(state))
 
     node.__name__ = node_name
     return node

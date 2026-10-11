@@ -1,170 +1,149 @@
-"""指标：**零依赖的计数器 / 直方图**，出口是 Prometheus 文本格式（`9.api.md` §2 的 `/metrics`）。
+"""API 层的指标写入口：`MetricsRegistry`（`9.api.md` §2 的 `/metrics`）。
 
-`9.api.md` 把 `/metrics` 列进了对外接口，而埋点（第 11 步 observability）还没落地。
-本模块的处理方式是：**先把「API 层能测的量」测起来，并把出口做成 Prometheus 文本格式**，
-一步到位的部分是：
+## 本模块在第 11 步的变化（**收敛，不是重写**）
 
-* 端点 `/metrics` 现在就可用（`curl` 得到标准新行格式，Grafana/Prometheus 抓取格式不变）；
-* 「先出结论骨架」的延迟（B2 的量化指标）现在就有数据，第 11 步接 Grafana 时不用回填历史。
+第 9 步为了让 `/metrics` 当时就能用，在这里手写了一套计数器/直方图 + 文本渲染，
+当时的注释明确写着两件事：「不引入 `prometheus_client`」与「不做节点级/工具级埋点
+（那是第 11 步的活）」。第 11 步两件都做了，所以这里改成**门面**：
 
-刻意**不做**的部分（留给第 11 步，避免两套埋点）：
+| 项 | 第 9 步 | 现在 |
+|---|---|---|
+| 计数器/直方图的实现 | 本模块手写 | `app/observability/metrics.py`（`prometheus_client`） |
+| 文本渲染 | 本模块手写（`render()`） | 同上（库的 `generate_latest()`） |
+| 指标名 | `shopsage_api_*` | **不变**（下游看板与用例都按名字查） |
+| `MetricsRegistry` 类型 | 真实实现 | **门面**：`counter()` / `observe()` 语义完全不变 |
 
-* 不引入 `prometheus_client`，也不注册全局 `REGISTRY` —— 那样一个库的全局状态会渗进
-  每条用例（测试之间互相污染），而本模块的实例挂在 `app.state` 上，建一个 app 就有一份；
-* 不做节点级/工具级埋点（那需要 `graph/` 与 `tools/` 的注入点，属第 11 步的活）；
-* 不做 p50/p95/p99 的分位计算 —— 直方图的**桶**已经足够，
-  分位数交给 Prometheus 的 `histogram_quantile()` 在查询时算（这正是它设计的用法）。
-  自己算分位会得到一个「随时间漂移、无法复现」的数字。
+为什么保留 `MetricsRegistry` 这个类型而不是让调用方直接用 `observability.metrics`：
 
-## 关于标签基数（为什么状态码要折叠成 `2xx` / `4xx` / `5xx`）
+* 中间件（`middleware.py`）与路由（`chat.py`）只依赖 `counter()` / `observe()` 这两个写入口，
+  所以换实现不影响它们（**这是第 9 步就设计好的接缝**，本步正好用上）；
+* `app.state.metrics` 是**按 app 注入**的（`create_app(metrics=...)`），
+  测试用一条用例一个干净注册表。若改成进程级全局注册表，
+  「第二条用例」会因为 `Duplicated timeseries` 直接红 ——
+  `prometheus_client` 的全局 `REGISTRY` 正是这么设计的，所以本仓**从不注册它**。
 
-Prometheus 的每个唯一标签组合都是一条时间序列。把原始状态码（或 `user_id`）当标签，
-一个爬虫刷 500 个不存在的路径就能造出 500 条序列 —— 这是最常见的一种「监控把监控搞垮」。
-所以这里**只允许低基数标签**：`endpoint` / `status_class` / `role`（角色表是有限的）。
+## 为什么直方图必须仍然是 histogram（而不是「算好分位数再暴露」）
+
+第 9 步的注释已经解释过：分位数要交给 Prometheus 的 `histogram_quantile()` 在**查询时**算。
+本步补一条更实际的理由：**本模块现在同时被 `/metrics` 与告警规则使用**，
+而告警规则写在 Prometheus 侧（`infra/prometheus/`）。若在这里算好 P99 再暴露成 gauge，
+告警只能对着「已经算完的数字」写，且无法按 `node` / `tool` 做维度下钻
+（下钻靠的是标签，而 gauge 一旦被聚合就丢了维度）。
 """
 
 from __future__ import annotations
 
-import math
-import threading
 from collections.abc import Iterable, Mapping
-from typing import Final, Protocol
-from urllib.parse import quote
+from typing import Any, Final
 
-#: 直方图的桶边界（秒）。覆盖「本机毫秒级」到「模型超时级」：
-#: 10ms 以下是空转，5s 以上已经进入 §5 的可重试/降级讨论，不需要更细。
-DEFAULT_BUCKETS: Final[tuple[float, ...]] = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
+from app.observability.metrics import (
+    AGENT_DURATION,
+    DEFAULT_SETTINGS,
+    Metrics,
+)
+
+#: 直方图的桶边界（秒）——**与第 9 步完全一致**，所以历史看板不会断档。
+#:
+#: 第 9 步的口径：10ms 以下是空转，5s 以上已经进入「重试/降级」的讨论。
+#: 第 11 步的 telemetry 默认桶（`observability.metrics.MetricsSettings.fast_buckets`）
+#: 是它的**超集**（多了 10s，用于慢节点）。API 层继续用这套更窄的桶：
+#: HTTP 请求的耗时不值得为 5s~10s 那一段再多一条序列（那条序列要存 15 天）。
+DEFAULT_BUCKETS: Final[tuple[float, ...]] = DEFAULT_SETTINGS.fast_buckets[:9]
 
 #: 指标名前缀（Prometheus 约定：`<namespace>_<subsystem>_<name>`）
 PREFIX: Final[str] = "shopsage_api"
 
-
-def _label_key(labels: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
-    """标签 → 可哈希且**顺序稳定**的键（渲染时标签顺序必须稳定，否则同一个指标会分裂成多条）。"""
-    return tuple(sorted((str(k), str(v)) for k, v in labels.items()))
-
-
-def _render_labels(labels: Mapping[str, str]) -> str:
-    """`{'a': 'b'}` → `{a="b"}`（Prometheus 文本格式；值里的引号/换行要转义）。"""
-    if not labels:
-        return ""
-    parts = []
-    for name, value in labels.items():
-        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-        parts.append(f'{name}="{escaped}"')
-    return "{" + ",".join(parts) + "}"
+#: 第 9 步定下的 **HTTP 层对外契约名**（看板与告警按它们配好了，不能改）。
+#:
+#: 与第 11 步的通用名（`observability.metrics.REQUEST_COUNT` = `shopsage_requests_total`）
+#: **并存**，两者由 `instrument.record_request` 在同一次调用里写、用同一个耗时值。
+#:
+#: | 名字 | 谁在用 |
+#: |---|---|
+#: | `shopsage_api_requests_total` | 第 9 步已配好的看板/告警（改名 = 让它们静默失效） |
+#: | `shopsage_requests_total` | 第 11 步的通用出口（记录规则、新看板） |
+#:
+#: 真正的纪律不是「只有一个名字」，而是「**一个名字只有一个写入方**」——
+#: 两个名字两份数据必然漂移，而漂移的看板比没有看板更危险（它会让人**以为**看见了）。
+API_REQUESTS_TOTAL: Final[str] = f"{PREFIX}_requests_total"
+API_REQUEST_DURATION: Final[str] = f"{PREFIX}_request_duration_seconds"
 
 
 class MetricsRegistry:
-    """进程内指标registry：`counter` / `observe` 两个写入口 + `render()` 一个读出口。"""
+    """API 层指标的注册表门面（**转发给 `observability.metrics.Metrics`**）。
 
-    def __init__(self, *, buckets: Iterable[float] = DEFAULT_BUCKETS) -> None:
-        self._buckets: tuple[float, ...] = tuple(sorted(buckets))
-        self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
-        self._histograms: dict[tuple[str, tuple[tuple[str, str], ...]], list[float]] = {}
-        self._lock = threading.Lock()
+    ⚠️ 本类**不再自己存数据**。第 9 步的版本里 `render()` 读的是自己的字典，
+    而第 11 步的 telemetry 埋点写在 prometheus_client 的 collector 里 ——
+    两处各存一份必然漂移（典型症状：某个量在 `/metrics` 里有时有、有时没有，
+    取决于哪条路径写的），所以数据只有一处：collector。
+    """
 
-    # ── 写 ────────────────────────────────────────────────────────────────────
+    def __init__(self, *, buckets: Iterable[float] | None = None, metrics: Metrics | None = None) -> None:
+        self._buckets: tuple[float, ...] = tuple(sorted(buckets)) if buckets else DEFAULT_BUCKETS
+        self.metrics = metrics or Metrics()
+
+    # ── 写（与第 9 步签名完全一致）────────────────────────────────────────────
     def counter(self, name: str, labels: Mapping[str, str] | None = None, *, value: float = 1.0) -> None:
-        key = (name, _label_key(labels or {}))
-        with self._lock:
-            self._counters[key] = self._counters.get(key, 0.0) + value
+        self.metrics.counter(name, labels, value=value)
 
     def observe(self, name: str, seconds: float, labels: Mapping[str, str] | None = None) -> None:
-        key = (name, _label_key(labels or {}))
-        with self._lock:
-            buckets = self._histograms.setdefault(key, [0.0] * (len(self._buckets) + 2))
-            for index, bound in enumerate(self._buckets):
-                if seconds <= bound:
-                    buckets[index] += 1
-            buckets[-2] += 1  # +Inf 桶（累计计数）
-            buckets[-1] += seconds  # 总和
+        self.metrics.observe(name, seconds, labels)
 
-    def snapshot(self) -> dict[str, dict[str, object]]:
-        """当前值的快照（测试断言用；结构不承诺对外稳定）。"""
-        with self._lock:
-            counters = {f"{n}{_render_labels(dict(k))}": v for (n, k), v in self._counters.items()}
-            histograms: dict[str, object] = {}
-            for (name, key), buckets in self._histograms.items():
-                histograms[f"{name}{_render_labels(dict(key))}"] = {
-                    "count": buckets[-2],
-                    "sum": buckets[-1],
-                }
-        return {"counters": counters, "histograms": histograms}
+    # ── 读 ───────────────────────────────────────────────────────────────────
+    def render(self) -> str:
+        """渲染 Prometheus 文本格式（**唯一的渲染实现**在 `observability.metrics`）。"""
+        return self.metrics.render()
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        """当前值的快照（测试断言用；结构不承诺对外稳定）。
+
+        保持第 9 步的形状（`{"counters": {...}, "histograms": {...}}` 且每个直方图带
+        `count` / `sum`）：那是 `tests/api/*` 与演示脚本已经在用的读口，
+        换掉形状的收益是零，代价是所有调用方都要改一遍。
+        """
+        raw = self.metrics.snapshot()
+        histograms = {
+            key: {"count": entry["count"], "sum": entry["sum"]}
+            for key, entry in raw["histograms"].items()
+        }
+        return {"counters": raw["counters"], "histograms": histograms}
 
     def reset(self) -> None:
-        with self._lock:
-            self._counters.clear()
-            self._histograms.clear()
-
-    # ── 读（Prometheus 文本格式 0.0.4）────────────────────────────────────────
-    def render(self) -> str:
-        """渲染成 Prometheus 文本格式。
-
-        ⚠️ 直方图的 `_bucket` 系列必须是**累计**值（`le` 单调不减），这是 Prometheus
-        的硬性约定；写反了不会报错，只会让 `histogram_quantile()` 算出毫无意义的数字。
-        本实现在 `observe()` 里对每个命中桶都加一，天然满足累计性。
-        """
-        lines: list[str] = []
-        with self._lock:
-            counters = dict(self._counters)
-            histograms = {k: list(v) for k, v in self._histograms.items()}
-
-        families: dict[str, list[str]] = {}
-        for (name, key), value in counters.items():
-            families.setdefault(name, []).append(f"{name}{_render_labels(dict(key))} {_fmt(value)}")
-        for (name, key), buckets in histograms.items():
-            labels = dict(key)
-            body = [
-                f'{name}_bucket{_render_labels({**labels, "le": _fmt(bound)})} {_fmt(buckets[i])}'
-                for i, bound in enumerate(self._buckets)
-            ]
-            body.append(f'{name}_bucket{_render_labels({**labels, "le": "+Inf"})} {_fmt(buckets[-2])}')
-            body.append(f"{name}_sum{_render_labels(labels)} {_fmt(buckets[-1])}")
-            body.append(f"{name}_count{_render_labels(labels)} {_fmt(buckets[-2])}")
-            families.setdefault(name, []).extend(body)
-
-        for name in sorted(families):
-            lines.append(f"# HELP {name} shopsage 自采指标（第 9 步 api 层）")
-            lines.append(f"# TYPE {name} {'summary' if name.endswith('_seconds') else 'counter'}")
-            lines.extend(sorted(families[name]))  # 排序：输出稳定，diff 才有意义
-        return "\n".join(lines) + "\n"
+        self.metrics.reset()
 
 
-def _fmt(value: float) -> str:
-    """数字格式化：整数不带小数点，浮点保留 6 位（Prometheus 的常规写法）。"""
-    if math.isinf(value):
-        return "+Inf" if value > 0 else "-Inf"
-    if float(value).is_integer():
-        return str(int(value))
-    return f"{value:.6f}"
-
-
-class Metrics(Protocol):
-    """路由层只依赖这两个写入口（换实现不影响路由代码）。"""
-
-    def counter(self, name: str, labels: Mapping[str, str] | None = None, *, value: float = 1.0) -> None:
-        ...
-
-    def observe(self, name: str, seconds: float, labels: Mapping[str, str] | None = None) -> None:
-        ...
+# ── 计数器/直方图之外的读口（B2 的量化指标；第 11 步接 Grafana 的输入）─────────
 
 
 def status_class(status_code: int) -> str:
-    """状态码 → 低基数标签（`2xx` / `4xx` / `5xx`）。"""
+    """状态码 → 低基数标签（`2xx` / `4xx` / `5xx`）。
+
+    折叠的**唯一**理由（第 9 步的注释，本步继续有效）：Prometheus 的每个唯一标签组合
+    都是一条时间序列。把原始状态码（或更糟：`user_id`）当标签，一个爬虫刷 500 个
+    不存在的路径就能造出 500 条序列 —— 「监控把监控搞垮」的最常见形态。
+    """
     return f"{int(status_code) // 100}xx"
 
 
 def escape_label(value: str) -> str:
     """URL 里有非法字符时用它做标签值（保留可读性的最小转义）。"""
+    from urllib.parse import quote
+
     return quote(str(value), safe="/._-")
 
 
+def agent_duration_series() -> str:
+    """`AGENT_DURATION` 的系列名（给看板与用例引用，避免各处写字符串）。"""
+    return AGENT_DURATION
+
+
 __all__ = [
+    "API_REQUEST_DURATION",
+    "API_REQUESTS_TOTAL",
     "DEFAULT_BUCKETS",
     "PREFIX",
-    "Metrics",
     "MetricsRegistry",
+    "agent_duration_series",
     "escape_label",
     "status_class",
 ]

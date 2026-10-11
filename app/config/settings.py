@@ -262,10 +262,32 @@ class Settings(BaseSettings):
     rag_chunk_max_chars: int = Field(default=600, ge=80, le=8000)
     rag_chunk_overlap: int = Field(default=80, ge=0, le=2000)
 
-    # 可观测
+    # ── 可观测（第 11 步 observability）：三件套的配置面 ────────────────────────
+    #
+    # 三个开关的设计口径是**「不配 = 不打扰业务」**：
+    #   * otel_endpoint 留空 → **只把 span 留在进程内存里**（开发机没有 collector），
+    #     配了才走 OTLP/HTTP 外发。这一条很重要：留空也去建 exporter 的话，
+    #     每个请求都会在后台重试连接并超时（症状是「服务越跑越慢」，而原因在监控上）。
+    #   * Langfuse 的密钥留空 → **完全不构造 client**（实测：给了假密钥它会真的建 TLS 连接
+    #     并在后台重试导出 401；而 `public_key=""` 只是打一条 WARNING 把自己禁用）。
+    #   * observability_enabled=False → 所有埋点退化成 no-op（压测对照 / 排障时「怀疑监控拖慢」）。
+    observability_enabled: bool = True
     otel_endpoint: str = ""
+    # 服务名：进 OTEL 的 resource 与日志，多服务共用一个 collector 时靠它区分
+    service_name: str = "shopsage-api"
     langfuse_public_key: str = ""
     langfuse_secret_key: SecretStr = SecretStr("")
+    # 自建 Langfuse 的地址（留空 = SDK 默认，即 Langfuse Cloud）
+    langfuse_host: str = ""
+    # Langfuse 总开关（**即使两个密钥都配好了也能关掉它**）。
+    #
+    # 为什么需要这个开关（而不是「密钥就是开关」）：
+    # Langfuse SDK 会注册一个 `atexit` 钩子，进程退出时它去做一次 flush ——
+    # 实测（端点不可达）：最短 2.0s、最长 23.6s；**记过 score 之后 6~13s**
+    # （score 走 SDK 内部另一条无上限的队列，不受 `timeout` 参数约束）。
+    # 于是「有关键路径的密钥、但这次不想上报」（压测对照、离线演示、临时排障）
+    # 缺一个**不影响密钥配置**的出口 —— 否则只能去改密钥（改了会连带影响别的用途）。
+    langfuse_enabled: bool = True
 
     # 实例化时由 settings_customise_sources 重绑的「实际生效的 dotenv 来源」。
     # 只服务冲突检测这一个诊断用途。

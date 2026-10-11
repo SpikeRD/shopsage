@@ -67,7 +67,7 @@ services:
       retries: 10
     networks: [shopsage-dev]
 
-  # ── Prometheus（第 12 步 observability.md 的指标采集端）─────────────────────
+  # ── Prometheus（第 11 步 observability.md 的指标采集端）─────────────────────
   prometheus:
     image: prom/prometheus:v2.55.1
     container_name: shopsage-dev-prometheus
@@ -76,8 +76,16 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=15d"
-      # 允许通过 UI 调 scrape 目标，方便第 12 步现场排查
+      # 允许通过 UI 调 scrape 目标，方便第 11 步现场排查
       - "--web.enable-lifecycle"
+    environment:
+      # 第 11 步：业务代码跑在 Windows 宿主，Prometheus 在容器里。
+      # 172.17.0.1 是默认网桥下「宿主机」的地址（Linux 上是 docker0 的 IP）；
+      # 业务与 Prometheus 同机时改成 host.docker.internal（下面 extra_hosts 已配好）。
+      SHOPSAGE_API_TARGET: ${SHOPSAGE_API_TARGET:-172.17.0.1:8000}
+    extra_hosts:
+      # 让 `host.docker.internal` 在 Linux 上也能用（Docker Desktop 自带，原生 Linux 不自带）
+      - "host.docker.internal:host-gateway"
     ports:
       - "${PROMETHEUS_BIND_IP:-0.0.0.0}:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
@@ -87,6 +95,11 @@ services:
       # 报 "not a directory: Are you trying to mount a directory onto a file"。
       # 改这两个路径时别丢了 --project-directory . 的对应关系（见文件头注释）。
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # 第 11 步的记录规则（分 Agent 的 P99 等）。**必须挂**：
+      # prometheus.yml 里写了 `rule_files: /etc/prometheus/rules/*.yml`，
+      # 少了这个挂载，Prometheus 会因为「规则文件目录不存在」而在启动时**直接失败**
+      # （不是警告）—— 那时整个监控栈起不来，而报错信息只提 rule_files。
+      - ./infra/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     healthcheck:
       # prom/prometheus 镜像里没有 curl，用官方自带的 promtool 探活
@@ -97,7 +110,41 @@ services:
       start_period: 15s
     networks: [shopsage-dev]
 
-  # ── Grafana（第 12 步的可视化端）───────────────────────────────────────────
+  # ── OTel Collector（第 11 步的链路采集端；**可选**，默认不随栈启动）──────────
+  # 为什么要它：Prometheus 回答「长期看是多少」，它**看不见单次请求的调用链** ——
+  # 而「那次 P99 尖峰到底卡在哪个节点」只有 trace 能回答。
+  #
+  # ⚠️ 默认不启动（`profiles` 生效时才会起），因为：
+  #   ① 业务默认把 span 留在进程内存里（`OTEL_ENDPOINT` 留空），起了也没人发；
+  #   ② 一旦配了 `OTEL_ENDPOINT` 而 collector 没起，业务侧的 BatchSpanProcessor
+  #      会不断重试连接（只打日志、不阻塞请求，但日志会变吵）。
+  # 启用方式：
+  #   docker compose -f infra/docker-compose.dev.yml --project-directory . --profile tracing up -d
+  # 然后把 .env 的 OTEL_ENDPOINT 指向 **4318**（OTLP/HTTP）。
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: shopsage-dev-otel-collector
+    restart: unless-stopped
+    profiles: ["tracing"]
+    command: ["--config=/etc/otel/otel-collector.yml"]
+    ports:
+      - "${OTEL_GRPC_BIND_IP:-0.0.0.0}:${OTEL_GRPC_PORT:-4317}:4317"   # OTLP/gRPC
+      - "${OTEL_HTTP_BIND_IP:-0.0.0.0}:${OTEL_HTTP_PORT:-4318}:4318"   # OTLP/HTTP（业务用这条）
+      - "${OTEL_METRICS_PORT:-0.0.0.0:8888}:8888"                      # collector 自身指标
+    volumes:
+      - ./infra/otel/otel-collector.yml:/etc/otel/otel-collector.yml:ro
+      - otel_data:/data
+    healthcheck:
+      # contrib 镜像里没有 curl/wget 保证，用 collector 自己的健康检查扩展不可用时，
+      # 退化成「端口有没有在听」的 TCP 检查（够用：它回答「起来了没有」）。
+      test: ["CMD-SHELL", "timeout 2 sh -c '</dev/tcp/127.0.0.1/4318' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks: [shopsage-dev]
+
+  # ── Grafana（第 11 步的可视化端）───────────────────────────────────────────
   grafana:
     image: grafana/grafana:11.3.0
     container_name: shopsage-dev-grafana
@@ -113,9 +160,15 @@ services:
       - "${GRAFANA_BIND_IP:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
     volumes:
       # 用 provisioning 自动挂数据源：省掉「手点 UI 加 datasource」这一步，
-      # 第 12 步验收「能从 Grafana 定位慢在哪一步」时开箱即用
+      # 第 11 步验收「能从 Grafana 定位慢在哪一步」时开箱即用
       # 同样必须是 ./infra/...（原因见 prometheus 服务里的注释）；
       # 少了 infra/ 时不会报错，只会静默挂上一个空目录 → 「Grafana 没数据源」
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      # ⚠️ 看板 JSON 必须位于 `/etc/grafana/provisioning/dashboards` **之内**：
+      # `provisioning/dashboards/shopsage.yml` 里的 `path` 指的就是这个容器内路径。
+      # 所以仓库里的看板放在 `infra/grafana/provisioning/dashboards/`（而不是另起
+      # 一个 `infra/grafana/dashboards/`）—— 后者会被挂到 `/etc/grafana/dashboards`，
+      # Grafana **看不到**，症状是「数据源在、看板不见了」（不报错，只是空文件夹）。
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
     depends_on:
@@ -138,3 +191,4 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  otel_data:

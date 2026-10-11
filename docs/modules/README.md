@@ -16,6 +16,7 @@
 > [`8.graph-runbook.md`](../runbook/8.graph-runbook.md)（图装配 / `durability="sync"` / 断点重放与幂等 / 闸门与 `interrupt` / 十二个实测坑）、
 > [`9.api-runbook.md`](../runbook/9.api-runbook.md)（第一个端到端切片：鉴权与 `thread_id` 派生 / WebSocket 五类帧与首帧 <1s / 滑动窗口限流与 429 / 审批通道 202→200→409 / 错误映射表 / 十个实测坑），
 > [`10.rag-runbook.md`](../runbook/10.rag-runbook.md)（中文 n-gram 切词与 SQL 内手算 BM25 / 三种分块策略 / HNSW 与 GIN 索引 / RRF 融合与 rerank 降级 / 增量索引的账目与可见延迟 / 十三个实测坑），
+> [`11.observability-runbook.md`](../runbook/11.observability-runbook.md)（OTEL 父子 span 与「根 span 必须包住整个请求」/ 分位数与桶边界 / 属性白名单与基数三道闸 / Langfuse 4.x 的版本事实与四个必守性质 / Prometheus 记录规则与 Grafana provisioned 看板 / 十个实测坑），
 > 另有不绑定某一步的底座命令手册 [`4.uv-pytest-basics.md`](../runbook/4.uv-pytest-basics.md)（uv 环境与 pytest 选用例）。
 >
 > 📌 **本目录文件已按「建议开发顺序」编号**（`1.config.md` … `16.web.md`，与下表 `#` 一致；

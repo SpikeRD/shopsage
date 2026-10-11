@@ -1,0 +1,24 @@
+# Grafana 看板自动配置（第 11 步 observability 的验收落点）。
+#
+# 为什么必须 provision 而不是「手点 UI 导入」：
+#   第 11 步的验收标准是「**Grafana 能看到分 Agent 耗时、P99、队列深度；能定位到具体瓶颈**」。
+#   手点的看板活在容器的 `grafana_data` volume 里 —— `down -v` 之后验收证据就消失了，
+#   而「证据可复现」是本仓所有 runbook 的硬要求（每个数字都要能在新环境重跑出来）。
+#   provision 之后：删库重建 → 看板自动回来，验收命令照旧。
+#
+# ⚠️ 路径 = 容器内路径（compose 把 ./infra/grafana 挂到 /etc/grafana/provisioning）。
+apiVersion: 1
+
+providers:
+  - name: shopsage
+    orgId: 1
+    folder: ShopSage
+    folderUid: shopsage
+    type: file
+    # 允许在 UI 上改（开发期方便），改动不会写回文件 —— 想固化就改 JSON 再重启
+    allowUiUpdates: true
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

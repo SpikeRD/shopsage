@@ -141,13 +141,66 @@ def rate_limit_component(request: Request) -> ComponentHealth:
     )
 
 
+def observability_component(request: Request) -> ComponentHealth:
+    """可观测性三件套的状态（第 11 步）。
+
+    ## 为什么它**永不**报 `down`
+
+    与 `rate_limit` 同一条理由：埋点是**旁路**，它挂了业务照跑。
+    把「OTel 没配端点」算成 down，会让 `/health` 在一个完全健康的服务上显示全站不可用 ——
+    而那正是探针最不该做的事（第 9 步 `health.py` 的模块 docstring 里已经定过这个口径）。
+
+    ## 三种状态分别在说什么
+
+    | 状态 | 含义 | 该不该处理 |
+    |---|---|---|
+    | `ok` | 埋点开着，且至少记录了 1 条 span | 不用 |
+    | `skipped` | 没配 `OTEL_ENDPOINT`（span 只留内存）或 `OBSERVABILITY_ENABLED=false` | **不用** —— 这是开发默认值 |
+    | `degraded` | 埋点开着但**一条 span 都没有** | 要查：可能是「还没流量」，也可能是埋点没接上 |
+
+    `degraded` 的措辞刻意把两种可能都写出来：只看 `degraded` 会让人立刻去查代码，
+    而实际上「服务刚启动、还没有请求」是更常见的原因。
+    """
+    state = getattr(request.app.state, "telemetry", None)
+    if state is None:
+        return ComponentHealth(
+            name="observability",
+            status="skipped",
+            detail="telemetry 未装配（未走 create_app 的 lifespan？）——业务不受影响",
+        )
+    if not state.enabled:
+        return ComponentHealth(
+            name="observability",
+            status="skipped",
+            detail="OBSERVABILITY_ENABLED=false：所有埋点退化成 no-op（压测/排障对照用）",
+        )
+    spans = len(state.exporter.records)
+    if spans == 0:
+        return ComponentHealth(
+            name="observability",
+            status="degraded",
+            detail=(
+                "埋点已启用但还没有记录到任何 span（可能是**还没有请求**，也可能是埋点没接上）。"
+                f"外发端点：{state.otel_endpoint or '（未配，span 只留内存）'}"
+            ),
+        )
+    return ComponentHealth(
+        name="observability",
+        status="ok",
+        detail=(
+            f"已记录 {spans} 条 span；外发端点：{state.otel_endpoint or '（未配，span 只留内存）'}；"
+            f"/metrics 见 shopsage_agent_duration_seconds 等系列"
+        ),
+    )
+
+
 @router.get("/health", response_model=HealthResponse, summary="健康检查（依赖状态在 body 里）")
 def health(request: Request) -> HealthResponse:
     """探活：**恒 200**，依赖状态写在 `components`（理由见模块 docstring）。"""
     settings = getattr(request.app.state, "settings", None)
     timeout = float(getattr(request.app.state, "probe_timeout", None) or DEFAULT_PROBE_TIMEOUT)
 
-    components: list[ComponentHealth] = [rate_limit_component(request)]
+    components: list[ComponentHealth] = [rate_limit_component(request), observability_component(request)]
     targets: list[Endpoint | None] = [
         endpoint_from_url(getattr(settings, "database_url", ""), name="postgres", default_port=5432),
         # ⚠️ Redis 是 `required=False`：本项目的 Redis 用途全是**优化**（限流计数、未来的
@@ -193,15 +246,76 @@ def health(request: Request) -> HealthResponse:
 def metrics(request: Request) -> Response:
     """把进程内指标渲染成 Prometheus 文本格式。
 
-    `MetricsRegistry` 由 `main.create_app` 挂在 `app.state.metrics` 上；
-    取不到就返回一段空输出（而不是 500）—— 指标不可用不该让抓取端报错，
-    那会把「指标系统的小问题」升级成「业务接口故障」的告警。
+    ## 第 11 步：为什么渲染**两个**注册表
+
+    | 注册表 | 写者 | 内容 |
+    |---|---|---|
+    | `app.state.metrics`（按 app 注入） | HTTP 中间件、三条业务路由 | `shopsage_api_*`（QPS/P99/首帧延迟…） |
+    | `observability.metrics.default_metrics()` | 图节点、LLM 门面、SQL/检索工具 | `shopsage_agent_*` / `shopsage_llm_*` / `shopsage_sql_*` |
+
+    两者必须是**两个**注册表（前者随 app 注入、后者随进程），
+    但抓取端只能配**一个** `/metrics`（否则运维要记得抓两个端点，而漏掉一个的症状是
+    「节点级指标怎么没有」——那正是本步要解决的 B1）。所以这里把两段文本拼起来。
+
+    ⚠️ 拼接的前提是**没有重名系列**：若两边有同名指标，Prometheus 抓到的文本里
+    会出现重复行，抓取会**部分失败**（`Error on ingesting samples with different value
+    but same timestamp`）—— 这是最难查的一类抓取错误。所以 `_registration_collision()`
+    在拼接前做一次检查，撞了就让 app 那一份胜出并打一条 ERROR
+    （绝不能让「新加的埋点」把已经配好的看板搞坏）。
     """
     registry = getattr(request.app.state, "metrics", None)
-    body = registry.render() if registry is not None else "# 指标注册表未初始化\n"
+    parts = [registry.render()] if registry is not None else ["# 指标注册表未初始化\n"]
+    extra = _observability_render(registry)
+    if extra:
+        parts.append(extra)
+    body = "".join(parts)
+    # ⚠️ 末尾必须有换行 —— 这是 Prometheus **文本格式**的硬性要求
+    # （`version=0.0.4` 的规范：每一行以 LF 结束）。缺了它抓取端会报
+    # `unexpected end of stream`，而在浏览器里看完全正常（最迷惑人的一类格式错）。
+    # 本地实测踩到：两个注册表拼接时若后一段为空、前一段又被改成不以 LF 结尾，
+    # 整体就丢掉了末尾换行。
+    if not body.endswith("\n"):
+        body += "\n"
     response = Response(content=body, media_type=PROMETHEUS_CONTENT_TYPE)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _observability_render(primary: Any) -> str:
+    """渲染第 11 步的 telemetry 注册表；**与 primary 同一个就不重复渲染**。"""
+    try:
+        from app.observability.metrics import default_metrics
+
+        candidate = default_metrics()
+    except Exception as exc:  # noqa: BLE001 - 指标不可用不该让抓取端报错
+        logger.warning("可观测性指标注册表不可用（已忽略）：%s", exc)
+        return ""
+    if primary is not None and getattr(primary, "metrics", None) is candidate:
+        # 生产路径（`create_app` 把 app 的注册表交给了 telemetry）：同一份，不重复
+        return ""
+    text = candidate.render()
+    if not text.strip():
+        return ""
+    overlap = _registration_collision(primary, candidate)
+    if overlap:
+        logger.error(
+            "两个指标注册表里有重名系列（已丢弃可观测性那一段，避免抓取端报重复时间戳）：%s",
+            sorted(overlap),
+        )
+        return ""
+    return text
+
+
+def _registration_collision(primary: Any, candidate: Any) -> set[str]:
+    """两个注册表之间**是否有重名的指标族**（拼接前必须回答的问题，见 `/metrics`）。"""
+    if primary is None:
+        return set()
+    try:
+        left = {metric.name for metric in primary.metrics.registry.collect()}
+        right = {metric.name for metric in candidate.registry.collect()}
+    except Exception:  # noqa: BLE001 - 检查本身失败时按「不撞」处理（不能因检查而丢数据）
+        return set()
+    return left & right
 
 
 __all__: list[Any] = [
@@ -210,6 +324,7 @@ __all__: list[Any] = [
     "SERVICE_VERSION",
     "Endpoint",
     "endpoint_from_url",
+    "observability_component",
     "probe_tcp",
     "rate_limit_component",
     "router",

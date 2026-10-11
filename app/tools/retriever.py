@@ -25,6 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from app.observability.instrument import record_retrieval
 from app.tools.audit import audit_tool_call
 from app.tools.errors import ToolContractError, ToolNotAvailableError
 
@@ -179,49 +180,65 @@ def retrieve_docs(
     effective_top_k = min(top_k, MAX_TOP_K)
     searcher = search if search is not None else _default_searcher()
 
-    with audit_tool_call(
-        TOOL_NAME, caller=caller, query=query, top_k=effective_top_k, min_score=min_score
-    ) as handle:
-        raw_hits = list(searcher(query=query, top_k=effective_top_k))
+    # 第 11 步：埋点用 `with` 包住**整个调用**（含后端检索与溯源过滤）——
+    # 对调用方来说「检索花了多久」就是这一段，而 `RETRIEVAL_DURATION` 要回答的
+    # 正是「用户等了多久」这个问题（把过滤排除掉会低估真实等待）。
+    with record_retrieval(hits=0) as call:
+        with audit_tool_call(
+            TOOL_NAME, caller=caller, query=query, top_k=effective_top_k, min_score=min_score
+        ) as handle:
+            raw_hits = list(searcher(query=query, top_k=effective_top_k))
 
-        docs: list[RetrievedDoc] = []
-        dropped_reasons: dict[str, int] = {}
-        for hit in raw_hits:
-            doc = _to_doc(hit)
-            if isinstance(doc, str):
-                dropped_reasons[doc] = dropped_reasons.get(doc, 0) + 1
-                continue
-            if min_score is not None and doc.score < float(min_score):
-                dropped_reasons["below_min_score"] = dropped_reasons.get("below_min_score", 0) + 1
-                continue
-            docs.append(doc)
+            docs: list[RetrievedDoc] = []
+            dropped_reasons: dict[str, int] = {}
+            for hit in raw_hits:
+                doc = _to_doc(hit)
+                if isinstance(doc, str):
+                    dropped_reasons[doc] = dropped_reasons.get(doc, 0) + 1
+                    continue
+                if min_score is not None and doc.score < float(min_score):
+                    dropped_reasons["below_min_score"] = dropped_reasons.get("below_min_score", 0) + 1
+                    continue
+                docs.append(doc)
 
-        # 排序放最后：`rag` 交付时可能返回 RRF 融合分或 rerank 分，
-        # 这里统一按 score 降序，让「第 10 步换排序口径」不会静默改变上层看到的顺序。
-        docs.sort(key=lambda doc: doc.score, reverse=True)
+            # 排序放最后：`rag` 交付时可能返回 RRF 融合分或 rerank 分，
+            # 这里统一按 score 降序，让「第 10 步换排序口径」不会静默改变上层看到的顺序。
+            docs.sort(key=lambda doc: doc.score, reverse=True)
 
-        if dropped_reasons.get("no_source"):
-            # 用 WARNING 而不是静默丢弃：这条日志是「rag 侧有片段没带 metadata」的唯一信号，
-            # 第 10 步的数据质量问题应当在这里被看见，而不是等合成 Agent 答不出出处才发现。
-            logger.warning(
-                "检索命中里有 %d 条没有 source 溯源，已按「只返回带溯源的结果」丢弃"
-                "（调用方 %s，query=%r）",
-                dropped_reasons["no_source"],
-                handle.caller,
-                query[:50],
+            if dropped_reasons.get("no_source"):
+                # 用 WARNING 而不是静默丢弃：这条日志是「rag 侧有片段没带 metadata」的唯一信号，
+                # 第 10 步的数据质量问题应当在这里被看见，而不是等合成 Agent 答不出出处才发现。
+                logger.warning(
+                    "检索命中里有 %d 条没有 source 溯源，已按「只返回带溯源的结果」丢弃"
+                    "（调用方 %s，query=%r）",
+                    dropped_reasons["no_source"],
+                    handle.caller,
+                    query[:50],
+                )
+
+            handle.rows = len(docs)
+            handle.details.update(
+                {
+                    "hits_raw": len(raw_hits),
+                    "hits_returned": len(docs),
+                    "dropped": dict(dropped_reasons),
+                    "top_k": effective_top_k,
+                    "backend": getattr(searcher, "__module__", "unknown"),
+                }
             )
-
-        handle.rows = len(docs)
-        handle.details.update(
-            {
-                "hits_raw": len(raw_hits),
-                "hits_returned": len(docs),
-                "dropped": dict(dropped_reasons),
-                "top_k": effective_top_k,
-                "backend": getattr(searcher, "__module__", "unknown"),
-            }
-        )
-        return docs
+            # 第 11 步：给埋点补上「候选池 → 命中 → 是否降级」这条链（耗时由 `with` 自己量）。
+            # 「检索慢」与「检索不准」是两类问题，前者看 P99，
+            # 后者要看 hits_raw 与 hits_returned 的比值（第 10 步的 E2 结论就是从这三个数里算出来的）。
+            # ⚠️ 查询文本**不进埋点**（问题本身可能含 PII，见 instrument.record_retrieval）。
+            call.set_attributes(
+                {
+                    "hits": len(docs),
+                    "candidates": len(raw_hits),
+                    "degraded": bool(dropped_reasons),
+                }
+            )
+            call.outcome("degraded" if dropped_reasons else "hits", rows=len(docs))
+            return docs
 
 
 __all__ = [

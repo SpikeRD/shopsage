@@ -160,12 +160,24 @@ class ChatResponse(BaseModel):
 
 
 class ComponentHealth(BaseModel):
-    """单个依赖的健康状态。"""
+    """单个依赖的健康状态。
+
+    `status` 的三个取值（第 11 步补上 `degraded`）：
+
+    * `ok` —— 正常；
+    * `degraded` —— **能用，但有代价**（例如限流退化到内存：多副本下额度被放大）；
+    * `skipped` —— 这个依赖没启用（`status` 不该报 down，见 `health.py` 的说明）；
+    * `down` —— 真的不可用。
+
+    ⚠️ 第 11 步之前这里只有 `ok`/`down`/`skipped`，而 `HealthResponse.status` 早就有
+    `degraded` —— 于是「整体 degraded、但组件里说不出是谁 degraded」，
+    排障时只能反过来猜。补上它是让两层的词汇表一致（**同一个词在两层都可用**）。
+    """
 
     model_config = ConfigDict(extra="allow")
 
     name: str
-    status: Literal["ok", "down", "skipped"]
+    status: Literal["ok", "degraded", "down", "skipped"]
     detail: str = ""
     latency_ms: float | None = None
 

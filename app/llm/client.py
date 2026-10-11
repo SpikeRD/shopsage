@@ -30,6 +30,8 @@ from app.llm.errors import (
     is_permanent,
     is_retryable,
 )
+from app.observability.instrument import record_llm_call
+from app.observability.tracing import trace_llm, trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -393,21 +395,58 @@ async def llm_call(
     async def _call() -> LLMResponse:
         t0 = time.perf_counter()
         extra: dict[str, Any] = {"api_base": api_base} if api_base else {}
-        response = await litellm.acompletion(
-            model=used_model,
-            messages=messages,
-            api_key=api_key,  # 唯一密钥入口（按模型解析，见上）
-            timeout=timeout,
-            # ⚠️ 必须显式关掉 litellm 自带重试，否则一次业务调用会是「两层重试」
-            #    （4 × (1+N) 个请求），退避时间失控且会主动放大限流压力。
-            #    ⚠️ `num_retries` **不在** acompletion 的具名参数里（走 **kwargs 透传），
-            #    所以参数名写错不会报错、只会静默不生效 —— 唯一的哨兵是
-            #    tests/test_llm_client_retry.py 里的计数断言。
-            num_retries=0,
-            **extra,
-            **kwargs,
+        # ── 第 11 步：LLM 埋点（**本步唯一的 LLM span 来源**）────────────────────
+        # 落在这里而不是各个 Agent 里：本函数是全项目唯一允许打模型的地方（模块 docstring
+        # 第 1 节的硬约束），所以在它里面埋点等于「不可能漏」——任何绕过去的调用
+        # 本来就已经违反了那条约束，而那种绕行不该靠埋点来发现（有 grep 自查用例钉着）。
+        #
+        # ⚠️ 重试的每一次尝试**各自一个 span**：`_call` 是被 tenacity 反复调用的那个闭包，
+        # 所以「重试了 3 次」在 trace 里就是 3 条 `llm.call`。
+        # 若把 span 开在 `llm_call` 外面，重试会被折叠成一条 —— 而「这次请求到底打了几次模型」
+        # 正是成本与延迟归因的关键（看不到重试次数，就看不出「退避把 P99 推高了」）。
+        with trace_llm(used_model, attributes={"backend": "litellm"}) as span:
+            try:
+                response = await litellm.acompletion(
+                    model=used_model,
+                    messages=messages,
+                    api_key=api_key,  # 唯一密钥入口（按模型解析，见上）
+                    timeout=timeout,
+                    # ⚠️ 必须显式关掉 litellm 自带重试，否则一次业务调用会是「两层重试」
+                    #    （4 × (1+N) 个请求），退避时间失控且会主动放大限流压力。
+                    #    ⚠️ `num_retries` **不在** acompletion 的具名参数里（走 **kwargs 透传），
+                    #    所以参数名写错不会报错、只会静默不生效 —— 唯一的哨兵是
+                    #    tests/test_llm_client_retry.py 里的计数断言。
+                    num_retries=0,
+                    **extra,
+                    **kwargs,
+                )
+            except BaseException as exc:  # noqa: BLE001 - 只为埋点，原样重抛
+                span.record_exception(exc)
+                raise
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            result = _to_response(response, latency_ms)
+            # span 属性只放**白名单**里的量（prompt 全文绝不进 trace，见 tracing.ALLOWED_ATTRIBUTES）
+            span.set_attributes(
+                {
+                    "model": result.model or used_model,
+                    "tokens": result.total_tokens,
+                    "cost_usd": result.cost_usd,
+                    "attempts": 1,
+                }
+            )
+            span.set_ok()
+        # 指标在 span 之外记（`trace_llm` 的 `with` 只保证 span 会结束）：
+        # token 与成本是 counter（累加量），与 span 的「一条记录」是两回事。
+        record_llm_call(
+            model=result.model or used_model,
+            latency_ms=result.latency_ms,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+            finish_reason=result.finish_reason,
         )
-        return _to_response(response, int((time.perf_counter() - t0) * 1000))
+        return result
 
     return await _run_with_retry(_call, max_retries=max_retries)
 
@@ -469,6 +508,24 @@ async def embed(
 
     vectors = await _run_with_retry(call, max_retries=max_retries)
     _assert_embedding_dim(vectors, expected=settings.embedding_dim, model=used_model, backend=backend)
+    # ── 第 11 步：embedding 埋点────────────────────────────────────────────────
+    # 为什么 embedding 也要埋点（文档 §4 第 1 条把「向量检索」列进了必埋项）：
+    # 一次灌库会打上千次 embedding，而它是**按 token 计费**的 —— 成本看板上
+    # 「embedding 花了多少」与「生成花了多少」必须是两条线，否则一次全量重灌
+    # 会把账算到生成调用头上（第 10 步的「只重嵌 1 个片段」正是靠这个对比才成立）。
+    #
+    # token 口径用 `approx_tokens`（本地后端没有真实 usage）：
+    # 这是一个**近似值**，所以它记在 span 属性里，而**不进** `LLM_TOKENS` counter ——
+    # 把估算值混进计费口径的 counter 会让那个数字永久失真（而它看起来仍然精确）。
+    from app.rag.textkit import approx_tokens
+
+    approx = sum(approx_tokens(text) for text in items)
+    with trace_span(
+        "llm.embed",
+        kind="llm",
+        attributes={"model": used_model, "backend": backend, "tokens": approx, "rows": len(vectors)},
+    ) as span:
+        span.set_ok()
     return vectors
 
 

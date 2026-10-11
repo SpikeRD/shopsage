@@ -2,10 +2,14 @@
 #
 # 关键点：Prometheus 跑在 Linux 虚拟机的容器里，而**业务代码跑在 Windows 宿主机**，
 # 所以 scrape target 不能写 "localhost"（那是容器自己）。
-# docker 网桥下，Windows 宿主机的地址是容器的默认网关（通常 172.17.0.1）。
+# Docker 网桥下 Windows 宿主机的地址是容器的默认网关（通常 172.17.0.1）；
+# 若业务与 Prometheus 同在一台 Linux 上，用 `extra_hosts: host.docker.internal:host-gateway`
+# 后写 `host.docker.internal:8000` 更稳（见 compose 里 prometheus 服务的注释）。
 #
-# 第 12 步（observability.md）落地后，按下面注释解开 API job 即可。
-# 在此之前 metrics_server 尚未实现，保持注释状态，避免 Prometheus 一直刷 target down。
+# ⚠️ 第 11 步落地后，`shopsage-api` 这个 job **默认打开**（在此之前它是注释状态，
+#    理由写在原注释里：metrics_server 尚未实现时打开只会让 Prometheus 一直刷 target down）。
+#    `/metrics` 的路径不在 `API_PREFIX` 下（`app/api/health.py` 的口径），
+#    所以 `metrics_path` 必须是 `/metrics` 而不是 `/api/metrics`。
 
 global:
   scrape_interval: 15s
@@ -14,21 +18,44 @@ global:
     env: dev
     project: shopsage
 
+# 记录规则：把最常用的分位数**预先算好**。
+#
+# 为什么需要它们（而不是每条看板自己写 `histogram_quantile(...)`）：
+#   ① 看板里重复写表达式必然漂移（同一张图里两个面板的 P99 算法不一样，没人会发现）；
+#   ② 第 11 步的验收口径是「**按 Agent 分组的 P99**」，而这条表达式有 3 个标签维度、
+#      手写极易漏掉 `sum by` 的分组键 —— 漏了的症状是「每个节点都显示全局 P99」，
+#      图上看起来完全正常，只是永远定位不到瓶颈（B1 会假装被解决了）。
+# 指标名与 `app/observability/metrics.py` 里的常量**必须一致**（那里是唯一真相）。
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
 scrape_configs:
   # Prometheus 自采：既验证配置生效，也是 Grafana 上「没数据」时的第一手对照
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
 
-  # 业务 API（第 12 步启用）
-  # - job_name: shopsage-api
-  #   metrics_path: /metrics
-  #   static_configs:
-  #     - targets: ["172.17.0.1:8000"]
-  #       labels:
-  #         service: api
+  # 业务 API（第 11 步启用）：HTTP 黄金指标 + 节点/LLM/SQL/检索埋点都在这一个端点上。
   #
-  # Arq worker（第 14 步启用，队列深度/失败数在 B1 验收里要看）
+  # ⚠️ 单副本口径：`--workers 4` 时每个进程各报一份计数，Prometheus 抓到 4 条序列
+  #    （`instance` 标签不同），**查询时必须 `sum by (...)`** —— 这正是 `rules/` 里的
+  #    记录规则帮你做掉的事。直接看裸序列会把「4 个副本各 3 次」误读成「一共 3 次」。
+  - job_name: shopsage-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["${SHOPSAGE_API_TARGET:-172.17.0.1:8000}"]
+        labels:
+          service: api
+
+  # OTel Collector 自身的指标（第 11 步起 collector 是可选项，所以默认注释）
+  # 打开它才能回答「采集端自己健康吗」—— trace 不到时先看这里，而不是先怀疑业务。
+  # - job_name: otel-collector
+  #   static_configs:
+  #     - targets: ["otel-collector:8888"]
+  #       labels:
+  #         service: otel-collector
+
+  # Arq worker（第 12 步启用，队列深度/失败数在 B1 验收里要看）
   # - job_name: shopsage-worker
   #   static_configs:
   #     - targets: ["172.17.0.1:9100"]

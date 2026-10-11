@@ -44,6 +44,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlglot import exp
 
 from app.db.session import get_read_engine
+from app.observability.instrument import record_sql_query
 from app.security import policy
 from app.security.sql_guard import DIALECT, ValidationResult, validate_sql
 from app.tools.audit import audit_tool_call
@@ -174,21 +175,36 @@ def execute_readonly_query(
         bound, bound_clamped = clamp_bound_limit(validation.sql, params, rows_cap + 1)
 
         # ③ 只读引擎 + 流式游标 + 「多取一行」探针
-        started = time.perf_counter()
-        try:
-            with get_read_engine().connect() as conn:
-                # stream_results：服务端游标，逐批取 —— 避免「为了拿 200 行先把结果集全读进内存」。
-                # 它和第 4 条的 fetchmany 上限是**两层**保护：一层防内存，一层防语义。
-                stream = conn.execution_options(stream_results=True)
-                result = stream.execute(text(validation.sql), bound)
-                columns = [str(name) for name in result.keys()]
-                fetched = result.mappings().fetchmany(rows_cap + 1)
-        except SQLAlchemyError as exc:
-            raise translate_db_error(exc, action=f"执行只读查询（{TOOL_NAME}）") from exc
+        #
+        # 第 11 步：埋点用 `with` 包住**执行这一段**（而不是包住整个函数）——
+        # `SQL_DURATION` 的语义是「数据库花了多久」，而校验/夹取/审计都是我们自己的 CPU 时间。
+        # 把校验算进去会让「库慢」与「守卫复杂」混成一个数字，而两者的处置完全不同。
+        # ⚠️ SQL 文本**不进埋点**（它可能含业务数据/字面量），只进审计（`6.tools.md` 的落点）。
+        with record_sql_query(tool=TOOL_NAME) as call:
+            started = time.perf_counter()
+            try:
+                with get_read_engine().connect() as conn:
+                    # stream_results：服务端游标，逐批取 —— 避免「为了拿 200 行先把结果集全读进内存」。
+                    # 它和第 4 条的 fetchmany 上限是**两层**保护：一层防内存，一层防语义。
+                    stream = conn.execution_options(stream_results=True)
+                    result = stream.execute(text(validation.sql), bound)
+                    columns = [str(name) for name in result.keys()]
+                    fetched = result.mappings().fetchmany(rows_cap + 1)
+            except SQLAlchemyError as exc:
+                # **失败的 SQL 也要埋点**：只埋成功的查询会让「库挂了/慢查询被 kill」
+                # 在看板上表现为「这段时间没有数据」—— 而「没有数据」与「一切正常」
+                # 在图上长得一样（这是监控最经典的骗局）。
+                # 异常会穿透 `_ToolCall.__exit__` 并自动被 span 记成 ERROR（见其说明）。
+                raise translate_db_error(exc, action=f"执行只读查询（{TOOL_NAME}）") from exc
 
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        truncated = len(fetched) > rows_cap
-        rows = [dict(mapping) for mapping in fetched[:rows_cap]]
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            truncated = len(fetched) > rows_cap
+            rows = [dict(mapping) for mapping in fetched[:rows_cap]]
+            # 记 `rows` 与 `truncated` 两个属性，而不是只记耗时：
+            # 「这条查询慢了 4 秒」的下一步永远是「它取回了几行」——
+            # 取回 200 行（被截断）与取回 1 行是两条完全不同的故事（前者要改 SQL，后者要查索引）。
+            call.set_attributes({"rows": len(rows), **({"degraded": True} if truncated else {})})
+            call.outcome("truncated" if truncated else "rows")
 
         meta: dict[str, Any] = {
             "audit_id": handle.audit_id,
