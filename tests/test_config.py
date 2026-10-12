@@ -298,6 +298,39 @@ def test_env_collision_silent_when_only_one_side_present(caplog):
     assert not caplog.records
 
 
+def test_env_collision_empty_dotenv_value_does_not_crash(caplog):
+    """`.env` 里该项为空 → 告警文案必须能生成（回归：NameError: ENV_FILE_NAME）。
+
+    这条分支与「两处值不同」是**两条独立文案**，只在 `.env` 里留空时才会走到。
+    曾经的 bug 正是这一支引用了未定义的名字，于是「用户为了不覆盖而把 .env 留空」
+    ——也就是最该被正确引导的那种配置——会让 `Settings()` 直接崩在 import 期，
+    连 `--dry-run` 都跑不起来。断言点：不抛异常、文案里点明是哪个文件、不泄露值。
+    """
+    from app.config.settings import ENV_FILE_NAME, _warn_on_env_collisions
+
+    with caplog.at_level("WARNING", logger="app.config.settings"):
+        _warn_on_env_collisions(
+            field_values={"database_url": "postgresql://u:ospass@prod-host:5432/db"},
+            dotenv={"database_url": ""},
+            env={"DATABASE_URL": "postgresql://u:ospass@prod-host:5432/db"},
+            env_prefix="",
+            case_sensitive=False,
+        )
+
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert ENV_FILE_NAME in msg, "文案要指明去哪个文件里改"
+    assert "空的" in msg, "空值分支应说明「是环境变量在提供它，不是覆盖」"
+    assert "ospass" not in msg, "告警泄露了密码明文"
+
+
+def test_env_file_name_constant_matches_model_config():
+    """告警文案里的文件名与真正读取的文件名必须是同一个来源，不能各写一份。"""
+    from app.config.settings import ENV_FILE_NAME
+
+    assert Settings.model_config["env_file"] == ENV_FILE_NAME
+
+
 def test_env_collision_respects_prefix_and_case_insensitive(caplog):
     """env_prefix 参与对账；名字大小写不同仍是同一个变量（Windows 语义）。"""
     from app.config.settings import _warn_on_env_collisions
@@ -405,18 +438,28 @@ def test_extra_keys_are_accepted_not_rejected(tmp_path,monkeypatch):
     无关配置项」直接崩掉启动。注意 `.env` 的键不会进进程环境变量，所以放宽 extra
     并没有放宽配置来源。
 
-    ⚠️ 这里用的键必须是一个**真实存在**的「别人的键」。本用例原先拿 `EMBEDDING_MODEL` 当例子，
-    但它在第 5 步（llm 模块）已经被 `Settings` **正式声明**了 —— 于是它不再进 `__pydantic_extra__`，
-    断言变成 `None == '...'`。这不是回归，而是这条用例的**例子过期了**：
-    凡是「拿某个键举例」的用例，都要在它被正式声明时一起改。
+    ⚠️ 这里用的键必须是一个**真实存在、且当前未被声明**的「别人的键」。本用例原先拿
+    `EMBEDDING_MODEL` 当例子，后来换 `LANGFUSE_HOST` / `RAG_CHUNK_SIZE` —— 它们**都已经在后续
+    步骤里被正式声明**了（`langfuse_host` 是字段名，真正的字段是 `rag_chunk_max_chars`，
+    `rag_chunk_size` 压根不存在）。声明之后它们不再进 `__pydantic_extra__`，断言退化成
+    `None == '...'`。这不是回归，而是这条用例的**例子过期了**：凡是「拿某个键举例」的用例，
+    都要在它被正式声明时一起改。所以这里改用 `API_*`（`app/api/config.py` 的键，本组件不声明，
+    且该模块正是靠 `extra="allow"` + `os.environ` 两条路读它们）。
+
+    另外：断言的是「经 extra 通道拿到的是 .env 里的值」。若同名进程环境变量存在，
+    优先级 env > .env 会让断言拿不到 .env 的值（Windows 用户级变量的老问题，本机实测
+    `LANGFUSE_HOST` 就是被进程环境变量盖掉的）。所以先把这两个键从进程环境里摘掉，
+    让用例只测「.env 的额外键不被拒」这一件事。
     """
     p = tmp_path / ".env"
-    p.write_text("RAG_CHUNK_SIZE=800\nLANGFUSE_HOST=http://localhost:3000\n", encoding="utf-8")
+    p.write_text("API_PREFIX=/v2\nAPI_DEBUG_PAYLOAD=1\n", encoding="utf-8")
     monkeypatch.setenv("LLM_PRIMARY", "deepseek")
+    monkeypatch.delenv("API_PREFIX", raising=False)
+    monkeypatch.delenv("API_DEBUG_PAYLOAD", raising=False)
     s = Settings(_env_file=p)
     extra = s.__pydantic_extra__ or {}
-    assert extra.get("rag_chunk_size") == "800"
-    assert extra.get("langfuse_host") == "http://localhost:3000"
+    assert extra.get("api_prefix") == "/v2"
+    assert extra.get("api_debug_payload") == "1"
 
 
 # --- frozen：配置启动即定型，运行期不得改写 ---

@@ -22,6 +22,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 所以下面那条冲突告警在未配置日志时也是可见的 —— 这正是 fail-loud 的本意。
 logger = logging.getLogger(__name__)
 
+# .env 文件名：同时是「唯一的读取来源」和「告警里对用户说的那个名字」。
+# ⚠️ 必须抽成常量而不是在两处各写一次字面量 ".env"：
+#    告警文案要告诉用户「去哪个文件里改」，如果文案里写死一份、model_config 里
+#    再写死一份，改文件名时就会出现「让你改 A、程序读 B」的错位。
+ENV_FILE_NAME = ".env"
+
 # 敏感字段：只读不打印，repr / 日志里整体脱敏为 **********
 _SENSITIVE_FIELDS = frozenset({"llm_api_key", "langfuse_secret_key", "jwt_secret"})
 
@@ -150,11 +156,28 @@ def _warn_on_env_collisions(
         else:
             shown = raw
 
+        # ⚠️ 「`.env` 里是什么」要一起说出来（本仓实测踩到）：
+        # 只说「环境变量覆盖了 .env」时，人会以为「环境变量是对的」而放过去 ——
+        # 直到某天发现真正生效的是那个已经忘了什么时候设的 OS 变量。
+        # 两类值在这里都不打印（.env 里也可能是真密钥），只给**判据**：
+        #   `.env` 里为空 → 这就是「环境变量在提供这个值」，不是覆盖；
+        #   `.env` 里有值 → 两个值真的不一样，必须自己选一个（见下面的处置建议）。
+        file_empty = not str(file_value).strip()
+        hint = (
+            "`{}` 里这一项是**空的**（所以是环境变量在提供它，不是覆盖）；"
+            "想让 .env 生效就先删掉那个用户/系统环境变量（或改名），"
+            "否则留空就可以"
+        ).format(ENV_FILE_NAME) if file_empty else (
+            "两处的值**真的不同**：改 .env 没用（优先级是 env > .env）；"
+            "要么删掉那个 OS 环境变量，要么把它改成与 .env 一致"
+        )
         logger.warning(
-            "配置冲突：进程环境变量 %s 正在覆盖 .env 中的同名值（生效值: %s）。"
-            "优先级为「环境变量 > .env」，如需以 .env 为准请改环境变量名或调整其值。",
+            "配置冲突：进程环境变量 %s 正在覆盖 %s 中的同名值（生效值: %s）。"
+            "优先级为「环境变量 > .env」。%s",
             key,
+            ENV_FILE_NAME,
             shown,
+            hint,
         )
 
 
@@ -165,7 +188,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE_NAME,
         env_file_encoding="utf-8",
         case_sensitive=False,
         # 配置在启动时定型，运行期不得改写：frozen 会拒绝字段赋值与「静默新增属性」
