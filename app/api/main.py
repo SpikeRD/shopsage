@@ -77,6 +77,22 @@ def _default_checkpointer_factory(backend: CheckpointBackend) -> Callable[[], An
     return factory
 
 
+def replace_runtime_cache(runtime: GraphRuntime, cache: Any) -> GraphRuntime:
+    """给一个 `GraphRuntime` 换上缓存实例（**唯一一处**做这件事）。
+
+    为什么需要它：`create_app(cache=...)` 的语义是「这个 app 的图用这个缓存」，
+    而调用方传进来的 `runtime` 可能只带了自己关心的字段（假模型、假检索）。
+    把「换缓存」写成 `dataclasses.replace` 的一处调用，而不是让每个调用方
+    自己拼一份完整的 `GraphRuntime(...)` —— 后者每加一个字段就要改一遍，
+    而漏掉某个字段的症状是「注入的假模型不见了、测试开始真打厂商 API」。
+
+    `runtime is None` 的分支由调用方处理（那里本来就是 `GraphRuntime()`）。
+    """
+    from dataclasses import replace
+
+    return replace(runtime, cache=cache)
+
+
 def make_graph_factory(checkpointer: Any) -> Callable[[GraphRuntime, deps.Actor], Any]:
     """造「每请求一张图」的工厂（闭包持有 checkpointer 的生命周期）。
 
@@ -128,6 +144,7 @@ def create_app(
     metrics: Any = None,
     telemetry: Any = None,
     queue: Any = None,
+    cache: Any = None,
     probe_timeout_value: float | None = None,
 ) -> FastAPI:
     """装配 FastAPI 应用（**所有外部依赖都可注入** —— 这是离线可测的前提）。
@@ -144,11 +161,19 @@ def create_app(
     | `metrics` | 新 `MetricsRegistry` | 测试注入共享注册表来断言指标 |
     | `telemetry` | 按 `settings` 新建 | 测试注入共享 telemetry 来断言 span（第 11 步） |
     | `queue` | `None` → 走 `REDIS_URL` 的默认队列 | **测试注入内存队列**（第 12 步：离线验入队/幂等/202，不必起 Redis） |
+    | `cache` | `None` → 走 `REDIS_URL` + 缓存表 | **测试注入内存缓存**（第 13 步：离线验命中/失效，不必起 Redis 与缓存表） |
 
     ⚠️ **不把 `llm`/`search` 做成环境变量**：它们是「本次跑图用什么依赖」的语义选择
     （评测要注入假模型、对客要强制闸门），塞进全局配置会让「测试环境」与「生产环境」的行为
     靠环境变量对齐 —— `8.graph.md` §5 已经为同一件事给过理由。第 12 步的 `queue=`
-    是同一类注入点：它换的是「往哪投任务」，而不是「投什么任务」。
+    与第 13 步的 `cache=` 是同一类注入点：前者换的是「往哪投任务」，
+    后者换的是「去哪个缓存里查 / 写」。
+
+    ⚠️ `cache=` 注入与**不注入**的差别只有一处，但它是决定性的：
+    不注入时 `GraphRuntime.cache` 是 `None`，于是 `rag_node` 的缓存闸整段跳过 ——
+    第 10 步的行为逐行不变（既有 1xxx 条用例不受影响）。这与第 12 步「`queue=`
+    不注入时 `create_app` 会去连 `REDIS_URL`」不同，是刻意的：
+    队列是**必需**的（入队接口没有别的实现），而缓存是**优化**（没有它业务照跑）。
     """
     ensure_compatible_event_loop()  # 必须在建事件循环之前（import 期执行）
 
@@ -168,7 +193,26 @@ def create_app(
 
         app.state.settings = settings
         app.state.metrics = metrics if metrics is not None else MetricsRegistry()
-        app.state.graph_runtime = runtime if runtime is not None else GraphRuntime()
+        # ── 第 13 步：缓存也在这里装配（**只建一次**，不是每请求）─────────────
+        # 为什么要在 lifespan 里 `build_cache()` 而不是让 `rag_node` 每次
+        # `default_cache()`：连接池、命中计数、降级状态都是**进程级**的。
+        # 每请求新建一个等于「每次都要 ping 一次 Redis + 命中率永远算不对」
+        # （每个请求自己算自己那一份）。
+        #
+        # ⚠️ 装配顺序：缓存必须在 `GraphRuntime` **之前** —— `runtime.cache` 就是它。
+        active_cache = cache
+        if active_cache is None:
+            from app.cache import build_cache
+
+            active_cache = build_cache()
+        app.state.cache = active_cache
+
+        base_runtime = runtime if runtime is not None else GraphRuntime()
+        app.state.graph_runtime = (
+            base_runtime
+            if runtime is not None and runtime.cache is not None
+            else replace_runtime_cache(base_runtime, active_cache)
+        )
         app.state.probe_timeout = (
             probe_timeout_value if probe_timeout_value is not None else api_config.probe_timeout(settings)
         )
@@ -233,6 +277,11 @@ def create_app(
                 from app.queue import close_default_queues
 
                 await close_default_queues()
+            # 第 13 步：**只关我们自己建的缓存**。注入的缓存不关：它的生命周期归调用方
+            # （用例可能跨多个 app 复用它来断言「第二个 app 仍然命中」）——
+            # 与上面 `queue is None` 的判断是同一条纪律。
+            if cache is None and active_cache is not None:
+                active_cache.close()
             obs.flush()  # 把还在缓冲里的 span 推出去（关服前的最后一件事）
             langfuse_handler().flush()
             reset_request_root(telemetry_token)

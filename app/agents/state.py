@@ -56,6 +56,10 @@ class GraphState(TypedDict, total=False):
 
     第 11 步补上 `rag` / `analysis` 之后，这两组会多出 `docs` 与 `analysis` 的填充者，
     但字段本身不变 —— 这也是「先定契约、后加节点」的价值。
+
+    第 13 步又加了**第五组**（`cached_answer` / `cache_info`），同样不改已有字段：
+    缓存是横切在 rag 与 synthesis 之间的一条缝（rag 写、synthesis 读），
+    而它的证据（「这一轮命中了」）必须能被断言 —— 从一个 `answer` 字符串上是看不出来的。
     """
 
     # ── 输入 ──────────────────────────────────────────────────────────────────
@@ -103,6 +107,35 @@ class GraphState(TypedDict, total=False):
     citations: list[str]
     #: 「为什么没答上」的记录（权限不足/能力未就绪/没有数据），**不许编造答案时用它兜底**。
     refusals: list[str]
+
+    # ── 缓存（第 13 步；只有 rag 节点写，synthesis 读）─────────────────────────
+    #: 语义缓存命中的**整段答案**。命中时 synthesis 直接用它，**不再打模型**（E1 的落点）。
+    #:
+    #: ⚠️ 它为空串与「没有这个键」在图上等价（`total=False` 的语义），
+    #: 所以 `synthesis_node` 的判断是 `if state.get("cached_answer")`。
+    #: 刻意**不放进 `row_meta`**：那是 SQL 执行元信息的字典，混进缓存状态会让
+    #: 「查询耗时多少」这种问题在排障时读到一个不相干的键。
+    cached_answer: str
+    #: 缓存账目：`{"outcome": "hit"|"miss"|"stale"|"bypassed", "age_seconds": …, "detail": …}`。
+    #: 它进 state 的唯一理由是**可断言**：「这一轮用了缓存吗」在测试里必须能一眼看到
+    #: （只看 `answer` 是看不出来的 —— 缓存里的答案与刚生成的答案文本一样）。
+    cache_info: dict[str, Any]
+    #: **这一轮用的检索参数**（`rag` 写、`synthesis` 读回去用于写缓存）。
+    #:
+    #: ⚠️ 为什么它必须在 state 里（而不是让两个节点各自拼一份）：
+    #: 这些参数进缓存的**版本指纹**，两处拼出不同的组合 = 写进去的条永远命中不了。
+    #: 唯一的构造处是 `app/cache/params.retrieval_params`，`rag_node` 调它一次、
+    #: 放进这里，`synthesis` 原样带回去（见 `app/agents/rag.remember_answer` 的说明 ——
+    #: 那条纪律是本仓实测踩坑之后补上的）。
+    cache_params: dict[str, Any]
+    #: 写缓存的**上下文**（`rag` 写、`synthesis` 读）：问题串 / scope / 指纹 / 版本 / 分档 / TTL。
+    #:
+    #: ⚠️ 它必须是**可序列化的字段**（字符串 / 整数 / 简单 dict）：
+    #: LangGraph 的 checkpointer 会对 state 值做 msgpack 序列化，
+    #: 把 `Prepared`（dataclass）放进来会被**静默丢掉**、放闭包会直接抛
+    #: `TypeError: Type is not msgpack serializable: function` ——
+    #: 两种情况的表现都是「缓存写了但永远不命中」（本仓实测踩过，见 `rag.remember_answer`）。
+    cache_context: dict[str, Any]
 
     # ── 护栏（横切）──────────────────────────────────────────────────────────
     #: 输入侧被拦时为 True，第 8 步据此短路后续节点。

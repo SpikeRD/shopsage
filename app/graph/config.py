@@ -104,6 +104,17 @@ class GraphRuntime:
     max_analysis_rows: int = MAX_ANALYSIS_ROWS
     #: 人工审批策略
     interrupts: InterruptPolicy = field(default_factory=InterruptPolicy)
+    #: ── 第 13 步：语义缓存 ──────────────────────────────────────────────────
+    #: 缓存注入点（`app.cache.Cache`）。语义与第 10 步的 `search=` 完全一样：
+    #:   * `None` → 走生产实现（`app.cache.default_cache()`，会连 Redis 与业务库）；
+    #:   * 传一个实例 → 测试/演示用内存后端（**不碰任何真依赖**）。
+    #:
+    #: ⚠️ 为什么它是 `Any` 而不是 `Cache | None`：`app.cache` 会 import
+    #: `app.observability`，而本模块（`graph/config.py`）被第 8 步的**所有**图用例
+    #: import —— 在配置模块顶层拖进一个缓存包的 import，等于让「只想跑图结构断言」
+    #: 的用例也付一次 `app.cache`（连带 `app.llm`、`app.observability`）的 import 代价。
+    #: 注入点的类型标注价值远小于「图配置保持零依赖」这条纪律。
+    cache: Any = None
 
 
 __all__ = [

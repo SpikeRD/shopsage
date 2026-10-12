@@ -19,8 +19,13 @@
 * `RAG_TABLES`（第 10 步）：向量库三张表，**纯 DDL 建的**（`vector(n)` / `tsvector` /
   HNSW / GIN / PL/pgSQL 触发器），刻意没有等价的 SQLAlchemy 模型 ——
   用 ORM 类型重写一遍 pgvector 与 tsvector 只会多一份可能漂移的「第二真相」。
+* `CACHE_TABLES`（第 13 步）：缓存的两张表，与 RAG 同一类原因
+  （`vector(n)` + HNSW + 单行版本表）。⚠️ 与上面两类**不同**的是：
+  排除它保护的不是「会话状态/知识库」，而是「**缓存与知识库版本号**」——
+  一次误删的后果是「所有缓存失效 + 版本号归 1」，业务照跑但成本会跳一下，
+  所以它排第三档，但它同样**不该**出现在自动生成的 `drop_table` 里。
 
-不排除的后果对两类都一样：`alembic revision --autogenerate` 会生成一串
+不排除的后果对三类都一样：`alembic revision --autogenerate` 会生成一串
 `op.drop_table(...)`，它在评审里长得完全像一次正常的清理，跑下去就是
 **把会话状态与整个知识库删掉**。`tests/test_db_migrations.py` 有一组用例钉住这条。
 """
@@ -29,10 +34,13 @@ from __future__ import annotations
 
 from typing import Any, Final
 
+from app.cache.schema import CACHE_TABLES
 from app.graph.checkpointer import CHECKPOINT_TABLES
 from app.rag.schema import RAG_TABLES
 
-EXCLUDED_TABLES: Final[tuple[str, ...]] = tuple(CHECKPOINT_TABLES) + tuple(RAG_TABLES)
+EXCLUDED_TABLES: Final[tuple[str, ...]] = (
+    tuple(CHECKPOINT_TABLES) + tuple(RAG_TABLES) + tuple(CACHE_TABLES)
+)
 
 
 def is_excluded_from_autogenerate(object_: Any, name: str | None = None, type_: str | None = None) -> bool:

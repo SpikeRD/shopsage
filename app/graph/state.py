@@ -108,6 +108,20 @@ class GraphStateDoc(TypedDict, total=False):
     guardrail_rules: Annotated[list[str], LastValue]
     guardrail_message: Annotated[str, LastValue]
 
+    # ── 缓存（第 13 步；rag 写、synthesis 读）──────────────────────────────────
+    #: 语义缓存命中的整段答案（synthesis 看到它就跳过模型调用）。
+    cached_answer: Annotated[str, LastValue]
+    #: 缓存账目（`outcome` / `age_seconds` / `detail`…）—— 「这一轮用了缓存吗」的唯一证据。
+    cache_info: Annotated[dict[str, Any], LastValue]
+    #: 这一轮用的检索参数（`rag` 写、`synthesis` 读回去写缓存）—— 见 `app/agents/state.py`。
+    cache_params: Annotated[dict[str, Any], LastValue]
+    #: 写缓存的上下文（`rag` 写、`synthesis` 读）—— 见 `app/agents/state.py`。
+    #:
+    #: ⚠️ 它必须是**可序列化的字段**：LangGraph 的 checkpointer 对 state 值做 msgpack
+    #: 序列化，放 `Prepared`（dataclass）会被静默丢掉、放闭包会直接抛
+    #: `TypeError: Type is not msgpack serializable: function`（本仓实测）。
+    cache_context: Annotated[dict[str, Any], LastValue]
+
 
 class GraphState(GraphStateDoc, total=False):  # type: ignore[misc]
     """对外暴露的名字（`8.graph.md` §2 的那一行 import）。

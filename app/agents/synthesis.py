@@ -31,7 +31,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 from app.agents.agent_llm import JsonLLM, build_system_prompt, format_rows, generate_json
-from app.agents.rag import docs_to_prompt_block
+from app.agents.rag import docs_to_prompt_block, remember_answer
 from app.agents.state import GraphState, last_user_message, permissions_of, role_of
 from app.security.rbac import (
     PERM_READ_ALL_ORDERS,
@@ -225,13 +225,44 @@ def resolve_citations(cited: Any, index: Sequence[Mapping[str, Any]]) -> list[st
     return found
 
 
-async def synthesis_node(state: GraphState, *, llm: JsonLLM | None = None) -> dict[str, Any]:
+async def synthesis_node(
+    state: GraphState,
+    *,
+    llm: JsonLLM | None = None,
+    cache: Any = None,
+) -> dict[str, Any]:
     """图节点：合成最终回答，写 `answer` + `citations`。
+
+    ## 第 13 步：命中缓存时**不打模型**
+
+    `state["cached_answer"]` 非空（`rag_node` 命中语义缓存时写入）就直接返回它。
+    这一步是 E1（成本下降）的真正落点：命中时省掉的是
+    「embedding + 向量检索 + 关键词检索 + rerank + 一次上千 token 的生成」。
+
+    ⚠️ 这里**只跳过模型调用，不跳过护栏**：输出侧护栏（`guardrail_output`）
+    是图上的下一个节点，它对缓存答案一视同仁 —— 否则「缓存成了一个绕过合规审查的后门」
+    （而它看起来完全正常：缓存里的答案当初是通过审查的）。
+    也就是说：缓存答案要过**两遍**审查（写入那次 + 命中那次），这是刻意的。
 
     ⚠️ **不在这里塞「抱歉我没答上」的模板兜底**：那属于第 8 步的图级兜底
     （节点异常/被护栏拦下时的出口）。若这里也写一份，就会出现两处「拒答话术」，
     改一处忘一处；更糟的是本节点若在材料为空时自顾自编一段，`refusals` 就白记了。
     """
+    cached = str(state.get("cached_answer") or "")
+    if cached:
+        citations = [str(item) for item in (state.get("citations") or [])]
+        logger.info(
+            "synthesis 用缓存答案（跳过模型调用）：chars=%d citations=%d outcome=%s",
+            len(cached),
+            len(citations),
+            (state.get("cache_info") or {}).get("outcome"),
+        )
+        return {
+            "answer": cached,
+            "citations": citations,
+            "cache_info": {**(state.get("cache_info") or {}), "cached_answer_used": True},
+        }
+
     role = role_of(state)
     permissions = permissions_of(state)
     template, _ = role_template(role, permissions)
@@ -258,7 +289,16 @@ async def synthesis_node(state: GraphState, *, llm: JsonLLM | None = None) -> di
         len(answer),
         len(citations),
     )
-    return {"answer": answer, "citations": citations}
+    out: dict[str, Any] = {"answer": answer, "citations": citations}
+    if cache is not None:
+        # 生成之后写缓存（**只有真的从模型拿到回答才写** —— 空回答由上面的 raise 拦住）。
+        # ⚠️ 写用的上下文来自 `state["cache_context"]` —— 那是 `rag_node` 在读缓存那一刻
+        # 留下的**可序列化字段**（问题串 / scope / 指纹 / 版本 / 分档 / TTL）。
+        # 用「当前的 messages」去写是不行的：图会在本节点之后把这一轮追加进历史。
+        write = await remember_answer(state, answer, cache=cache, citations=citations)
+        if write is not None:
+            out["cache_info"] = {**(state.get("cache_info") or {}), "write": write.summary()}
+    return out
 
 
 __all__ = [

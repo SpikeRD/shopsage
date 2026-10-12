@@ -64,6 +64,15 @@ WRITE_PRIVILEGES = ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRI
 # `permission denied for table rag_documents` —— 而报错离「少了一次 GRANT」很远。
 RAG_TABLES = ("rag_documents", "rag_chunks", "rag_corpus_stats")
 
+# 第 13 步（cache）的两张表。**为什么只读角色需要它们的 SELECT**：
+# `app/cache/stores.PostgresEntryStore` 与 `app/cache/corpus.PostgresRevisionStore`
+# 的**读路径**都走 `get_read_engine()`（= 只读角色）—— 与 RAG 同一口径：
+# 缓存查询是读操作，顺手证明「读缓存不会写库」。
+# ⚠️ 写路径（`put` / `bump`）走写引擎，所以缓存**不会**因为这次只读授权而失去写能力；
+# 反过来，漏了这次授权也不会报错 —— 症状是「缓存永远不命中」（读被拒 → fail-open 成 miss），
+# 而那看起来只像「阈值调高了」。`test_cache_db.py` 有一组用例钉住这条。
+CACHE_TABLES = ("cache_semantic_entries", "cache_corpus_versions")
+
 
 def _admin_dsn() -> str:
     """用**写**角色连接（建角色、授权都需要管理权限）。"""
@@ -104,7 +113,7 @@ def regrant(role: str = READONLY_ROLE) -> list[str]:
     `permission denied for table orders` 而红。所以「建表之后要重放授权」必须是个
     **可重复调用的一等操作**，而不是靠人记得再跑一次 bootstrap。
     """
-    targets = _existing_tables(BUSINESS_TABLES + RAG_TABLES)
+    targets = _existing_tables(BUSINESS_TABLES + RAG_TABLES + CACHE_TABLES)
     with psycopg.connect(_admin_dsn(), autocommit=True) as conn, conn.cursor() as cur:
         for table in targets:
             cur.execute(
@@ -180,8 +189,8 @@ def bootstrap(password: str, *, downgrade_superuser: bool = False) -> str:
         )
         print(f"[2/5] CONNECT on {db_name} + USAGE on schema public 已授权")
 
-        # ③ 8 张业务表 + 3 张向量表的 SELECT（逐表授权，顺便把「白名单表」变成可核对的清单）
-        read_tables = list(sorted(BUSINESS_TABLES)) + _existing_tables(RAG_TABLES)
+        # ③ 8 张业务表 + 3 张向量表 + 2 张缓存表的 SELECT（逐表授权，顺便把「白名单表」变成可核对的清单）
+        read_tables = list(sorted(BUSINESS_TABLES)) + _existing_tables(RAG_TABLES + CACHE_TABLES)
         for table in read_tables:
             cur.execute(
                 sql.SQL("GRANT SELECT ON TABLE {tbl} TO {role}").format(
@@ -270,7 +279,8 @@ def verify() -> int:
         # ⚠️ 必须**逐表**试读：`GRANT SELECT` 是挂在表对象上的，表被 DROP 重建后授权会一起消失。
         # 只抽查一张表会漏掉「别的表没授权」这种状态（实测踩过：迁移回环之后只有部分表读不了）。
         # 第 10 步起把向量表也算进来：检索走的就是这条只读连接。
-        check_tables = sorted(BUSINESS_TABLES) + _existing_tables(RAG_TABLES)
+        # 第 13 步再把两张缓存表加进来：缓存查询走的也是它。
+        check_tables = sorted(BUSINESS_TABLES) + _existing_tables(RAG_TABLES + CACHE_TABLES)
         unreadable: list[str] = []
         readable = 0
         for candidate in check_tables:

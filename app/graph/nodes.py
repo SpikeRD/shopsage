@@ -249,11 +249,16 @@ def make_data(runtime: GraphRuntime) -> Any:
 
 
 def make_rag(runtime: GraphRuntime) -> Any:
-    """检索节点：未接真实后端时落 `refusals`（不假装「检不到」）。"""
+    """检索节点：未接真实后端时落 `refusals`（不假装「检不到」）；第 13 步起先查缓存。"""
 
     async def node(state: AgentGraphState) -> dict[str, Any]:
         return await rag_node(
-            state, search=runtime.search, top_k=runtime.top_k, min_score=runtime.min_score
+            state,
+            search=runtime.search,
+            top_k=runtime.top_k,
+            min_score=runtime.min_score,
+            # `runtime.cache is None` 时 `rag_node` 的行为与第 10 步逐行相同
+            cache=runtime.cache,
         )
 
     return safe_node(_named(node, NODE_RAG))
@@ -269,10 +274,16 @@ def make_analysis(runtime: GraphRuntime) -> Any:
 
 
 def make_synthesis(runtime: GraphRuntime) -> Any:
-    """合成节点：按角色三套模板，写 `answer` + `citations`。"""
+    """合成节点：按角色三套模板，写 `answer` + `citations`；缓存命中时直接返回。
+
+    ⚠️ 这里**不传** `top_k` / `search` 之类的检索参数：写缓存要用的那一组
+    由 `rag_node` 放进 `state["cache_params"]`（唯一的构造处是
+    `app/cache/params.retrieval_params`）—— 两处各拼一份参数会让读写指纹不一致，
+    而症状是「写了但永远不命中」（本仓实测踩过，见 `remember_answer` 的说明）。
+    """
 
     async def node(state: AgentGraphState) -> dict[str, Any]:
-        return await synthesis_node(state, llm=runtime.llm)
+        return await synthesis_node(state, llm=runtime.llm, cache=runtime.cache)
 
     return safe_node(_named(node, NODE_SYNTHESIS))
 

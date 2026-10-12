@@ -535,6 +535,37 @@ QUEUE_DLQ_PENDING: Final = f"{NAMESPACE}_queue_dead_letter_pending"
 #: 与上一条的区别是**这个才值得告警**：条数多可能只是刚发生一批抖动，
 #: 而「最老的躺了三天」意味着人工兜底流程根本没人在走（A1 失效）。
 QUEUE_DLQ_OLDEST: Final = f"{NAMESPACE}_queue_dead_letter_oldest_seconds"
+#: 缓存的结果计数（counter，标签 `outcome` / `policy`，第 13 步）。
+#:
+#: ⚠️ **`miss` 才是要注意的那个**：命中率是「省钱了多少」的代理指标（E1），
+#: 而「miss 突然变多」有两类完全不同的原因 ——
+#: ① 阈值调高了 / 知识库版本变了（**缓存被正确地失效了**，是好事）；
+#: ② Redis 挂了、回落成了每个副本一份的内存缓存（**故障**，命中率被副本数除）。
+#: 两者看同一条曲线（都在掉），所以本指标必须与 `CACHE_DEGRADED` 一起看。
+CACHE_RESULTS: Final = f"{NAMESPACE}_cache_results_total"
+#: 缓存查询耗时（histogram，快桶；标签 `outcome`）。它回答「缓存有没有反而拖慢主路径」。
+CACHE_LOOKUP_DURATION: Final = f"{NAMESPACE}_cache_lookup_seconds"
+#: LLM 调用被缓存省下的次数（counter，标签 `policy`，第 13 步）。
+#:
+#: 为什么单独一条而不是从 `CACHE_RESULTS{outcome="hit"}` 里推：
+#: 命中**不等于**省下一次 LLM 调用 —— 命中的可能是「检索结果」这类中间产物
+#: （那省的是检索而不是生成）。E1（成本下降）要的是后者，所以让「省下的是哪一层」
+#: 由写入方显式声明，而不是让看板去猜。
+CACHE_SAVED_CALLS: Final = f"{NAMESPACE}_cache_saved_calls_total"
+#: 缓存存储处于降级形态（gauge，0/1，标签 `store`，第 13 步）。
+#:
+#: 这条 gauge 存在的唯一理由是「降级不能静默」：Redis 挂掉之后缓存照常工作
+#: （回落进程内存），如果不把这件事变成一个可告警的数字，症状就只剩
+#: 「命中率悄悄掉了一个数量级」，而那时已经很难把因果连起来了。
+CACHE_DEGRADED: Final = f"{NAMESPACE}_cache_degraded"
+#: 缓存条目数（gauge，标签 `store`，第 13 步）：回答「缓存里现在有多少东西」。
+CACHE_ENTRIES: Final = f"{NAMESPACE}_cache_entries"
+#: 语义相似度落在灰区（`floor <= sim < threshold`）的次数（counter，第 13 步）。
+#:
+#: 灰区 = 「像，但不敢答」。它是**阈值校准**的唯一在线信号：
+#: 灰区计数高而命中低 → 阈值偏高（可以降一点，但要去第 14 步用 golden set 验）；
+#: 命中高而灰区里出现了本不该命中的样本 → 阈值偏低。
+CACHE_NEAR_MISS: Final = f"{NAMESPACE}_cache_near_miss_total"
 
 #: 进程级默认实例（唯一一份被 `/metrics` 渲染的指标）。
 _DEFAULT: Metrics | None = None
@@ -622,6 +653,12 @@ def buckets_of(metrics: Metrics, series: str) -> Sequence[float]:
 
 __all__ = [
     "AGENT_DURATION",
+    "CACHE_DEGRADED",
+    "CACHE_ENTRIES",
+    "CACHE_LOOKUP_DURATION",
+    "CACHE_NEAR_MISS",
+    "CACHE_RESULTS",
+    "CACHE_SAVED_CALLS",
     "CONTENT_TYPE",
     "DEFAULT_SETTINGS",
     "LLM_COST",

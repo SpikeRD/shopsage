@@ -153,6 +153,7 @@ async def ingest_document(
     embedder: Embedder | None = None,
     force: bool = False,
     now: Any = None,
+    on_change: Callable[[IngestReport], None] | None = None,
 ) -> IngestReport:
     """把一份文档增量灌入知识库（`10.rag.md` 第 2 节的 `ingest_document`）。
 
@@ -163,6 +164,22 @@ async def ingest_document(
         strategy: 强制分块策略（`None` = 按 `RAG_CHUNK_*` 与内容自动判断）。
         force:    即使文档指纹没变也走一遍 upsert（默认 `False` —— 这才是「增量」）。
         now:      注入时间戳（测试断言 `updated_at` 用；`None` = 数据库 `now()`）。
+        on_change: **第 13 步新增**：真正改动发生之后的回调（签名收 `IngestReport`）。
+                   `app/cache` 用它推进知识库版本，从而让语义缓存整批失效
+                   （`13.cache.md` §5 的第三级失效）。
+
+    ## 为什么回调签名收的是「报告」而不是「几个数字」
+
+    回调需要的信息（source / version / 有没有真的变）**全在报告里**，
+    而报告是这次入库的**结论**，不是它的输入。让回调收 `(source, version)` 意味着
+    调用方要自己判断「这次算不算变」—— 那就有两处判断，迟早漂移
+    （症状是「某个路径下知识库更新了但缓存没失效」，而它只在特定入口出现）。
+
+    ## 回调**失败不影响入库**
+
+    入库成功了，而缓存版本没推进 —— 这不是一回事。所以回调异常会被吞掉并打 WARNING，
+    外加一条进 `report.warnings`（这样「缓存为什么没失效」在入库的返回值里就能看到，
+    不必去翻日志）。这是刻意的非对称处置：**入库是主路径，缓存失效是配套动作**。
 
     返回 `IngestReport`；`action` 是 `created/updated/unchanged` 三态。
     """
@@ -285,6 +302,17 @@ async def ingest_document(
         len(pending),
         report.elapsed_ms,
     )
+    # ── 第 13 步：知识库变更之后推进缓存版本（第三级失效的触发点）──────────
+    # 只在**真的改动了**的时候调（`report.doc_changed`）：跑一次同步但什么都没变
+    # 也会 bump 一次版本，那会把整份缓存白清一遍 —— 而它看起来只是「命中率偶尔掉一下」。
+    if on_change is not None and report.doc_changed:
+        try:
+            on_change(report)
+        except Exception as exc:  # noqa: BLE001 - 缓存侧的问题不该让入库失败
+            logger.warning("入库后的 on_change 回调失败（入库本身已成功）：%s: %s", type(exc).__name__, exc)
+            report.warnings.append(
+                f"知识库变更回调失败（语义缓存可能未失效，靠 TTL 兜底）：{type(exc).__name__}: {exc}"
+            )
     return report
 
 

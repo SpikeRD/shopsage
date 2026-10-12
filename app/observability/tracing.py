@@ -127,6 +127,18 @@ ALLOWED_ATTRIBUTES: Final[frozenset[str]] = frozenset(
         "outcome",
         "backend",
         "retrieval_legs",
+        # ── 第 13 步（缓存）补的四个键 ──────────────────────────────────────
+        # 为什么要新增而不是复用已有的 `cache` / `outcome`：
+        # ① `cache` 的消费者是「检索腿是否来自缓存」，而这里要说的是**这一次查询的结论**
+        #    （hit / miss / stale / bypassed）—— 两者同时出现在一条 `retrieval` span 上，
+        #    合成一个键会让「缓存命中了但检索腿没用它」这类矛盾无法表达；
+        # ② `outcome` 是工具结局（created / truncated…）的键，值的取值域完全不同。
+        # 四个键都是**低基数**（outcome 5 个取值、policy 3 个、hit 布尔、fingerprint 16 位 hex
+        # 每版本一个）—— 基数纪律没有被破坏。
+        "cache_outcome",
+        "cache_policy",
+        "cache_hit",
+        "cache_fingerprint",
     }
 )
 

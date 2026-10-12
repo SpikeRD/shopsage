@@ -194,13 +194,70 @@ def observability_component(request: Request) -> ComponentHealth:
     )
 
 
+def cache_component(request: Request) -> ComponentHealth:
+    """缓存组件的状态（第 13 步）。
+
+    ## 为什么缓存也需要一个 `/health` 组件
+
+    它**永远不会让服务不可用**（缓存是优化：挂了业务照跑，只是慢一点、贵一点）。
+    但它有一个**必须被看见**的降级形态：Redis 挂掉之后缓存会回落到「每个进程一份」的内存，
+    于是多副本部署下命中率被副本数除 —— 而业务侧完全看不出来
+    （接口照常返回、日志只有一条 WARNING）。
+
+    ## 四种状态分别在说什么
+
+    | 状态 | 含义 | 该不该处理 |
+    |---|---|---|
+    | `ok` | 条目存储与预期一致（Postgres 表在 / Redis 通） | 不用 |
+    | `skipped` | 缓存没装配（没走 `create_app` 的 lifespan？） | 不用（业务不受影响） |
+    | `degraded` | **存储降级了**（回落进程内存 / 缓存表不存在） | 要查：命中率会悄悄掉 |
+    | `down` | 配置本身不合法（阈值/策略写错） | 要查：它会让缓存要么永不命中、要么答错问题 |
+
+    ⚠️ 「配置不合法」为什么算 `down` 而不是 `degraded`：阈值写反（`floor > threshold`）
+    会让缓存**永远不命中**（成本白花），而 `time_sensitive_policy` 写成别的值
+    可能让强时效数据被缓存（**答错**）。这两件事都比「慢一点」严重，
+    所以它必须比 `degraded` 更醒目。
+    """
+    cache = getattr(request.app.state, "cache", None)
+    if cache is None:
+        return ComponentHealth(
+            name="cache",
+            status="skipped",
+            detail="语义缓存未装配（业务不受影响，只是每次问答都要走完整链路）",
+        )
+    try:
+        state = cache.health()
+    except Exception as exc:  # noqa: BLE001 - 探活失败也要给一句能读的话
+        return ComponentHealth(
+            name="cache",
+            status="degraded",
+            detail=f"缓存自检失败（{type(exc).__name__}）：{exc}",
+        )
+    problems = list(state.problems)
+    if problems:
+        return ComponentHealth(name="cache", status="down", detail="；".join(problems))
+    stats = state.stats
+    detail = (
+        f"存储={state.store}"
+        f"{'（**降级**：Redis 不可用，回落进程内存 —— 命中率会被副本数除）' if state.degraded else ''}；"
+        f"条目={state.entry_store.get('entries', '?')}；"
+        f"本轮命中/未命中/失效={stats.get('hit', 0)}/{stats.get('miss', 0)}/{stats.get('stale', 0)}"
+    )
+    return ComponentHealth(
+        name="cache", status="degraded" if state.degraded else "ok", detail=detail
+    )
+
+
 @router.get("/health", response_model=HealthResponse, summary="健康检查（依赖状态在 body 里）")
 def health(request: Request) -> HealthResponse:
-    """探活：**恒 200**，依赖状态写在 `components`（理由见模块 docstring）。"""
     settings = getattr(request.app.state, "settings", None)
     timeout = float(getattr(request.app.state, "probe_timeout", None) or DEFAULT_PROBE_TIMEOUT)
 
-    components: list[ComponentHealth] = [rate_limit_component(request), observability_component(request)]
+    components: list[ComponentHealth] = [
+        rate_limit_component(request),
+        observability_component(request),
+        cache_component(request),
+    ]
     targets: list[Endpoint | None] = [
         endpoint_from_url(getattr(settings, "database_url", ""), name="postgres", default_port=5432),
         # ⚠️ Redis 是 `required=False`：本项目的 Redis 用途全是**优化**（限流计数、未来的
