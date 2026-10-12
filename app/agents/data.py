@@ -105,12 +105,24 @@ def schema_text() -> str:
     `address` / `id_card` 与 `stock_movements.operator_id` 一律写不进 SQL（守卫会拒），
     列进 prompt 只会让模型反复尝试、白白消耗重试预算。
     **不列 ≠ 不拦**：真正的拒绝在 `validate_sql` 里（这一处只是减少无效尝试）。
+
+    ⚠️ **只列业务表**（`models.BUSINESS_MODELS`），不是「`Base.metadata` 里的全部表」：
+    第 12 步加了 `queue_dead_letters`（死信表），它**不在** `policy.ALLOWED_TABLES` 里 ——
+    若按 metadata 全量渲染，模型会看到一张守卫**一定会拒**的表，
+    于是它可能生成 `SELECT ... FROM queue_dead_letters` 并被 `SQLSecurityError` 拦下，
+    白烧一次尝试预算。第一版就是全量渲染，加了队列表之后
+    `tests/test_agents_data.py::test_schema_text_lists_all_allowed_tables` 立刻红
+    （它断言「schema 的行数 == 可查表数量」）——那条用例正是为这种腐烂写的。
     """
     from app.db.base import Base
+    from app.db.models import BUSINESS_MODELS
     import app.db.models  # noqa: F401 - 触发模型注册（否则 Base.metadata 是空的）
 
+    business_tables = {model.__tablename__ for model in BUSINESS_MODELS}
     lines: list[str] = []
     for table in sorted(Base.metadata.tables.values(), key=lambda t: t.name):
+        if table.name not in business_tables:
+            continue  # 基础设施表（死信表等）不进 prompt（理由见 docstring）
         protected = PROTECTED_COLUMNS.get(table.name, frozenset())
         columns = [
             c.name for c in table.columns if c.name not in protected and c.name not in HIDDEN_COLUMNS

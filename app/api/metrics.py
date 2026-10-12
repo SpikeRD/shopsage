@@ -89,6 +89,18 @@ class MetricsRegistry:
     def observe(self, name: str, seconds: float, labels: Mapping[str, str] | None = None) -> None:
         self.metrics.observe(name, seconds, labels)
 
+    def gauge(self, name: str, value: float, labels: Mapping[str, str] | None = None) -> None:
+        """设一个 gauge（第 12 步加的第三个写入口：队列积压、待处理死信）。
+
+        ⚠️ 为什么它不是「顺手加的」：第 9 步只有 `counter()` / `observe()` 两个入口，
+        而队列的「现在积压多少」既不是累计量也不是耗时 —— 用 counter 记它会得到
+        「积压增长速率」，用 observe 记它会得到「每次观测到的积压的分位数」。
+        两者都是**看起来正常、实际答非所问**的曲线，所以这一层必须显式多一个入口。
+        签名的参数顺序（name, value, labels）与 `observe` 保持一致，
+        但 `value` 是位置参数（gauge 没有「单位」约定，不能像秒那样有默认值）。
+        """
+        self.metrics.gauge(name, value, labels)
+
     # ── 读 ───────────────────────────────────────────────────────────────────
     def render(self) -> str:
         """渲染 Prometheus 文本格式（**唯一的渲染实现**在 `observability.metrics`）。"""
@@ -100,13 +112,21 @@ class MetricsRegistry:
         保持第 9 步的形状（`{"counters": {...}, "histograms": {...}}` 且每个直方图带
         `count` / `sum`）：那是 `tests/api/*` 与演示脚本已经在用的读口，
         换掉形状的收益是零，代价是所有调用方都要改一遍。
+
+        `gauges` 是第 12 步**追加**的第三个键（不是替换）：队列的「当前积压」
+        必须能被读出来（`GET /api/tasks/queue` 与验收脚本都断言它），
+        而把它塞进 `counters` 会让「当前值」与「累计值」在同一个字典里混住。
         """
         raw = self.metrics.snapshot()
         histograms = {
             key: {"count": entry["count"], "sum": entry["sum"]}
             for key, entry in raw["histograms"].items()
         }
-        return {"counters": raw["counters"], "histograms": histograms}
+        return {
+            "counters": raw["counters"],
+            "histograms": histograms,
+            "gauges": dict(raw.get("gauges") or {}),
+        }
 
     def reset(self) -> None:
         self.metrics.reset()

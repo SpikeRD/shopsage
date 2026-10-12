@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 #: 用 `setdefault` 而不是赋值：给运维留一个「就是要那族指标」的覆盖口。
 os.environ.setdefault("PROMETHEUS_DISABLE_CREATED_SERIES", "true")
 
-from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest  # noqa: E402
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest  # noqa: E402
 
 #: 指标名前缀。与第 9 步的 `shopsage_api_*` 兼容：业务侧指标都在一起，
 #: 前缀只区分「哪一层产生的」（`shopsage_api_*` = HTTP 层，本模块 = 图/LLM/工具层）。
@@ -139,6 +139,7 @@ class Metrics:
         self._lock = threading.Lock()
         self._counters: dict[str, Counter] = {}
         self._histograms: dict[str, Histogram] = {}
+        self._gauges: dict[str, Gauge] = {}
 
     # ── 写入口 ───────────────────────────────────────────────────────────────
     def counter(self, name: str, labels: Mapping[str, str] | None = None, *, value: float = 1.0) -> None:
@@ -159,6 +160,30 @@ class Metrics:
             return
         self._obs(self._histogram_name(name), self._normalize(labels), seconds)
 
+    def gauge(self, name: str, value: float, labels: Mapping[str, str] | None = None) -> None:
+        """把 `name` 这个 gauge **设成** `value`（当前值，可以升也可以降）。
+
+        ⚠️ 三个不能混用的语义，写错任何一个都会得到一条**看起来正常**的曲线：
+
+        | 语义 | 方法 | 例子 |
+        |---|---|---|
+        | 「发生了 N 次」（只增） | `counter()` | 入队了几笔、失败了几笔 |
+        | 「一次花了多久」 | `observe()` | 单任务耗时（→ 分位数） |
+        | 「现在是多少」（可升可降） | **`gauge()`** | 队列积压、待处理死信、最老死信躺了多久 |
+
+        用 `counter()` 记积压是**最常见的错**：`rate()` 之后它会变成「积压增长速率」，
+        看起来像一条合法曲线，而「现在积压多少」这个问题永远答不出来
+        （这也是为什么 `QUEUE_DEPTH` 必须有一条自己的写入口 —— 第 11 步只留了常量，
+        本步把它接上）。
+
+        `NaN` / `inf` 直接丢弃：`prometheus_client` 对它们会写出一个 Prometheus
+        无法解析的文本行（整个 scrape 失败），而调用方那边完全看不出问题。
+        """
+        number = float(value)
+        if not math.isfinite(number):
+            return
+        self._set(self._gauge_name(name), self._normalize(labels), number)
+
     def _inc(self, name: str, labels: dict[str, str], value: float) -> None:
         try:
             child = self._counter(name, tuple(labels)).labels(**labels) if labels else self._counter(name, ())
@@ -175,6 +200,15 @@ class Metrics:
             _warn("histogram", name, exc)
             return
         child.observe(seconds)
+
+    def _set(self, name: str, labels: dict[str, str], value: float) -> None:
+        try:
+            gauge = self._gauge(name, tuple(labels))
+            child = gauge.labels(**labels) if labels else gauge
+        except (ValueError, TypeError) as exc:  # noqa: BLE001
+            _warn("gauge", name, exc)
+            return
+        child.set(value)
 
     # ── 内部：collector 的建/取（**标签名在首见时定型**，见 `LABEL_SPECS`）────────
     def _counter(self, name: str, labelnames: tuple[str, ...]) -> Counter:
@@ -194,6 +228,35 @@ class Metrics:
         """把名字规整成 `<...>_seconds`（理由见 `observe`）。"""
         return name if name.endswith("_seconds") else f"{name}_seconds"
 
+    def _gauge_name(self, name: str) -> str:
+        """gauge 的名字**保持原样**（不加后缀）。
+
+        ⚠️ 与直方图相反，这里**不能**自动补后缀：`shopsage_queue_depth` 补成
+        `_seconds` 会变成一条语义完全错误的序列，而 `prometheus_client` 的
+        `Gauge('shopsage_queue_depth_gauge', ...)` 在**对外暴露时**会去掉 `_gauge` 后缀
+        （那是库自己的命名约定），于是「我怎么写名字」与「抓到的名字」不再一致 ——
+        对一个要写进 Grafana 查询的量来说，这是最不该有的不确定性。
+        """
+        return name
+
+    def _collector_kinds(self) -> dict[str, str]:
+        """`{样本名: 类型}`（`counter` / `histogram` / `gauge`），来自 collector 自己。
+
+        ⚠️ 为什么不用「名字后缀」猜：`prometheus_client` 的样本名里**没有类型信息**，
+        而 gauge 与 counter 的名字形状可以一模一样（`shopsage_queue_depth` 两种都合法）。
+        猜错的后果不是报错，而是 gauge 的值悄悄出现在 `snapshot()["counters"]` 里 ——
+        一个「当前积压」被读成「累计入队数」，而两条曲线看起来都很正常。
+        所以这里直接问 `metric.type`（collector 的公开属性）。
+        """
+        kinds: dict[str, str] = {}
+        for metric in self.registry.collect():
+            kind = str(getattr(metric, "type", "") or "")
+            if kind not in ("counter", "histogram", "gauge"):
+                continue
+            for sample in metric.samples:
+                kinds[sample.name] = kind
+        return kinds
+
     def _histogram(self, name: str, labelnames: tuple[str, ...]) -> Histogram:
         with self._lock:
             existing = self._histograms.get(name)
@@ -212,6 +275,19 @@ class Metrics:
                     buckets=buckets,
                 )
                 self._histograms[name] = existing
+            return existing
+
+    def _gauge(self, name: str, labelnames: tuple[str, ...]) -> Gauge:
+        with self._lock:
+            existing = self._gauges.get(name)
+            if existing is None:
+                existing = Gauge(
+                    name,
+                    f"shopsage 自采 gauge（瞬时值）：{name}",
+                    labelnames,
+                    registry=self.registry,
+                )
+                self._gauges[name] = existing
             return existing
 
     def _normalize(self, labels: Mapping[str, str] | None) -> dict[str, str]:
@@ -244,8 +320,16 @@ class Metrics:
         """
         counters: dict[str, float] = {}
         histograms: dict[str, dict[str, Any]] = {}
+        gauges: dict[str, float] = {}
+        # 类型问 collector 自己，不靠名字猜（理由见 `_collector_kinds`）
+        kinds = self._collector_kinds()
         for metric in self.registry.collect():
             for sample in metric.samples:
+                if kinds.get(sample.name) == "gauge":
+                    # ⚠️ gauge 必须与直方图/计数器**分开收**：否则「当前积压」会与
+                    # 「累计入队数」混在同一个字典里，而两条曲线看起来都很正常。
+                    gauges[_series_key(sample.name, {k: v for k, v in sample.labels.items()})] = sample.value
+                    continue
                 # 一个直方图的全部样本（`_bucket` / `_count` / `_sum`）**必须聚到同一个键**，
                 # 否则分位数会从一半数据里算出一个看似合理的数字（最难查的一类错）。
                 # 所以键取「去掉后缀、且去掉 `le` 标签」之后的系列名。
@@ -264,7 +348,17 @@ class Metrics:
                         entry["buckets"][float(bound)] = sample.value
                 elif kind in ("count", "sum"):
                     entry[kind] = sample.value
-        return {"counters": counters, "histograms": histograms}
+        return {"counters": counters, "histograms": histograms, "gauges": gauges}
+
+    def gauge_value(self, series: str) -> float | None:
+        """读一个 gauge 的当前值（演示脚本与用例用；**不放请求路径**）。
+
+        `series` 可以是裸名字（`shopsage_queue_depth`）或带标签的键
+        （`shopsage_queue_jobs_total{function="x"}`）—— 与 `histogram_quantile` 同一口径。
+        """
+        snap = self.snapshot()["gauges"]
+        key = next((k for k in snap if k == series or k.startswith(f"{series}{{")), None)
+        return None if key is None else float(snap[key])
 
     def histogram_quantile(self, series: str, quantile: float) -> float | None:
         """从桶里算分位数（Prometheus `histogram_quantile()` 的等价实现）。
@@ -321,6 +415,8 @@ class Metrics:
                 counter._metrics.clear()  # noqa: SLF001 - 官方没有公开的 reset（见 docstring）
             for histogram in self._histograms.values():
                 histogram._metrics.clear()  # noqa: SLF001
+            for gauge in self._gauges.values():
+                gauge._metrics.clear()  # noqa: SLF001
 
 
 def _series_key(name: str, labels: Mapping[str, str]) -> str:
@@ -351,6 +447,9 @@ def _split_sample(sample_name: str) -> tuple[str, str]:
     而 `shopsage_x_count`（没有 `_seconds` 的系列）去掉最后一段也会得到 `shopsage_x`（也对），
     但 `shopsage_x_sum` 与 `shopsage_x_count` 会在**不同**的 base 上分家 —— 一旦分家，
     分位数就只从一半数据里算。显式后缀表把「哪些名字属于同一个直方图」变成数据。
+
+    ⚠️ 本函数**区分不了 gauge**（`prometheus_client` 的样本名里没有类型信息），
+    所以 `snapshot()` 不靠它判型，而是问 collector 本身（见 `_collector_kinds()`）。
     """
     for suffix, kind in _SAMPLE_SUFFIXES:
         if sample_name.endswith(suffix):
@@ -424,7 +523,18 @@ TRACE_COUNT: Final = f"{NAMESPACE}_traces_total"
 #: 一直命中通常意味着上游在重复投递（A2 的幂等保护在工作，但那是**故障的信号**，不是成功）。
 TOOL_OUTCOME: Final = f"{NAMESPACE}_tool_outcome_total"
 #: 队列深度（第 12 步 `queue.md` 的输入；本步只留出口，值由队列自己写）。
+#:
+#: ⚠️ 它是 **gauge**（瞬时值，可升可降），不是 counter。第 11 步只留了这一个常量，
+#: 第 12 步把它接上（`Metrics.gauge()` 也是那一步才加的）——
+#: 用 `counter()` 写它会得到「积压增长速率」，而「现在积压多少」永远答不出来。
 QUEUE_DEPTH: Final = f"{NAMESPACE}_queue_depth"
+#: 待处理死信条数（gauge，第 12 步）。它回答「人工兜底这条路径上堆了多少活」。
+QUEUE_DLQ_PENDING: Final = f"{NAMESPACE}_queue_dead_letter_pending"
+#: 最老的一条待处理死信躺了多久（gauge，秒，第 12 步）。
+#:
+#: 与上一条的区别是**这个才值得告警**：条数多可能只是刚发生一批抖动，
+#: 而「最老的躺了三天」意味着人工兜底流程根本没人在走（A1 失效）。
+QUEUE_DLQ_OLDEST: Final = f"{NAMESPACE}_queue_dead_letter_oldest_seconds"
 
 #: 进程级默认实例（唯一一份被 `/metrics` 渲染的指标）。
 _DEFAULT: Metrics | None = None
@@ -519,6 +629,8 @@ __all__ = [
     "LLM_TOKENS",
     "NAMESPACE",
     "QUEUE_DEPTH",
+    "QUEUE_DLQ_OLDEST",
+    "QUEUE_DLQ_PENDING",
     "REQUEST_COUNT",
     "REQUEST_DURATION",
     "RETRIEVAL_DURATION",
@@ -526,7 +638,6 @@ __all__ = [
     "SQL_DURATION",
     "TOOL_DURATION",
     "TOOL_OUTCOME",
-    "TRACE_COUNT",
     "TRACE_COUNT",
     "Metrics",
     "MetricsSettings",

@@ -31,7 +31,7 @@ from app.db.base import Base
 from app.db.session import engine
 from app.db.urls import to_sqlalchemy_url
 from app.graph.checkpointer import CHECKPOINT_TABLES
-from scripts.db_check import BUSINESS_TABLES, snapshot
+from scripts.db_check import BUSINESS_TABLES, INFRA_TABLES, snapshot
 
 # 必须显式 import 模型模块：`Base.metadata.tables` 在被测模型 import 之前是空的。
 # 这一行同时也是「为什么 alembic/env.py 里必须 import app.db.models」的现场演示
@@ -84,7 +84,14 @@ def test_initial_migration_creates_all_eight_tables():
 
     这条专门防「`env.py` 里漏 import 模型 → autogenerate 静默生成空迁移」：
     首版迁移的 upgrade 体里应当逐一 op.create_table('users') / ('orders') / ...
+
+    ⚠️ 表数量的口径在第 12 步变过一次（queue 加了死信表），但**业务表的判据没变**：
+    断言的是「业务表 8 张 + 其余的是基础设施表」，而不是「模型里一共 8 张表」。
+    后者会在每次加基础设施表时红，而那是**误报** —— 它把「业务 Schema 变了」
+    与「多了一张队列表」混成了一件事。
     """
+    from app.db.models import INFRA_MODELS
+
     script = ScriptDirectory.from_config(_alembic_config())
     revisions = list(script.walk_revisions())  # 从新到旧
     assert revisions, "alembic/versions 里没有任何迁移（先跑 alembic revision --autogenerate）"
@@ -92,7 +99,10 @@ def test_initial_migration_creates_all_eight_tables():
     source = inspect.getsource(first.module.upgrade)
     missing = [t for t in BUSINESS_TABLES if f"'{t}'" not in source and f'"{t}"' not in source]
     assert not missing, f"首版迁移 {first.revision} 里没有建这些表: {missing}（空迁移？检查 env.py 有没有 import 模型）"
-    assert len(MODEL_TABLES) == 8, f"模型里有 {len(MODEL_TABLES)} 张表，应为 8 张业务表"
+    assert len(MODEL_TABLES) == len(BUSINESS_TABLES) + len(INFRA_MODELS), (
+        f"模型里有 {len(MODEL_TABLES)} 张表，应为 {len(BUSINESS_TABLES)} 张业务表 + "
+        f"{len(INFRA_MODELS)} 张基础设施表"
+    )
 
 
 # ── 集成：库与模型是否一致 ────────────────────────────────────────────────────
@@ -215,14 +225,20 @@ def test_migration_round_trip_is_repeatable():
     for round_no in (1, 2):
         command.downgrade(cfg, "base")
         after_downgrade = table_set()
-        assert BUSINESS_TABLES and not (set(BUSINESS_TABLES) & after_downgrade), (
-            f"第 {round_no} 轮回滚后仍残留业务表: {set(BUSINESS_TABLES) & after_downgrade}"
-        )
+        leftover = set(BUSINESS_TABLES) & after_downgrade
+        assert BUSINESS_TABLES and not leftover, f"第 {round_no} 轮回滚后仍残留业务表: {leftover}"
+        # 第 12 步：基础设施表（queue 的死信表）也要跟着回滚干净 ——
+        # 它由**同一条迁移链**建出来，漏了它就说明迁移的 downgrade 不完整。
+        infra_left = set(INFRA_TABLES) & after_downgrade
+        assert not infra_left, f"第 {round_no} 轮回滚后仍残留基础设施表: {infra_left}"
 
         command.upgrade(cfg, "head")
         after_upgrade = table_set()
         assert set(BUSINESS_TABLES) <= after_upgrade, (
             f"第 {round_no} 轮升级后缺表: {set(BUSINESS_TABLES) - after_upgrade}"
+        )
+        assert set(INFRA_TABLES) <= after_upgrade, (
+            f"第 {round_no} 轮升级后缺基础设施表: {set(INFRA_TABLES) - after_upgrade}"
         )
 
     # 收尾 1：重放只读角色授权（表被 DROP 过，授权需要重新挂到新表上）

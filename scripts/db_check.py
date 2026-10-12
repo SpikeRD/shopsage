@@ -30,7 +30,19 @@ MIN_COUNTS: dict[str, int] = {
     "employees": 3,
 }
 
-BUSINESS_TABLES = tuple(MIN_COUNTS)
+#: **业务表**（架构第 5 节的 Schema）：种子数据与「8 张业务表」这条口径都按它算。
+BUSINESS_TABLES: tuple[str, ...] = tuple(MIN_COUNTS)
+
+#: 第 12 步（queue）的**基础设施表**：它必须存在（迁移跑过），但**不属于业务数据** ——
+#: 「库里没有死信」是健康的形态，不是缺数据。
+#:
+#: 为什么单独一份而不是塞进 `MIN_COUNTS`：`MIN_COUNTS` 的长度被三处当成
+#: 「业务表数量」的判据（本脚本、`tests/test_db_migrations.py`、`tests/conftest.py` 的
+#: 种子装置）。混进一张队列表会让「业务表数量对不对」这条检查失去意义。
+INFRA_TABLES: tuple[str, ...] = ("queue_dead_letters",)
+
+#: 迁移必须建出来的全部表（业务 + 基础设施）
+REQUIRED_TABLES: tuple[str, ...] = BUSINESS_TABLES + INFRA_TABLES
 
 
 @dataclass(frozen=True)
@@ -44,7 +56,8 @@ class Snapshot:
 
     @property
     def missing_tables(self) -> tuple[str, ...]:
-        return tuple(t for t in BUSINESS_TABLES if t not in self.tables)
+        """迁移应当建出来、但库里没有的表（业务 + 基础设施）。"""
+        return tuple(t for t in REQUIRED_TABLES if t not in self.tables)
 
     @property
     def below_minimum(self) -> dict[str, tuple[int, int]]:
@@ -70,7 +83,7 @@ def snapshot(eng: Engine | None = None) -> Snapshot:
             )
         )
         counts: dict[str, int] = {}
-        for table in BUSINESS_TABLES:
+        for table in REQUIRED_TABLES:
             if table in tables:
                 counts[table] = conn.execute(text(f'select count(*) from "{table}"')).scalar_one()
 
@@ -110,6 +123,14 @@ def render(snap: Snapshot, *, minimal: bool = False) -> str:
             status = "缺表！"
         lines.append(f"{table:<18}{actual:>8}{minimum:>10}  {status}")
 
+    # 基础设施表（第 12 步 queue）：只报**存在性**，不报行数 ——
+    # 「没有死信」是健康形态（见 INFRA_TABLES 的注释）。
+    lines.append("")
+    for table in INFRA_TABLES:
+        actual = snap.counts.get(table, 0)
+        exists = "存在" if table in snap.tables else "缺表！"
+        lines.append(f"(基础设施) {table:<18}{actual:>8}{'—':>10}  {exists}")
+
     lines.append("")
     # contype: p=主键 f=外键 c=CHECK u=唯一
     labels = {"p": "主键", "f": "外键", "c": "CHECK", "u": "唯一", "x": "排他"}
@@ -146,7 +167,10 @@ def main(argv: list[str] | None = None) -> int:
         for p in problems:
             print(f"  - {p}")
         return 1
-    print("\n[OK] 8 张业务表齐全、行数达标、迁移版本已就位。")
+    print(
+        f"\n[OK] {len(BUSINESS_TABLES)} 张业务表 + {len(INFRA_TABLES)} 张基础设施表齐全、"
+        "行数达标、迁移版本已就位。"
+    )
     return 0
 
 

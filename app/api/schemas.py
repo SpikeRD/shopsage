@@ -243,6 +243,161 @@ class Frame(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+# ── 第 12 步：长任务的请求/响应契约 ───────────────────────────────────────────
+
+
+class TaskRequest(BaseModel):
+    """`POST /api/tasks` 的请求体（提交一个长任务）。
+
+    **为什么没有 `user_id` / `role`**：与 `ChatRequest` 同一条纪律 ——
+    身份只能来自已验签的令牌。任务结果会按发起人做归属判定
+    （`GET /api/tasks/{job_id}` 的越权检查），请求体里放一个 `user_id`
+    就等于「让调用方自己声明结果是给谁的」。
+
+    **为什么没有 `thread_id`**：`agent` 任务的 `thread_id` 由服务端从
+    「令牌 + `session_id`」派生（与 `POST /api/chat` 完全同一条规则）。
+    客户端能自己指定 `thread_id` 就等于能推进别人的会话。
+
+    **为什么没有 `idempotency_key` 的强制要求**：不传时服务端按
+    「任务种类 + user_id + 参数」派生一个稳定键（`queue.jobs.derive_key`），
+    于是「客户端网络抖动后重发一次」不会变成两个任务。传了就原样用 ——
+    那是「我知道这次请求的业务幂等键」的场景（例如与上游单据号对齐）。
+    """
+
+    model_config = ConfigDict(extra="forbid")  # 写错字段名要 422，不要静默忽略
+
+    kind: Literal["report", "agent", "kb_rebuild"] = Field(
+        description="任务种类：`report`（报表）/ `agent`（长链路 Agent）/ `kb_rebuild`（知识库重建）"
+    )
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "任务入参（按 kind 不同）："
+            "report 用 `title` / `sql` / `params`；agent 用 `message`；kb_rebuild 用 `source_dir` / `force`"
+        ),
+    )
+    session_id: str | None = Field(
+        default=None,
+        pattern=SESSION_ID_PATTERN,
+        description="仅 `agent` 任务用：决定 thread_id（与 POST /api/chat 同一条派生规则）",
+    )
+    idempotency_key: str | None = Field(
+        default=None,
+        max_length=64,
+        description="业务幂等键（可选）：同一个键只执行一次。缺省 = 服务端按参数派生",
+    )
+    defer_by: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=30 * 24 * 3600.0,
+        description="延迟多少秒执行（0 = 立刻入队；上限 30 天，更远的定时任务请用 cron）",
+    )
+
+    def enqueue_kwargs(self, actor: Any) -> dict[str, Any]:
+        """把请求体翻成 `enqueue_*` 的关键字参数（**唯一的翻译点**）。
+
+        `agent` 任务需要 `thread_id`，其余任务不需要 —— 这条分支写在这里而不是
+        三个路由里，因为「哪一个任务需要会话」是**契约**的一部分，
+        而它一旦漂移（比如 report 也悄悄接受 thread_id）就没人看得出来。
+
+        ⚠️ 本方法**不做授权判断**：`kb_rebuild` 是内部专属任务，而那个判断在
+        `app/api/tasks.py` 里做（授权是路由的职责，本模块只描述「请求长什么样」）。
+        第一版把它写在这里，结果是「客户提交 kb_rebuild → `PermissionError` 冒到 500」——
+        一个本该是 403 的响应变成了「服务端未知错误」（见 runbook §10.1）。
+        """
+        common: dict[str, Any] = {
+            "idempotency_key": self.idempotency_key,
+            "defer_by": float(self.defer_by),
+        }
+        params = dict(self.params)
+        if self.kind == "agent":
+            message = str(params.pop("message", "") or "").strip()
+            if not message:
+                raise ValueError("agent 任务必须在 params 里给 message（这一轮要回答什么）")
+            return {
+                **common,
+                "user_id": int(actor.user_id),
+                "thread_id": str(actor.thread_id),
+                "message": message,
+                "role": str(actor.role),
+                "replay_budget": int(params.pop("replay_budget", 1) or 1),
+            }
+        if self.kind == "report":
+            return {
+                **common,
+                "user_id": int(actor.user_id),
+                "title": str(params.pop("title", "") or "订单报表"),
+                "params": params,
+            }
+        # kb_rebuild：知识库是全局资源（授权判断在路由里，见上面的说明）
+        return {
+            **common,
+            "user_id": int(actor.user_id),
+            "source_dir": str(params.pop("source_dir", "") or ""),
+            "force": bool(params.pop("force", False)),
+        }
+
+
+class TaskAcceptedResponse(BaseModel):
+    """`POST /api/tasks` 的响应（**202 Accepted**：已受理，还没完成）。
+
+    三个字段回答客户端最关心的三件事：**凭据**（`job_id`）、
+    **要不要重新等**（`created`）、**去哪查**（`status_url`）。
+    """
+
+    job_id: str = Field(description="任务凭据：用它查状态、也用它做幂等（同一个键只执行一次）")
+    kind: str
+    status: str = Field(description="`queued`（立刻可取）或 `deferred`（延迟任务，还没到点）")
+    created: bool = Field(description="True = 本次真的投了新任务；False = 幂等命中（之前已投过）")
+    deferred_seconds: float = 0.0
+    poll_after_seconds: int = Field(default=5, description="建议的轮询间隔（秒）")
+    status_url: str = Field(description="查状态的相对路径（前缀与 API_PREFIX 一致）")
+
+
+class DeadLetterView(BaseModel):
+    """死信任务的失败现场（**给运维看**，不含 traceback 全文）。
+
+    ⚠️ 刻意回传 `error_type` 与截断后的 `error_message`，而**不**回传 `error_traceback`：
+    traceback 里可能带业务数据（SQL 文本、行内容），而它进 HTTP 响应就意味着出网。
+    要全文请去库里查 `queue_dead_letters.error_traceback`（那是有审计的入口）。
+    """
+
+    attempts: int = 1
+    error_type: str = ""
+    error_message: str = ""
+    retryable: bool = False
+    failed_at: Any = None
+    replay_count: int = 0
+    resolution: str = ""
+    replay_hint: str = ""
+
+
+class TaskStatusResponse(BaseModel):
+    """`GET /api/tasks/{job_id}` 的响应。"""
+
+    job_id: str
+    status: str = Field(description="queued / deferred / in_progress / complete / not_found / dead_letter")
+    description: str = Field(description="状态的中文说明（前端可直接展示）")
+    result: dict[str, Any] | None = Field(
+        default=None, description="完成后的结果（**只保留 24 小时**；过期后为 null 但 status 仍是 complete）"
+    )
+    dead_letter: DeadLetterView | None = Field(default=None, description="进死信时的失败现场")
+
+
+class QueueStatusResponse(BaseModel):
+    """`GET /api/tasks/queue` 的响应（队列现状，给人看的读数）。"""
+
+    depth: int = Field(description="立刻可取的积压条数")
+    deferred: int = Field(description="延迟任务条数（还没到执行时间，**不算积压**）")
+    backlog: int = Field(description="`depth + deferred`")
+    dead_letters: int = Field(description="待处理死信条数（人工兜底的入口）")
+    oldest_dead_letter_seconds: float | None = Field(
+        default=None, description="最老的一条待处理死信躺了多久（**它才值得告警**）"
+    )
+    scale_hint: str = Field(description="给扩容决策的一句话（背压信号）")
+    kinds: list[str] = Field(default_factory=list, description="登记过的任务种类")
+
+
 __all__ = [
     "FRAME_ANSWER",
     "FRAME_DONE",
@@ -262,9 +417,14 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "ComponentHealth",
+    "DeadLetterView",
     "ErrorDetail",
     "ErrorResponse",
     "FlowState",
     "Frame",
     "HealthResponse",
+    "QueueStatusResponse",
+    "TaskAcceptedResponse",
+    "TaskRequest",
+    "TaskStatusResponse",
 ]

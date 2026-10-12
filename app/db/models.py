@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import datetime as dt
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -24,6 +26,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampTZ
@@ -38,6 +41,8 @@ TICKET_TYPES = ("order", "refund", "product", "logistics", "other")
 TICKET_STATUSES = ("open", "processing", "resolved", "closed")
 EMPLOYEE_LEVELS = ("L1", "L2", "L3")
 CUSTOMER_LEVELS = ("normal", "silver", "gold", "vip")
+#: 队列任务种类（第 12 步；与 `app.queue.jobs.JOB_KINDS` 同源，有对账用例钉住）
+QUEUE_JOB_KINDS = ("report", "agent", "kb_rebuild")
 
 # 金额统一 NUMERIC(12, 2)：不用 float —— 金额比较/累加不能用二进制浮点。
 MONEY = Numeric(12, 2)
@@ -256,19 +261,99 @@ class Employee(Base):
     __table_args__ = (CheckConstraint(_in_list("level", EMPLOYEE_LEVELS), name="level_valid"),)
 
 
+class QueueDeadLetter(Base):
+    """死信表（第 12 步 queue）：**长任务失败之后的唯一持久留痕处**。
+
+    为什么任务本体留在 Redis、只有失败才落库（`12.queue.md` §4 第 4 条）：
+
+    * **成功的任务不值得一行数据库记录**：它每天可能几十万条，而它的价值只有
+      「结果」——那已经在 Redis 里（TTL 24h）且已经回给了调用方；
+    * **失败的任务必须留下来**：它是「零任务丢失」这条验收的落点，也是人工兜底的入口。
+      而「人工」意味着**人能筛、能查、能标记已处理** —— Redis 的字符串结果做不到这些。
+
+    字段口径（每个都对应一次排障）：
+
+    | 列 | 用途 |
+    |---|---|
+    | `job_id` | 唯一键：重放的幂等键 + 与 Redis 的对应关系 |
+    | `function` / `kind` / `payload` | **重放需要的一切**（原样喂回任务） |
+    | `attempts` | 试了几次（区分「一次就永久失败」与「三次都恢复不了」） |
+    | `error_type` / `error_message` / `error_traceback` | 出了什么错、在哪一行 |
+    | `retryable` | 「运气不好」还是「代码坏了」（决定该不该重放） |
+    | `policy` | 当时用的是哪套退避策略（策略改了之后回看旧记录仍然说得通） |
+    | `resolution` / `resolved_at` / `replay_count` / `replayed_job_id` | 人工处理的结果 |
+
+    ⚠️ `resolution` 是**文本**而不是布尔位：收场方式不止一种
+    （`replayed_ok` / `replayed_failed` / `wont_fix` / `manual_fix`），
+    布尔位会逼着后来的人往别处记「怎么处理的」。
+    """
+
+    __tablename__ = "queue_dead_letters"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    #: 幂等键：同一 job_id 只留一行（重投后再失败 → 更新失败现场，不新增一行）
+    job_id: Mapped[str] = mapped_column(String(96), nullable=False, unique=True)
+    function: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: 任务入参（重放时原样喂回）。JSONB 而不是 Text：能按字段查、写入时即校验。
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    error_type: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    #: 完整栈（截断到 4000 字符，见 `app/queue/core.traceback_text`）——
+    #: 它是**唯一**能看到「错在哪一行」的地方（Redis 的失败结果会过期）。
+    error_traceback: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    #: 当时的退避策略（JSONB：字段与 `jobs.RetryPolicy` 一一对应）
+    policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    enqueued_at: Mapped[dt.datetime | None] = mapped_column(TimestampTZ)
+    failed_at: Mapped[dt.datetime] = mapped_column(TimestampTZ, nullable=False, server_default=func.now())
+    user_id: Mapped[int | None] = mapped_column(BigInteger)
+    replay_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    #: 最近一次重放用的 job_id（追「这条死信是被哪次执行补上的」）
+    replayed_job_id: Mapped[str] = mapped_column(String(96), nullable=False, default="", server_default="")
+    #: 收场方式（空 = 还没人处理）：replayed_ok / replayed_failed / wont_fix / manual_fix
+    resolution: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(TimestampTZ)
+
+    __table_args__ = (
+        CheckConstraint(_in_list("kind", QUEUE_JOB_KINDS), name="kind_valid"),
+        CheckConstraint("attempts >= 1", name="attempts_positive"),
+        CheckConstraint("replay_count >= 0", name="replay_count_non_negative"),
+        # 排障的主查询：「最近还有哪些没处理」→ (resolution, failed_at)
+        Index("ix_queue_dead_letters_resolution_failed_at", "resolution", "failed_at"),
+        Index("ix_queue_dead_letters_kind_failed_at", "kind", "failed_at"),
+    )
+
+
 # `db.md` 第 2 节的 import 清单要能一次性拿到 8 张表
 BUSINESS_MODELS = (User, Product, Order, OrderItem, Refund, StockMovement, Ticket, Employee)
 
+#: **非业务**表（第 12 步）：属于基础设施而非领域模型。
+#:
+#: 为什么分开列而不是塞进 `BUSINESS_MODELS`：那条元组的语义是「8 张业务表」
+#: （架构第 5 节的 Schema），而 `tests/test_db_migrations.py` 与 `scripts/db_check.py`
+#: 用它的**长度**做断言。把它混进去会让「业务表数量对不对」这条检查失去意义 ——
+#: 队列是基础设施，它加表不该改动业务 Schema 的口径。
+INFRA_MODELS = (QueueDeadLetter,)
+
+ALL_MODELS = BUSINESS_MODELS + INFRA_MODELS
+
 __all__ = [
+    "ALL_MODELS",
     "Base",
+    "BUSINESS_MODELS",
     "CUSTOMER_LEVELS",
     "EMPLOYEE_LEVELS",
     "Employee",
+    "INFRA_MODELS",
     "ORDER_STATUSES",
     "Order",
     "OrderItem",
     "PAYMENT_METHODS",
     "Product",
+    "QUEUE_JOB_KINDS",
+    "QueueDeadLetter",
     "REFUND_STATUSES",
     "Refund",
     "STOCK_MOVEMENT_TYPES",
@@ -277,5 +362,4 @@ __all__ = [
     "TICKET_TYPES",
     "Ticket",
     "User",
-    "BUSINESS_MODELS",
 ]

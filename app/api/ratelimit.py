@@ -94,6 +94,10 @@ DEFAULT_RULES: Final[dict[str, RateLimitRule]] = {
     "chat.stream": RateLimitRule(limit=60, window_seconds=60.0),
     # 批准通道：写操作的手工确认，频次天然很低；给个明确的小额度而不是不限。
     "chat.approve": RateLimitRule(limit=20, window_seconds=60.0),
+    # 长任务提交（第 12 步）：**比 chat 更严**。一次提交换来一个后台长任务
+    # （几分钟、若干次模型调用），而被滥用的代价落在**队列**上 ——
+    # 积压会让所有人的任务一起变慢，不像 chat 那样只影响调用者自己。
+    "tasks": RateLimitRule(limit=10, window_seconds=60.0),
     # 健康检查：探针本身就可能每几秒来一次，给宽松额度（这条限流拦的是「有人拿 /health 当压力入口」）。
     "health": RateLimitRule(limit=120, window_seconds=60.0),
     # 指标：给 Prometheus 抓取留足（scrape_interval 15s → 4 次/分钟就够）。

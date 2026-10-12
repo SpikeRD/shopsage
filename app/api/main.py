@@ -46,6 +46,7 @@ from app.api.metrics import MetricsRegistry
 from app.api.middleware import ApiMiddleware
 from app.api.ratelimit import open_rate_limiter
 from app.api.scope import SCOPE_BY_ROUTE
+from app.api.tasks import router as tasks_router
 from app.graph import GraphRuntime, compile_graph, ensure_compatible_event_loop, open_checkpointer
 from app.graph.checkpointer import CheckpointBackend
 from app.graph.config import GATED_ROLES, SENSITIVE_ROUTES
@@ -126,6 +127,7 @@ def create_app(
     rate_limiter: Any = None,
     metrics: Any = None,
     telemetry: Any = None,
+    queue: Any = None,
     probe_timeout_value: float | None = None,
 ) -> FastAPI:
     """装配 FastAPI 应用（**所有外部依赖都可注入** —— 这是离线可测的前提）。
@@ -141,10 +143,12 @@ def create_app(
     | `rate_limiter` | 按 `REDIS_URL` 自动选 | 测试注入小额度来验 429 |
     | `metrics` | 新 `MetricsRegistry` | 测试注入共享注册表来断言指标 |
     | `telemetry` | 按 `settings` 新建 | 测试注入共享 telemetry 来断言 span（第 11 步） |
+    | `queue` | `None` → 走 `REDIS_URL` 的默认队列 | **测试注入内存队列**（第 12 步：离线验入队/幂等/202，不必起 Redis） |
 
     ⚠️ **不把 `llm`/`search` 做成环境变量**：它们是「本次跑图用什么依赖」的语义选择
     （评测要注入假模型、对客要强制闸门），塞进全局配置会让「测试环境」与「生产环境」的行为
-    靠环境变量对齐 —— `8.graph.md` §5 已经为同一件事给过理由。
+    靠环境变量对齐 —— `8.graph.md` §5 已经为同一件事给过理由。第 12 步的 `queue=`
+    是同一类注入点：它换的是「往哪投任务」，而不是「投什么任务」。
     """
     ensure_compatible_event_loop()  # 必须在建事件循环之前（import 期执行）
 
@@ -173,6 +177,10 @@ def create_app(
             if rate_limiter is not None
             else open_rate_limiter(redis_url=str(getattr(settings, "redis_url", "") or ""), rules=api_config.rate_limit_rules(settings))
         )
+        # ── 第 12 步：队列是**可注入**的（`None` = 走 REDIS_URL 的默认队列）────────
+        # 注入内存队列的用途不是「测试后门」：`POST /api/tasks` 的契约（202 + job_id +
+        # 幂等命中）与「任务投到哪个后端」无关，所以它必须能在不起 Redis 的前提下验完。
+        app.state.queue = queue
 
         # ── 第 11 步：可观测性在**这里**装配（一次），而不是 import 期或每请求 ──
         # 三件事同时被这一行定死：
@@ -216,6 +224,15 @@ def create_app(
             # ⚠️ `finally` 而不是平铺在 `yield` 之后：启动中途抛错时（例如 checkpointer
             #    连不上）也要把 span 与 telemetry 根收干净 —— 否则「启动失败」会留下一份
             #    活跃的 telemetry 根，让下一个 app（测试里很常见）的埋点写进上一个人的注册表。
+            #
+            # 第 12 步补的一条：**默认队列的连接池也要在这里关**。它是按事件循环缓存的
+            # （`app/queue/backend._QUEUES`），不关的话下一个 app 会拿到一个属于旧循环的池
+            # —— 症状是 `RuntimeError: Event loop is closed`，只在「同一进程起第二个 app」
+            # 时出现（测试里很常见，生产里就是进程重启）。注入的队列**不关**（不是我们建的）。
+            if queue is None:
+                from app.queue import close_default_queues
+
+                await close_default_queues()
             obs.flush()  # 把还在缓冲里的 span 推出去（关服前的最后一件事）
             langfuse_handler().flush()
             reset_request_root(telemetry_token)
@@ -242,6 +259,7 @@ def create_app(
 
     prefix = api_config.api_prefix(settings)
     app.include_router(chat_router, prefix=prefix)
+    app.include_router(tasks_router, prefix=prefix)
     app.include_router(infra_router)
 
     @app.get("/", include_in_schema=False)

@@ -26,8 +26,20 @@ from tests.api.conftest import (  # noqa: F401 - 这个 import 是**有意的**�
     internal_token,
     metrics,
 )
-
 DB_MARKER = "db"
+
+
+@pytest.fixture
+def queue():
+    """第 12 步的内存队列（**放在根 conftest**，理由见下面那段注释）。
+
+    `app_factory` 默认就注入它，于是 `POST /api/tasks` 的契约能离线验完 ——
+    与「默认注入假模型」是同一条纪律：测试不该依赖（也不该影响）真实依赖栈。
+    不注入的话 `create_app` 会去连 `REDIS_URL`（本机的 `.env` 里有一个真地址）。
+    """
+    from tests.queue.fake_queue import MemoryJobQueue
+
+    return MemoryJobQueue()
 
 # ⚠️ **为什么把 `tests/api/conftest.py` 的装置导进根 conftest**（第 11 步的取舍）：
 #
@@ -146,11 +158,20 @@ def pytest_collection_modifyitems(config, items) -> None:
 
 @pytest.fixture(scope="session")
 def seeded() -> None:
-    """需要种子数据的用例声明它：行数不达标就现场补灌（幂等，可安全重复跑）。"""
-    from scripts.db_check import BUSINESS_TABLES, MIN_COUNTS, snapshot
+    """需要种子数据的用例声明它：行数不达标就现场补灌（幂等，可安全重复跑）。
+
+    ⚠️ 只按 `MIN_COUNTS`（= 8 张业务表）判断，**不看基础设施表**
+    （第 12 步的 `queue_dead_letters`）：`snapshot()` 也会数它，但「库里没有死信」
+    是**健康**形态，不是缺数据。第一版写成遍历 `snap.counts` 去找 `MIN_COUNTS[t]`，
+    于是新增那张表之后本装置直接 `KeyError: 'queue_dead_letters'` ——
+    而它的表现是「所有依赖 `seeded` 的用例在 setup 阶段成片 ERROR」
+    （50 个 error，看起来像工具层坏了，见 runbook §10.1）。
+    """
+    from scripts.db_check import MIN_COUNTS, snapshot
     from scripts.seed import seed
 
     snap = snapshot()
-    below = {t: n for t, n in snap.counts.items() if n < MIN_COUNTS[t]}
-    if below or len(snap.counts) < len(BUSINESS_TABLES):
+    below = {t: n for t, n in snap.counts.items() if t in MIN_COUNTS and n < MIN_COUNTS[t]}
+    missing_business = [t for t in MIN_COUNTS if t not in snap.tables]
+    if below or missing_business:
         seed()

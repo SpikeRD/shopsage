@@ -83,6 +83,8 @@ def rate_limit_specs(settings: Any = None) -> dict[str, str]:
         ("chat", "rate_limit_chat"),
         ("chat.stream", "rate_limit_chat_stream"),
         ("chat.approve", "rate_limit_chat_approve"),
+        # 第 12 步：长任务提交（默认 10/60，理由见 `ratelimit.DEFAULT_RULES`）
+        ("tasks", "rate_limit_tasks"),
     ):
         raw = str(_env_value(settings, key, "") or "").strip()
         if raw:

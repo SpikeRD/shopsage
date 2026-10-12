@@ -129,7 +129,19 @@ def tiny_limiter(*, chat: int = 3, stream: int = 3, approve: int = 3) -> RateLim
 
 
 @pytest.fixture
-def app_factory(metrics: MetricsRegistry) -> Callable[..., Any]:
+def queue() -> Any:
+    """第 12 步的内存队列：让 `POST /api/tasks` 的契约能**离线**验完。
+
+    ⚠️ 默认就注入它（不注入的话 `create_app` 会去连 `REDIS_URL`）——
+    与「默认注入假模型」是同一条纪律：测试不该依赖（也不该影响）真实依赖栈。
+    """
+    from tests.queue.fake_queue import MemoryJobQueue
+
+    return MemoryJobQueue()
+
+
+@pytest.fixture
+def app_factory(metrics: MetricsRegistry, queue: Any) -> Callable[..., Any]:
     """造 app 的工厂（用例可以按需改限流/模型/prefix）。
 
     ⚠️ **默认就注入假模型**（`llm=None` 会落到生产出口 `app.llm.llm_call`）。
@@ -152,6 +164,8 @@ def app_factory(metrics: MetricsRegistry) -> Callable[..., Any]:
             ),
             "rate_limiter": overrides.pop("rate_limiter", tiny_limiter()),
             "metrics": metrics,
+            # 第 12 步：注入内存队列（理由见 `queue` 装置）
+            "queue": overrides.pop("queue", queue),
             # 用注入的工厂而不是 `backend="memory"`：走的是与生产**同一条**路径
             # （`factory()` 返回 `async with` 上下文），只是后端换成内存。
             "checkpointer_factory": overrides.pop(

@@ -25,6 +25,10 @@ from typing import Final, Protocol
 SCOPE_BY_ROUTE: Final[dict[tuple[str, str], str]] = {
     ("POST", "/api/chat"): "chat",
     ("POST", "/api/chat/approve"): "chat.approve",
+    # 第 12 步：提交长任务。**它必须限流**，而且要比 chat 更严：一次提交就是一个
+    # 后台长任务（可能几分钟、可能几次模型调用），而被滥用的代价落在**队列**上
+    # （积压 → 所有人的任务都变慢），不像 chat 那样只影响调用者自己。
+    ("POST", "/api/tasks"): "tasks",
 }
 
 #: WebSocket 的 scope 名（握手成功后由路由自己判定；路径不在 HTTP 的映射里）

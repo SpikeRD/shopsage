@@ -58,6 +58,12 @@ LIMITED_SCOPES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("POST", "/api/chat"),
         ("POST", "/api/chat/approve"),
+        # 第 12 步：提交长任务。**必须在这里登记**，否则 `POST /api/tasks` 会
+        # 完全不限流 —— 而 `scope.SCOPE_BY_ROUTE` 里有没有它、`ratelimit.DEFAULT_RULES`
+        # 有没有额度，都不会因此报错（症状是「额度配了但不生效」，见 runbook §10.1）。
+        # 三道登记缺一不可：本常量（中间件要不要限）、`scope.py`（用哪个 scope）、
+        # `ratelimit.DEFAULT_RULES`（默认额度是多少）。
+        ("POST", "/api/tasks"),
     }
 )
 
