@@ -578,3 +578,6 @@ __all__ = [
     "run_suite",
     "settings_from_args",
 ]
+
+if __name__ == "__main__":
+    sys.exit(main())
