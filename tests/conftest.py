@@ -71,6 +71,10 @@ def pytest_configure(config) -> None:
         "markers",
         "rag_live: 需要真实 embedding/rerank 模型（~20s 加载）的端到端用例；依赖缺失会自动跳过",
     )
+    config.addinivalue_line(
+        "markers",
+        "llm_live: 需要真实 LLM API key 的探活用例（花钱；CI 与日常用 `-m 'not llm_live'` 排除）",
+    )
 
 
 def pytest_addoption(parser) -> None:

@@ -1,0 +1,131 @@
+{
+  "name": "agent_golden",
+  "version": "1",
+  "kind": "agent",
+  "description": "端到端 golden set：10 条用例覆盖四个路由分支（data / rag / analysis / final）+ 一条「知识库里没有答案」+ 一条「强时效不进缓存」。每条都标了期望路线与必须命中的事实点。",
+  "corpus": "docs/kb/（8 份文档 / 61 个活跃片段）+ 种子业务数据（8 用户 / 30 订单 / 20 商品 / 8 退款 / 8 工单）",
+  "maintainer_note": "期望路线（expected_route）是「按第 7 步 router prompt 的口径应该判成什么」，不是「实测判成什么」——实测值进报告，两者不同才是要看的信号（见 runbook §7.2）。",
+  "cases": [
+    {
+      "id": "kb-return-policy",
+      "question": "无理由退货是几天内可以申请？",
+      "reference": "自签收之日起 7 天内，商品完好、不影响二次销售的，可以申请无理由退货。",
+      "key_facts": ["7 天", "签收"],
+      "expected_sources": ["docs/kb/退货政策.md"],
+      "expected_route": "rag",
+      "role": "customer",
+      "tags": ["rag分支", "政策"],
+      "note": "对客政策类：最常见的分支，也是「缓存 + 检索 + 合成」三段全走的一条"
+    },
+    {
+      "id": "kb-warranty",
+      "question": "整机保修期是多久？",
+      "reference": "整机类商品自签收之日起提供 12 个月保修；随机配件 6 个月，易耗品 3 个月。",
+      "key_facts": ["12 个月", "签收"],
+      "expected_sources": ["docs/kb/产品保修.md"],
+      "expected_route": "rag",
+      "role": "customer",
+      "tags": ["rag分支", "保修"],
+      "note": "数字密集：路由对了但检索错了会立刻表现为数字不支持（faithfulness 掉分）"
+    },
+    {
+      "id": "kb-shipping-fee",
+      "question": "满多少钱免运费？",
+      "reference": "单笔订单实付满 99 元免运费；未满 99 元收取 10 元运费。",
+      "key_facts": ["99 元", "10 元"],
+      "expected_sources": ["docs/kb/物流政策.md"],
+      "expected_route": "rag",
+      "role": "customer",
+      "tags": ["rag分支", "物流"],
+      "note": "带业务名词（运费）的政策问题：router 最容易误判成 data 的一类"
+    },
+    {
+      "id": "kb-enterprise",
+      "question": "企业采购有折扣吗？",
+      "reference": "企业客户单笔订单满 20000 元可申请企业价，企业价在标准价基础上优惠 5%~12%。",
+      "key_facts": ["20000 元", "5%~12%"],
+      "expected_sources": ["docs/kb/企业采购说明.txt"],
+      "expected_route": "rag",
+      "role": "customer",
+      "tags": ["rag分支", "纯文本文档"],
+      "note": "命中 .txt 语料：验证「非 Markdown 文档」在整条链路上也可检索"
+    },
+    {
+      "id": "data-my-order",
+      "question": "我的订单到哪了？",
+      "reference": "这条问题需要查数据库里这个用户自己的订单状态与物流信息；知识库里没有订单数据，答不上就如实说明。",
+      "key_facts": [],
+      "expected_sources": [],
+      "expected_route": "data",
+      "role": "customer",
+      "user_id": 8,
+      "expect_empty": true,
+      "time_sensitive": true,
+      "tags": ["data分支", "强时效"],
+      "note": "强时效：既不进语义缓存（第 13 步的 bypass），也不该从知识库答；expect_empty 声明「知识库里确实没有」"
+    },
+    {
+      "id": "data-my-refunds",
+      "question": "我这个月退款了几单？",
+      "reference": "这条问题需要查数据库里这个用户自己的退款记录并计数；知识库里没有业务数据，答不上就如实说明。",
+      "key_facts": [],
+      "expected_sources": [],
+      "expected_route": "data",
+      "role": "customer",
+      "user_id": 2,
+      "expect_empty": true,
+      "tags": ["data分支", "聚合"],
+      "note": "对客聚合：走 data 而不是 analysis（analysis 只对内部开放，见 router.classify）"
+    },
+    {
+      "id": "data-order-status",
+      "question": "订单 5 现在是什么状态？",
+      "reference": "这条问题需要按订单号查数据库；订单数据不在知识库里，答不上就如实说明。",
+      "key_facts": [],
+      "expected_sources": [],
+      "expected_route": "data",
+      "role": "customer",
+      "user_id": 8,
+      "expect_empty": true,
+      "tags": ["data分支", "按单号查"],
+      "note": "带具体单号：测「实体识别 + 参数绑定」这一段（第 6 步 tools 的能力）"
+    },
+    {
+      "id": "analysis-trend",
+      "question": "最近三个月的销售趋势怎么样？",
+      "reference": "这条问题要读全站订单做趋势分析，属于对内能力（analysis 分支）；知识库里没有业务数据。",
+      "key_facts": [],
+      "expected_sources": [],
+      "expected_route": "analysis",
+      "role": "internal_employee",
+      "user_id": 0,
+      "expect_empty": true,
+      "tags": ["analysis分支", "对内"],
+      "note": "同一个问法对客会被降级到 data（router 的 analysis 降级规则），所以角色必须写对"
+    },
+    {
+      "id": "final-greeting",
+      "question": "你好",
+      "reference": "纯寒暄，不需要检索任何数据，直接回答即可。",
+      "key_facts": [],
+      "expected_sources": [],
+      "expected_route": "final",
+      "role": "customer",
+      "expect_empty": true,
+      "tags": ["final分支"],
+      "note": "「不需要任何数据」的出口：判错会白花一次检索/一次 SQL（成本项，不是质量项）"
+    },
+    {
+      "id": "kb-missing-answer",
+      "question": "你们支持加密货币支付吗？",
+      "reference": "知识库里没有关于加密货币支付的内容；知识库只写了支付宝、微信支付、银行卡与货到付款。",
+      "key_facts": ["没有"],
+      "expected_sources": [],
+      "expected_route": "rag",
+      "role": "customer",
+      "expect_empty": true,
+      "tags": ["rag分支", "知识库缺口"],
+      "note": "知识库里确实没有答案：这一条的考点是**不要编造**（编了会表现为 unsupported_numbers）"
+    }
+  ]
+}

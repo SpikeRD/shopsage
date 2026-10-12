@@ -1,0 +1,160 @@
+{
+  "name": "rag_golden",
+  "version": "1",
+  "kind": "rag",
+  "description": "知识库问答 golden set：15 条真实问题 + 标准答案 + 必须命中的事实点 + 应该检索到的文档。覆盖政策/退货/物流/保修/积分/发票/账户安全/企业采购八类，并含一条「知识库里没有答案」的对照。",
+  "corpus": "docs/kb/（8 份文档 / 61 个活跃片段）",
+  "maintainer_note": "改任何一条的 question 或 reference 都要走 review：评测基线会随之漂移（见 docs/runbook/14.eval-runbook.md §10）。key_facts 必须逐字出现在 reference 里（loader 会校验）。",
+  "cases": [
+    {
+      "id": "return-window",
+      "question": "无理由退货是几天内可以申请？",
+      "reference": "自签收之日起 7 天内，商品完好、不影响二次销售的，可以申请无理由退货。",
+      "key_facts": ["7 天", "签收"],
+      "expected_sources": ["docs/kb/退货政策.md"],
+      "expected_route": "rag",
+      "tags": ["退货", "政策"],
+      "note": "最基础的政策类问题：答错它等于整条链路都不对"
+    },
+    {
+      "id": "return-shipping",
+      "question": "无理由退货的运费谁承担？",
+      "reference": "无理由退货的运费由买家承担；因商品质量问题发起的退货，往返运费由本店承担。",
+      "key_facts": ["由买家承担", "质量问题"],
+      "expected_sources": ["docs/kb/退货政策.md"],
+      "expected_route": "rag",
+      "tags": ["退货", "运费"],
+      "note": "答案里有两个方向相反的条件，是「答一半」最容易发生的样本"
+    },
+    {
+      "id": "return-exclusions",
+      "question": "哪些商品不支持无理由退货？",
+      "reference": "生鲜、定制商品、已拆封的音像制品与软件、贴身衣物、已激活的数码产品不适用无理由退货；存在质量问题的仍可申请退货或换货。",
+      "key_facts": ["生鲜", "定制商品", "贴身衣物"],
+      "expected_sources": ["docs/kb/退货政策.md"],
+      "expected_route": "rag",
+      "tags": ["退货", "例外"],
+      "note": "枚举型答案：事实点覆盖能直接暴露「只答了前两项」"
+    },
+    {
+      "id": "refund-eta",
+      "question": "退款多久能到账？",
+      "reference": "仓库验收通过后 3 个工作日内发起退款，原路退回；信用卡到账时间以发卡行清算为准，通常 3~15 个工作日。",
+      "key_facts": ["3 个工作日", "原路退回"],
+      "expected_sources": ["docs/kb/常见问题.md", "docs/kb/退货政策.md"],
+      "expected_route": "rag",
+      "tags": ["退款", "时效"],
+      "note": "同一事实在两份文档里都写了（FAQ 与政策第 4 条），故意让期望来源是两份"
+    },
+    {
+      "id": "exchange-model",
+      "question": "换货可以换成别的型号吗？",
+      "reference": "换货仅支持同款同规格商品的更换；需要更换为其它型号时，请按退货后重新下单处理。另外同一订单最多换货一次。",
+      "key_facts": ["同款同规格", "重新下单"],
+      "expected_sources": ["docs/kb/退货政策.md"],
+      "expected_route": "rag",
+      "tags": ["换货"],
+      "note": "「不可以」类问题：模型最容易顺着问法答成「可以」"
+    },
+    {
+      "id": "quality-return-fee",
+      "question": "质量问题退货的运费由谁承担？",
+      "reference": "质量问题退换货产生的运费由本店承担，买家先垫付的凭运单在退款时一并返还。",
+      "key_facts": ["由本店承担", "垫付"],
+      "expected_sources": ["docs/kb/退货政策.md"],
+      "expected_route": "rag",
+      "tags": ["退货", "运费"],
+      "note": "与 return-shipping 是同一份文档的不同条款：检索必须能区分第 2 条与第 7 条"
+    },
+    {
+      "id": "address-change",
+      "question": "怎么修改收货地址？",
+      "reference": "未发货的订单可在订单详情页点击「修改地址」自助修改，每个订单最多修改一次；已发货的订单无法修改收货地址，可联系客服协助与快递协商。",
+      "key_facts": ["未发货", "修改地址"],
+      "expected_sources": ["docs/kb/常见问题.md", "docs/kb/物流政策.md"],
+      "expected_route": "rag",
+      "tags": ["物流", "FAQ"],
+      "note": "FAQ 与物流政策都写了同一件事（双来源的召回检验）"
+    },
+    {
+      "id": "shipping-threshold",
+      "question": "满多少钱免运费？",
+      "reference": "单笔订单实付满 99 元免运费；未满 99 元收取 10 元运费。",
+      "key_facts": ["99 元", "10 元"],
+      "expected_sources": ["docs/kb/物流政策.md"],
+      "expected_route": "rag",
+      "tags": ["物流", "运费"],
+      "note": "数字型答案：faithfulness 的「材料里没有的数字」判据在这里最敏感"
+    },
+    {
+      "id": "damaged-parcel",
+      "question": "包裹破损了怎么办？",
+      "reference": "包裹外包装明显破损时可拒收并联系客服，本店免费重发；签收后 48 小时内可申请破损理赔，需提供开箱视频与外包装照片。",
+      "key_facts": ["拒收", "48 小时"],
+      "expected_sources": ["docs/kb/物流政策.md"],
+      "expected_route": "rag",
+      "tags": ["物流", "理赔"],
+      "note": "「怎么办」类问题：要给出动作（拒收）与时限（48 小时），缺一个都算没答全"
+    },
+    {
+      "id": "warranty-term",
+      "question": "整机保修期是多久？",
+      "reference": "整机类商品自签收之日起提供 12 个月保修；随机配件 6 个月，易耗品 3 个月；加购延保可延长至 24 个月。",
+      "key_facts": ["12 个月", "签收"],
+      "expected_sources": ["docs/kb/产品保修.md"],
+      "expected_route": "rag",
+      "tags": ["保修"],
+      "note": "同一份文档里有 12/6/3/24 四个数字，检索到错的条款会立刻表现为数字不支持"
+    },
+    {
+      "id": "invoice-reissue",
+      "question": "发票丢了可以补开吗？",
+      "reference": "可以。电子发票可在「我的订单 → 发票」中重复下载；纸质发票遗失需联系客服申请补开，补开周期约 5 个工作日。",
+      "key_facts": ["重复下载", "5 个工作日"],
+      "expected_sources": ["docs/kb/常见问题.md"],
+      "expected_route": "rag",
+      "tags": ["发票", "FAQ"],
+      "note": "FAQ 类：答案短且含一个数字，适合当「检索对了就一定能答对」的探针"
+    },
+    {
+      "id": "points-validity",
+      "question": "积分有效期是多久？",
+      "reference": "积分有效期为获得之日起 24 个月，过期自动清零，不可恢复。",
+      "key_facts": ["24 个月", "过期自动清零"],
+      "expected_sources": ["docs/kb/会员积分.md"],
+      "expected_route": "rag",
+      "tags": ["积分", "时效"],
+      "note": "与 warranty-term 是「同形不同数」的一对：用于验证答案里的数字真的来自材料"
+    },
+    {
+      "id": "account-locked",
+      "question": "账号被锁定了怎么办？",
+      "reference": "连续 5 次输入错误密码会锁定账号 30 分钟；发现账号被盗应立即改密并联系客服冻结。",
+      "key_facts": ["5 次", "30 分钟"],
+      "expected_sources": ["docs/kb/账户安全与隐私.md", "docs/kb/常见问题.md"],
+      "expected_route": "rag",
+      "tags": ["账户安全"],
+      "note": "两份文档都提到 5 次/30 分钟（账户安全政策第 3 条与 FAQ 忘记密码）"
+    },
+    {
+      "id": "fake-service",
+      "question": "客服索要短信验证码是诈骗吗？",
+      "reference": "客服不会以任何理由索要密码、短信验证码或支付密码，凡是索要的均为诈骗。",
+      "key_facts": ["不会", "诈骗"],
+      "expected_sources": ["docs/kb/账户安全与隐私.md"],
+      "expected_route": "rag",
+      "tags": ["账户安全", "风控"],
+      "note": "高风险问法：答错/答含糊的代价远高于其它用例（对客资金安全）"
+    },
+    {
+      "id": "enterprise-discount",
+      "question": "企业采购有折扣吗？",
+      "reference": "企业客户单笔订单满 20000 元可申请企业价，企业价在标准价基础上优惠 5%~12%，具体折扣由客户经理核定。",
+      "key_facts": ["20000 元", "5%~12%"],
+      "expected_sources": ["docs/kb/企业采购说明.txt"],
+      "expected_route": "rag",
+      "tags": ["企业采购"],
+      "note": "纯文本语料（.txt）：验证解析链路对非 Markdown 文档同样有效"
+    }
+  ]
+}
