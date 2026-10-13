@@ -30,3 +30,14 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 前端（第 16 步 web/）在本机受限环境下需要把三类全局目录指到工作区里，
+# 它们都是**缓存/配置**，不进版本库（`web/` 自己的 .gitignore 管 node_modules/.next）：
+#   .npm-cache  ← npm_config_cache（见 docs/runbook/16-web-runbook.md §1.1）
+#   .npm-config ← XDG_CONFIG_HOME（npx 的配置目录）
+#   .appdata    ← APPDATA/LOCALAPPDATA（create-next-app 等工具会往这里写）
+.npm-cache/
+.npm-config/
+.appdata/
+# uv 的缓存也常被指到工作区（前几步的 runbook 都这么写）
+.uv-cache/

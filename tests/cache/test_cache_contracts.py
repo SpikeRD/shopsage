@@ -363,11 +363,27 @@ def test_graph_runtime_has_a_cache_injection_point() -> None:
 def test_rag_node_checks_the_cache_before_retrieving() -> None:
     """缓存闸必须在**检索之前**（`13.cache.md` §5 最后一条的落点）。
 
-    判据用源码顺序：`cache.semantic_get` 出现在 `retrieve_docs(` 之前 ——
+    判据用源码顺序：`cache.semantic_get` 出现在检索调用之前 ——
     顺序反了的话「命中就整条链路都不走」这句话就不成立了（检索已经发生了）。
+
+    ⚠️ 第 16 步把检索调用从 `retrieve_docs(` 改成了 `await retrieve_docs_async(`
+    （同步入口不能在事件循环里跑，见 `docs/runbook/16-web-runbook.md` §10.1 坑 4），
+    所以这里的判据跟着改成 `retrieve_docs_async(` —— **顺序这条契约没变**，
+    只是被匹配的符号名变了一个后缀。两个名字都列出来是为了让将来任何一次
+    「换个入口名」都能被这条用例看见，而不是静默失效。
     """
     source = inspect.getsource(__import__("app.agents.rag", fromlist=["*"]))
-    assert source.index("cache.semantic_get") < source.index("docs = retrieve_docs(")
+    retrieval_at = min(
+        index
+        for index in (
+            source.find("await retrieve_docs_async("),
+            # ⚠️ 必须带上 `await `：裸的 `retrieve_docs(` 会命中**文件顶部的 import**
+            # （它在缓存闸之前，于是这条用例会以「顺序反了」的样子红掉 —— 实测踩到）
+            source.find("await retrieve_docs("),
+        )
+        if index != -1
+    )
+    assert source.index("cache.semantic_get") < retrieval_at
 
 
 def test_synthesis_uses_the_cached_answer_before_calling_the_model() -> None:

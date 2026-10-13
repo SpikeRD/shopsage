@@ -205,10 +205,33 @@ def _example_params(sql: str) -> str:
 
     参数名直接从 SQL 文本里抽（正则找 `:name`），不维护第二份清单：
     示例改了参数名而这里忘了改，模型看到的示例就是自相矛盾的。
+
+    ⚠️ **值必须是真实值，不许写 `<值>` 这类尖括号占位**（第 16 步实测踩到，见
+    `docs/runbook/16-web-runbook.md` §10.1 坑 5）：第一版输出的是
+    `{'uid': <值>, 'n': <值>}`，模型**照抄了尖括号**，于是
+    `LIMIT :n` 的绑定值是字符串 `"<值>"` → Postgres 报
+    `invalid input syntax for type bigint: "<值>"`；
+    带时间的查询更明显：`created_at >= :since` 绑成 `"<统计起始时间，如 2024-01-01>"` →
+    `InvalidDatetimeFormat`。两种都让查询查回 **0 行**，而症状看起来像
+    「库里没数据 / 图表出不来」——真实原因是「示例教坏了模型」。
+
+    值的来源：`uid` 由程序填（身份），`n` 是行数上限（程序给），其余是**用户问题里的值**。
     """
     names = re.findall(r":([a-z_][a-z0-9_]*)", sql)
     seen = list(dict.fromkeys(names))
-    return "{" + ", ".join(f"'{name}': <值>" for name in seen) + "}" if seen else "{}"
+    if not seen:
+        return "{}"
+    sample = {
+        "uid": "2",
+        "oid": "1024",
+        "n": "20",
+        "since": "'2026-01-01'",
+        "until": "'2026-12-31'",
+        "start": "'2026-01-01'",
+        "status": "'delivered'",
+    }
+    parts = [f"'{name}': {sample.get(name, '（用户问题里给出的值）')}" for name in seen]
+    return "{" + ", ".join(parts) + "}"
 
 
 #: 守卫规则名 → **可照做的修复动作**（`7.agents_module.md` §5 第三条的落点）。
@@ -240,6 +263,28 @@ RETRY_ACTIONS: Final[dict[str, str]] = {
 
 #: 表里没有的规则走这句兜底（**不静默**：它出现就说明 `RETRY_ACTIONS` 漏了）
 _FALLBACK_ACTION: Final[str] = "请按 PostgreSQL 只读查询的规范重写。"
+
+#: 绑定参数值的**占位符形状**：`<...>`、`XXX`、`值`、`待填` 这类「一看就不是值」的东西。
+#:
+#: 为什么要有这道检查（第 16 步实测，见 runbook §10.1 坑 5）：模型会照着示例写出
+#: `{"n": "<值>"}`、`{"since": "<统计起始时间，如 2024-01-01>"}`——
+#: 这些**不是** SQL 注入或越权，守卫与行级过滤自检都会放行（形状完全合规），
+#: 但数据库会以 `InvalidTextRepresentation` / `InvalidDatetimeFormat` 拒掉，
+#: 最终表现为「查回 0 行 / 出不了图」。在这里拦下并回喂一句可照做的指示，
+#: 比让它在 DB 层炸掉好：**守卫该拦的是「不可能执行的查询」，占位符正是其中一种**。
+_PLACEHOLDER_PARAM_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*(?:<[^>]*>|值|待填|待定|未知|示例值|xxx+|\?\?\?+|placeholder)\s*$",
+    re.IGNORECASE,
+)
+
+
+def placeholder_param_names(params: Mapping[str, Any]) -> tuple[str, ...]:
+    """挑出**值还是占位符**的绑定参数名（空元组 = 都像真值）。"""
+    bad: list[str] = []
+    for name, value in params.items():
+        if isinstance(value, str) and _PLACEHOLDER_PARAM_RE.match(value):
+            bad.append(str(name))
+    return tuple(bad)
 
 
 def _retry_hint(error: SQLSecurityError, *, is_customer: bool) -> str:
@@ -314,6 +359,24 @@ async def plan_sql(
             continue
         raws.append(str(payload))
         previous = str(payload)
+
+        # ①′ 绑定参数**不能是占位符**（`{"n": "<值>"}`）：形状合规但一定执行不了，
+        # 早拦一轮比让 DB 报 `invalid input syntax for type bigint` 便宜（见上方常量注释）
+        bad_params = placeholder_param_names(params)
+        if bad_params:
+            problem = (
+                f"绑定参数 {', '.join(bad_params)} 的值是占位符（如 `<值>` / `<起始时间>`）："
+                "params 里必须是**真实值** —— 行数上限给整数（如 20），"
+                "时间给 ISO 日期（如 '2026-01-01'），用户输入的值原样填。"
+                "不知道具体值时，改写查询去掉那个条件，不要留占位符。"
+            )
+            errors.append(f"[placeholder_params] {problem}")
+            logger.info(
+                "data 第 %d 次生成的绑定参数是占位符（%s），准备回喂报错重写",
+                attempt,
+                ", ".join(bad_params),
+            )
+            continue
 
         # ② 守卫校验（写语句/多语句/白名单/无 WHERE/超上限 全在这里被拦）
         try:
@@ -503,6 +566,7 @@ __all__ = [
     "allowed_tables",
     "build_data_messages",
     "data_node",
+    "placeholder_param_names",
     "plan_sql",
     "schema_text",
 ]

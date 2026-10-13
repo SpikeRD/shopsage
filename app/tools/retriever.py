@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -157,7 +158,7 @@ def retrieve_docs(
     min_score: float | None = None,
     caller: str | None = None,
 ) -> list[RetrievedDoc]:
-    """检索知识库，返回**带溯源**的结果（按 score 降序）。
+    """检索知识库，返回**带溯源**的结果（按 score 降序）——**同步版**。
 
     参数：
         query: 用户问题（非空）。
@@ -171,7 +172,78 @@ def retrieve_docs(
         `ToolContractError`：`query` 为空、`top_k` 不是正整数、`min_score` 不是数值，
             或没有任何调用者信息（审计不可绕过）；
         `ToolNotAvailableError`：默认后端（`rag/`）尚未落地，且没有注入 `search=`。
+        `RuntimeError`：**在事件循环线程里调用**（见下）。
+
+    ## ⚠️ 为什么这里要显式拒绝「在事件循环里调用」
+
+    默认后端 `app/rag/retriever.py::hybrid_search` 是**同步**入口，内部
+    `asyncio.run(...)`，所以它不能在已经有事件循环的线程里跑 —— 而那正是
+    FastAPI 路由与 LangGraph 节点的处境。
+
+    第一版没有这道检查，于是第 16 步（Web 端）第一次问知识库问题时：
+    检索抛 `RuntimeError: This event loop is already running`（或 `asyncio.run` 的
+    等价报错），被 `rag_node` 的兜底吞成 refusals，**用户看到的是「没有来源」**。
+    症状与「语料没灌」一模一样，而真相是「调用方式错了」—— 见
+    `docs/runbook/16.web-runbook.md` §10.1 坑 4。
+
+    异步调用方请用 `await retrieve_docs_async(...)`；脚本/同步调用方继续用本函数。
     """
+    _reject_inside_event_loop()
+    return _retrieve_docs(query, top_k, search=search, min_score=min_score, caller=caller)
+
+
+async def retrieve_docs_async(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    *,
+    search: Searcher | None = None,
+    min_score: float | None = None,
+    caller: str | None = None,
+) -> list[RetrievedDoc]:
+    """`retrieve_docs` 的**异步入口**（给 FastAPI 路由、LangGraph 节点用）。
+
+    两个刻意的决定：
+
+    1. **整段丢进 `asyncio.to_thread`**，而不是只把 `searcher(...)` 那一句丢进去 ——
+       审计上下文（`audit_tool_call`）、埋点（`record_retrieval`）与过滤都是
+       `with` 包着的一段，拆开会让「审计记到的耗时」与「真实检索耗时」对不上；
+    2. **复用同一份同步实现**，不另写一遍：两条路径共用一份逻辑，
+       「异步版少过滤一次」这种漂移就不可能发生（这也是 `9.api.md` §4 的
+       「一处真相」在本层的形态）。
+
+    `asyncio.to_thread` 会把当前 context 复制给工作线程，所以第 15 步 MCP 的
+    `caller_override`（contextvar）在异步路径上同样生效（`tests/mcp` 覆盖）。
+    """
+    return await asyncio.to_thread(
+        _retrieve_docs, query, top_k, search=search, min_score=min_score, caller=caller
+    )
+
+
+def _reject_inside_event_loop() -> None:
+    """在事件循环线程里调用同步入口时，给一条**能照着修**的报错。
+
+    与 `app/rag/retriever.py::Retriever.search_sync` 同一条纪律：不要让别人去猜
+    `RuntimeError: This event loop is already running` 是什么意思。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise RuntimeError(
+        "retrieve_docs() 不能在事件循环内调用（FastAPI 路由 / LangGraph 节点都是这种场景）："
+        "请改用 `await retrieve_docs_async(query, top_k, ...)`（它内部走 asyncio.to_thread）。"
+    )
+
+
+def _retrieve_docs(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    *,
+    search: Searcher | None = None,
+    min_score: float | None = None,
+    caller: str | None = None,
+) -> list[RetrievedDoc]:
+    """真正的实现（同步、无事件循环检查）；对外由上面两个入口包着。"""
     if not isinstance(query, str) or not query.strip():
         raise ToolContractError("query 不能为空（知识库检索必须带问题文本）")
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
@@ -251,4 +323,5 @@ __all__ = [
     "RetrievedDoc",
     "Searcher",
     "retrieve_docs",
+    "retrieve_docs_async",
 ]

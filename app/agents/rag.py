@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from typing import Any, Final
 
 from app.agents.state import GraphState, last_user_message, messages_of, role_of
-from app.tools import retrieve_docs
+from app.tools import retrieve_docs_async
 from app.tools.errors import ToolError, ToolNotAvailableError
 from app.tools.retriever import DEFAULT_TOP_K, MAX_TOP_K, Searcher
 
@@ -182,7 +182,12 @@ async def rag_node(
         }
 
     try:
-        docs = retrieve_docs(
+        # ⚠️ 这里是**异步**节点，必须走 `retrieve_docs_async`：
+        # 同步入口的默认检索后端内部是 `asyncio.run(...)`，在事件循环线程里会直接抛错，
+        # 而那个错会被下面的 `ToolNotAvailableError` 兜底**吞成 refusals** ——
+        # 用户看到「没有来源」，与「语料没灌」长得一模一样（第 16 步实测撞到，见
+        # `docs/runbook/16.web-runbook.md` §10.1 坑 4）。
+        docs = await retrieve_docs_async(
             question,
             effective_top_k,
             search=search,

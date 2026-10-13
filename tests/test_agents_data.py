@@ -220,6 +220,72 @@ async def test_data_without_read_permission_never_calls_llm() -> None:
     assert "read:own" in out["refusals"][0]
 
 
+def test_prompt_few_shot_params_are_real_values_not_placeholders() -> None:
+    """few-shot 里的「绑定参数」必须是**真实值**，不能是 `<值>` 这类占位符。
+
+    ⚠️ 这条是第 16 步（Web 端）实测撞出来的（`docs/runbook/16-web-runbook.md` §10.1 坑 5）：
+    第一版示例写的是 `{'uid': <值>, 'n': <值>}`，模型**照抄尖括号**，于是
+    `LIMIT :n` 绑成字符串 `"<值>"` → Postgres 报 `invalid input syntax for type bigint`；
+    带时间的查询绑成 `"<统计起始时间，如 2024-01-01>"` → `InvalidDatetimeFormat`。
+    两种都让查询查回 0 行，而界面上看起来像「库里没数据」。
+    示例教坏了模型，所以这条用例钉的是**示例本身**。
+    """
+    system = build_data_messages("我最近的三笔订单", is_customer=True, user_id=2)[0]["content"]
+    assert "<值>" not in system, "示例里的绑定参数又变成占位符了（模型会照抄）"
+    # 示例必须真的展示「uid 绑的是程序给的身份、n 绑的是整数」
+    params_line = [line for line in system.splitlines() if line.startswith("绑定参数：")]
+    assert params_line, "示例缺少「绑定参数」那一行"
+    for line in params_line:
+        assert "<" not in line and ">" not in line, f"这行示例里有尖括号占位符：{line}"
+
+
+async def test_data_retries_when_bound_params_are_placeholders() -> None:
+    """绑定参数是占位符 → 回喂报错重写，**不让它落到数据库层**。
+
+    占位符形状的 params 会通过守卫与行级过滤自检（形状完全合规），
+    只有数据库执行时才炸 —— 那时已经浪费了一次 LLM 调用与一次连接。
+    """
+    llm = FakeLLM(
+        schema_reply("SELECT status, count(*) AS c FROM orders WHERE status IS NOT NULL GROUP BY status LIMIT :n", n="<值>"),
+        schema_reply("SELECT status, count(*) AS c FROM orders WHERE status IS NOT NULL GROUP BY status LIMIT :n", n=20),
+    )
+    plan = await plan_sql("按状态统计订单", is_customer=False, user_id=7, llm=llm)
+
+    assert plan.ok is True
+    assert plan.attempts == 2, "第一次的占位符参数应当被拦下并要求重写"
+    assert plan.params["n"] == 20
+    assert any("placeholder_params" in error for error in plan.errors)
+    # 回喂给模型的话必须说清「怎么改」
+    assert "真实值" in llm.calls[1][-1]["content"]
+
+
+async def test_data_gives_up_on_persistent_placeholder_params() -> None:
+    """一直给占位符 → 用尽预算后降级（**不是**无限重试，也不是静默通过）。"""
+    llm = FakeLLM(
+        schema_reply("SELECT status, count(*) AS c FROM orders WHERE status IS NOT NULL GROUP BY status LIMIT :n", n="<返回的状态种类上限>")
+    )
+    plan = await plan_sql("按状态统计订单", is_customer=False, user_id=7, llm=llm)
+    assert plan.ok is False
+    assert plan.attempts == MAX_SQL_ATTEMPTS
+    assert any("placeholder_params" in error for error in plan.errors)
+
+
+def test_placeholder_param_names_detects_the_shapes_we_actually_saw() -> None:
+    """识别器必须覆盖实测见过的形状，且**不误伤**真值。"""
+    from app.agents.data import placeholder_param_names
+
+    # 实测见过的（第 16 步日志原文）
+    assert placeholder_param_names({"since": "<统计起始时间，如 2024-01-01>"}) == ("since",)
+    assert placeholder_param_names({"n": "<值>"}) == ("n",)
+    assert placeholder_param_names({"n": "<返回的状态种类上限>"}) == ("n",)
+    assert placeholder_param_names({"n": "值"}) == ("n",)
+    assert placeholder_param_names({"n": "xxx"}) == ("n",)
+    # 真值不许被误伤
+    assert placeholder_param_names({"n": 20, "uid": 2}) == ()
+    assert placeholder_param_names({"since": "2026-01-01", "status": "delivered"}) == ()
+    assert placeholder_param_names({"q": "小于 5 件"}) == ()
+
+
 def test_retry_actions_cover_every_guard_rule() -> None:
     """`RETRY_ACTIONS` 覆盖**守卫的每一条**规则，且不留死条目。
 

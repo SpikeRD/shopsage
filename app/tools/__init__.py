@@ -37,7 +37,7 @@ from app.tools.errors import (
     ToolNotAvailableError,
 )
 from app.tools.refund import RefundNotAllowed, RefundRef, create_refund_request, get_refund_status
-from app.tools.retriever import RetrievedDoc, retrieve_docs
+from app.tools.retriever import RetrievedDoc, retrieve_docs, retrieve_docs_async
 from app.tools.sql_executor import execute_readonly_query
 from app.tools.ticket import TicketRef, create_ticket, get_ticket_status
 
@@ -64,4 +64,5 @@ __all__ = [
     "get_refund_status",
     "get_ticket_status",
     "retrieve_docs",
+    "retrieve_docs_async",
 ]

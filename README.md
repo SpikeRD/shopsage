@@ -38,10 +38,18 @@
 | 3 **db** | ✅ **完成**（8 张表 / 迁移 / 种子 / 行级过滤 / 连接池） | `app/db/`、`alembic/`、`scripts/` | `uv run alembic upgrade head` → `uv run python -m scripts.seed` → `uv run python -m scripts.db_check --check` → `uv run pytest -q`（**97 passed, 1 skipped**） |
 | 4–8 security / llm / tools / agents / graph | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/security/`、`app/llm/`、`app/tools/`、`app/agents/`、`app/graph/` | `uv run pytest -q -k "graph or agents or tools or llm or security"`；第 8 步口径：`79 passed, 1 skipped`（图）+ 全量 `730 passed` |
 | 9 **api** | ✅ **完成**（**首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答；含 WebSocket 流式、限流、审批通道） | `app/api/`、`app/main.py`、`scripts/api_demo.py` | `uv run pytest -q tests/api`（**138 passed**）；`uv run python -m scripts.api_demo`（七个场景，首帧 **10~13ms**）；全量 **870 passed** |
+| 10–15 rag / observability / queue / cache / eval / mcp | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/rag/`、`app/observability/`、`app/queue/`、`app/cache/`、`app/eval/`、`app/mcp/` | 见各步 runbook 的状态表；第 15 步口径：全量 **1613 passed, 50 skipped, 13 deselected, 6 errors** |
+| 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py` | `cd web; npm test`（**65 passed**）；`npm run build`（**✓ 22.0s**）；`node tests/run-live.mjs`（**9 passed**，真后端 + 真前端）；全量 **1617 passed, 50 skipped, 13 deselected, 6 errors** |
 
 > 📌 第 9 步的启动方式：`uv run uvicorn app.main:app --reload --port 8000`
 > （`/docs` 看 OpenAPI、`/health` 看依赖状态、`WS /api/chat/stream` 走流式；
 > 逐步操作与排障见 [`docs/runbook/9.api-runbook.md`](docs/runbook/9.api-runbook.md)）。
+
+> 📌 第 16 步的启动方式（**两个进程**）：
+> ① 后端 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
+> ② 前端 `cd web; npm install --ignore-scripts; npm run dev` → <http://127.0.0.1:3000>；
+> ③ 登录令牌：`uv run python -m scripts.dev_token --role internal_employee`（粘贴到 `/login`）。
+> 逐步操作、坑与分诊见 [`docs/runbook/16-web-runbook.md`](docs/runbook/16-web-runbook.md)。
 
 常用命令（都在**仓库根**执行；本机无 Docker，数据库在 VMware-Linux 上）：
 
@@ -52,4 +60,17 @@ uv run alembic upgrade head                   # 建表 / 升级（连接串从 .
 uv run python -m scripts.seed                 # 灌演示数据（幂等：重复执行结果一致）
 uv run python -m scripts.db_check             # 现场核查：表、行数、约束统计
 uv run python -m scripts.db_check --check     # 验收断言：缺表/行数不足则退出码 1
+uv run python -m scripts.load_knowledge_base  # 灌知识库语料（跑完全量回归后必须重灌，见 16 runbook §10.1 坑 6）
+uv run python -m scripts.dev_token --role internal_employee   # 签一个能粘进 Web 登录页的演示令牌
+```
+
+前端（都在 `web/` 下执行；需要 Node ≥ 22，本机实测 v24.16.0）：
+
+```bash
+npm install --ignore-scripts   # ⚠️ 必须带 --ignore-scripts（见 16 runbook §10.1 坑 1）
+npm run dev                    # 开发模式 → http://127.0.0.1:3000
+npm test                       # 离线用例（65 条，不连后端）
+npm run typecheck              # 类型检查
+npm run build                  # 构建通过（验收第 1 条）
+node tests/run-live.mjs        # 真链路用例（9 条，需要后端在跑）
 ```
