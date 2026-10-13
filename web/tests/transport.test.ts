@@ -56,6 +56,9 @@ class FakeSocket implements WebSocketLike {
   }
 }
 
+/** 看门狗默认在测试里关掉：假 socket 永远不会自己 `open`（见 runbook §10.1 坑 16）。 */
+const NO_WATCHDOG = { handshakeTimeoutMs: 0, frameTimeoutMs: 0 } as const;
+
 function connect(token = "tok-123") {
   let socket: FakeSocket | null = null;
   const states: string[] = [];
@@ -68,8 +71,30 @@ function connect(token = "tok-123") {
     },
     onState: (state) => states.push(`${state.phase}:${state.seqs.length}`),
     now: () => 5_000,
+    ...NO_WATCHDOG,
   });
   return { handle, socket: () => socket as unknown as FakeSocket, states };
+}
+
+/** 造一个能同时拿到多条连接的装置（模拟 React 反复建连）。 */
+function multiConnect(token = "tok-123") {
+  const sockets: FakeSocket[] = [];
+  const create = (url: string, protocols: string[]) => {
+    const socket = new FakeSocket(url, protocols);
+    sockets.push(socket);
+    return socket;
+  };
+  const open = () =>
+    openChatStream({
+      token,
+      url: "ws://example.test/api/chat/stream",
+      socketFactory: create,
+      onState: () => {},
+      onClose: () => {},
+      now: () => 1_000,
+      ...NO_WATCHDOG,
+    });
+  return { sockets, open };
 }
 
 test("握手子协议：`shopsage.v1` 与 `bearer.<token>` **两个都要**（少一个就连不上）", () => {
@@ -128,23 +153,23 @@ test("无法解析的帧：本地造一条 bad_frame 并发成 failed（**不让
 
 test("4401 关闭：话术指向「重新登录」，且 phase=failed", () => {
   const codes: number[] = [];
-  let last: ReturnType<typeof openChatStream> | null = null;
-  let socket: FakeSocket | null = null;
-  last = openChatStream({
+  const sockets: FakeSocket[] = [];
+  const handle = openChatStream({
     token: "t",
     url: "ws://example.test/x",
     socketFactory: (url, protocols) => {
-      socket = new FakeSocket(url, protocols);
+      const socket = new FakeSocket(url, protocols);
+      sockets.push(socket);
       return socket;
     },
     onState: () => {},
     onClose: (code) => codes.push(code),
+    ...NO_WATCHDOG,
   });
-  assert.ok(last);
-  (socket as unknown as FakeSocket).emit("close", { code: 4401 });
+  sockets[0].emit("close", { code: 4401 });
   assert.deepEqual(codes, [4401]);
-  assert.equal(last.state().phase, "failed");
-  assert.match(last.state().error?.message ?? "", /重新登录/);
+  assert.equal(handle.state().phase, "failed");
+  assert.match(handle.state().error?.message ?? "", /重新登录/);
 });
 
 test("已经有 done 帧之后再关闭：不算失败（正常收尾）", () => {
@@ -172,13 +197,39 @@ test("socket error：话术里带**试过的 URL**、自查命令与要查的配
   assert.match(message, /NEXT_PUBLIC_API_BASE/, "指出要检查的配置项");
 });
 
-// ── 被抛弃的连接不许影响当前连接（坑 15：StrictMode 双挂载 / 热更新）──────────
+// ── 看门狗（坑 16）：没有它，「一直连接中」会永久卡住输入框 ────────────────────
 
-/** 造一个能同时拿到多条连接的装置（模拟 React 反复建连）。 */
-function multiConnect(token = "tok-123") {
+test("★握手超时：既不 open 也不 error 时必须自己收线并报错（否则输入框永久禁用）", async () => {
+  // 现场症状：「界面一直显示正在连接，没办法输入问题，点了新会话后就正常了」。
+  // 「新会话」只是把状态清空，**没有换 socket** —— 所以卡住的一定是 phase=connecting。
+  // 网络层吞掉 upgrade 时浏览器可能长时间既不 open 也不 error，必须自己兜。
+  const sockets: FakeSocket[] = [];
+  const states: string[] = [];
+  const handle = openChatStream({
+    token: "tok",
+    url: "ws://example.test/api/chat/stream",
+    socketFactory: (url, protocols) => {
+      const socket = new FakeSocket(url, protocols);
+      sockets.push(socket);
+      return socket;
+    },
+    onState: (state) => states.push(state.phase),
+    handshakeTimeoutMs: 20,
+    frameTimeoutMs: 0,
+  });
+  assert.equal(handle.state().phase, "connecting");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(handle.state().phase, "failed", "握手超时后必须变成 failed，界面才可能重新可用");
+  assert.equal(handle.state().error?.code, "connect_timeout");
+  assert.match(handle.state().error?.message ?? "", /check_web_cors/, "话术里要给出下一步动作");
+  assert.equal(sockets[0].closed?.code, 1000, "超时时要主动收线，别把连接挂在后台");
+  assert.deepEqual(states, ["connecting", "failed"]);
+});
+
+test("握手成功之后，看门狗**不许**再误报超时（否则正常连接会被自己掐断）", async () => {
   const sockets: FakeSocket[] = [];
   const handle = openChatStream({
-    token,
+    token: "tok",
     url: "ws://example.test/api/chat/stream",
     socketFactory: (url, protocols) => {
       const socket = new FakeSocket(url, protocols);
@@ -186,104 +237,154 @@ function multiConnect(token = "tok-123") {
       return socket;
     },
     onState: () => {},
+    handshakeTimeoutMs: 20,
+    frameTimeoutMs: 0,
+  });
+  sockets[0].emit("open", {});
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.notEqual(handle.state().phase, "failed");
+  assert.equal(handle.state().error, null);
+});
+
+test("★等回帧超时：握手成功但这一轮没有任何帧时，也必须收线（服务端被重启/静默切断）", async () => {
+  const sockets: FakeSocket[] = [];
+  const handle = openChatStream({
+    token: "tok",
+    url: "ws://example.test/api/chat/stream",
+    socketFactory: (url, protocols) => {
+      const socket = new FakeSocket(url, protocols);
+      sockets.push(socket);
+      return socket;
+    },
+    onState: () => {},
+    handshakeTimeoutMs: 0,
+    frameTimeoutMs: 20,
+  });
+  sockets[0].emit("open", {});
+  handle.ask("有人吗", "s1");
+  assert.equal(handle.state().phase, "streaming");
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(handle.state().phase, "failed");
+  assert.equal(handle.state().error?.code, "frame_timeout");
+});
+
+test("收到帧会重置等回帧的看门狗（慢回答不该被判成死连接）", async () => {
+  const sockets: FakeSocket[] = [];
+  const handle = openChatStream({
+    token: "tok",
+    url: "ws://example.test/api/chat/stream",
+    socketFactory: (url, protocols) => {
+      const socket = new FakeSocket(url, protocols);
+      sockets.push(socket);
+      return socket;
+    },
+    onState: () => {},
+    handshakeTimeoutMs: 0,
+    frameTimeoutMs: 40,
+  });
+  sockets[0].emit("open", {});
+  handle.ask("慢问题", "s1");
+  // 每 20ms 来一帧（< 40ms 的上限）：总时长超过上限，但不该被判超时
+  for (let index = 1; index <= 4; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    sockets[0].emitFrame({
+      event: "node",
+      seq: index,
+      ts: 1,
+      data: { node: `n${index}`, progress: "", delta: {} },
+    });
+  }
+  assert.equal(handle.state().phase, "streaming", "只要还在来帧，就不该被看门狗掐断");
+  assert.equal(handle.state().error, null);
+});
+
+// ── 被抛弃的连接不许影响当前连接（坑 15：StrictMode 双挂载 / 热更新）──────────
+
+/**
+ * 建一条连接并把状态收进 `box`。
+ *
+ * ⚠️ 首个参数是 `box` 而不是 `sockets`：**每次调用都必须新建一个 box** ——
+ * 第一版写成 `const { sockets, open } = multiConnect()` 然后 `open()` 两次，
+ * 结果**只有最后一次调用**的环境被记进 `onState`，于是「第一条连接的事件影响第二条」
+ * 这件事根本测不到（用例会以 `sockets[1] is undefined` 的形式露馅，见 runbook §10.1 坑 15）。
+ */
+function openInto(box: { state: ReturnType<typeof initialState>; sockets: FakeSocket[] }) {
+  return openChatStream({
+    token: "tok",
+    url: "ws://example.test/api/chat/stream",
+    socketFactory: (url, protocols) => {
+      const socket = new FakeSocket(url, protocols);
+      box.sockets.push(socket);
+      return socket;
+    },
+    onState: (next) => {
+      box.state = next;
+    },
     onClose: () => {},
     now: () => 1_000,
+    ...NO_WATCHDOG,
   });
-  return { handle, sockets };
 }
 
 test("★被关闭的旧连接再抛 error：**不许**污染当前状态（StrictMode 双挂载的现实场景）", () => {
   // 现场证据（后端日志）：同一个客户端端口出现两条 `/api/chat/stream` accepted，
   // 之后一条被强行关掉。React 开发模式的 StrictMode 会把 effect 跑两遍：
-  // 第一条连接被 cleanup.close() 掉，而它的 `error` 事件可能**在新连接已经工作之后**才到。
+  // 第一条连接被 cleanup.close() 掉，而它的 `error` 可能**在新连接已经工作之后**才到。
   // 若照单全收，用户会看到「聊得好好的，忽然报 WebSocket 连接失败」——正是实测那次。
-  const factory = (() => {
-    const sockets: FakeSocket[] = [];
-    return {
-      sockets,
-      create: (url: string, protocols: string[]) => {
-        const socket = new FakeSocket(url, protocols);
-        sockets.push(socket);
-        return socket;
-      },
-    };
-  })();
+  const box: { state: ReturnType<typeof initialState>; sockets: FakeSocket[] } = {
+    state: initialState(),
+    sockets: [],
+  };
 
-  let state = initialState();
   // ① 第一条连接（StrictMode 的第一次挂载）：还没 open 就被 cleanup 关掉
-  const first = openChatStream({
-    token: "tok",
-    url: "ws://example.test/api/chat/stream",
-    socketFactory: factory.create,
-    onState: (next) => {
-      state = next;
-    },
-    now: () => 1_000,
-  });
+  const first = openInto(box);
   first.close();
-  factory.sockets[0].emit("close", { code: 1000 });
+  box.sockets[0].emit("close", { code: 1000 });
 
-  // ② 第二条连接：StrictMode 的第二次挂载，正常收发
-  const second = openChatStream({
-    token: "tok",
-    url: "ws://example.test/api/chat/stream",
-    socketFactory: factory.create,
-    onState: (next) => {
-      state = next;
-    },
-    now: () => 1_000,
-  });
+  // ② 第二条连接（第二次挂载）：正常收发
+  const second = openInto(box);
   second.ask("我的订单到哪了", "s1");
-  factory.sockets[1].emitFrame({
+  box.sockets[1].emitFrame({
     event: "done",
     seq: 1,
     ts: 1,
     data: { flow_state: "delivered", thread_id: "u2:s1", session_id: "s1", blocked: false, approval: null },
   });
-  assert.equal(state.phase, "done");
+  assert.equal(box.state.phase, "done");
+  assert.equal(box.sockets.length, 2, "应当有两条连接（第一条被抛弃、第二条在用）");
 
   // ③ 迟到的 error/close：来自**已经被抛弃的**第一条连接
-  factory.sockets[0].emit("error", {});
-  factory.sockets[0].emit("close", { code: 1006 });
+  box.sockets[0].emit("error", {});
+  box.sockets[0].emit("close", { code: 1006 });
 
-  assert.equal(state.phase, "done", "迟到的 error 把 phase 打回 failed 了（用户会看到「连接失败」）");
-  assert.equal(state.error, null, "迟到的 error 污染了错误提示");
+  assert.equal(box.state.phase, "done", "迟到的 error 把 phase 打回 failed 了（用户会看到「连接失败」）");
+  assert.equal(box.state.error, null, "迟到的 error 污染了错误提示");
 });
 
 test("被抛弃的连接抛 error 时，当前连接仍然是干净的", () => {
-  const { sockets } = multiConnect();
-  const second = openChatStream({
-    token: "tok",
-    url: "ws://example.test/api/chat/stream",
-    socketFactory: (url, protocols) => {
-      const socket = new FakeSocket(url, protocols);
-      sockets.push(socket);
-      return socket;
-    },
-    onState: () => {},
-    now: () => 1_000,
-  });
-  sockets[0].emit("error", {});
+  const box: { state: ReturnType<typeof initialState>; sockets: FakeSocket[] } = {
+    state: initialState(),
+    sockets: [],
+  };
+  const first = openInto(box);
+  const second = openInto(box);
+  void first;
+  box.sockets[0].emit("error", {});
   assert.equal(second.state().error, null, "旧连接的 error 不该出现在当前状态里");
   assert.notEqual(second.state().phase, "failed");
 });
 
 test("ask 之后重连：新连接能正常发消息（被抛弃的连接不影响 ask）", () => {
-  const { sockets } = multiConnect();
-  sockets[0].emit("error", {});
-  const second = openChatStream({
-    token: "tok",
-    url: "ws://example.test/api/chat/stream",
-    socketFactory: (url, protocols) => {
-      const socket = new FakeSocket(url, protocols);
-      sockets.push(socket);
-      return socket;
-    },
-    onState: () => {},
-    now: () => 1_000,
-  });
+  const box: { state: ReturnType<typeof initialState>; sockets: FakeSocket[] } = {
+    state: initialState(),
+    sockets: [],
+  };
+  const first = openInto(box);
+  first.close();
+  box.sockets[0].emit("close", { code: 1000 });
+  const second = openInto(box);
   second.ask("还在吗", "s1");
-  assert.deepEqual(JSON.parse(sockets[1].sent[0]), { message: "还在吗", session_id: "s1" });
+  assert.deepEqual(JSON.parse(box.sockets[1].sent[0]), { message: "还在吗", session_id: "s1" });
 });
 
 test("★主动 close() 之后的 1006 不算「连接失败」（实测事件序列就是 error → close(1006)）", () => {

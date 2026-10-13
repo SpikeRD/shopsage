@@ -280,6 +280,14 @@ export interface OpenStreamOptions {
   onClose?: (code: number) => void;
   /** 注入时间源：测试里要能算出确定的 `firstFrameMs` */
   now?: () => number;
+  /**
+   * 握手超时（毫秒）。**没有它，「一直连接中」会永久卡住输入框**（坑 16）：
+   * 网络层吞掉 upgrade 时浏览器可能长时间既不 `open` 也不 `error`。
+   * `0` = 关掉（只给测试用：假 socket 永远不会自己 open 是正常的）。
+   */
+  handshakeTimeoutMs?: number;
+  /** 等回帧超时（毫秒），见 `handshakeTimeoutMs` 的说明；`0` = 关掉。 */
+  frameTimeoutMs?: number;
 }
 
 export interface ChatStreamHandle {
@@ -312,6 +320,19 @@ export interface ChatStreamHandle {
 let activeGeneration = 0;
 
 /**
+ * 握手超时的默认值（毫秒）。本机实测握手 < 100ms，8 秒已经非常宽松。
+ * ⚠️ 它的作用不是「快点报错」，而是**保证最终一定会报错** —— 见坑 16。
+ */
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 8_000;
+
+/**
+ * 一轮问答等回帧的超时（毫秒）。**按实测校准**：冷启动时后端要把
+ * bge-m3 + bge-reranker 拉进内存，实测整轮可以到 **109.7s**（§11 的证据表），
+ * 所以取 180s —— 比实测最慢的那次还宽一倍。
+ */
+export const DEFAULT_FRAME_TIMEOUT_MS = 180_000;
+
+/**
  * 建立一条流式连接。
  *
  * ⚠️ **子协议的顺序与内容都不是可选的**：`shopsage.v1` 必须在列表里
@@ -324,6 +345,8 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
   const now = options.now ?? (() => Date.now());
   const url = options.url ?? streamUrl();
   const protocols = [WS_SUBPROTOCOL, `${WS_TOKEN_PREFIX}${options.token}`];
+  const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+  const frameTimeoutMs = options.frameTimeoutMs ?? DEFAULT_FRAME_TIMEOUT_MS;
 
   // 本连接的世代号：**所有事件回调都先问一句「我还是当前那条连接吗」**
   const generation = (activeGeneration += 1);
@@ -339,10 +362,77 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
   };
   push({ ...state, phase: "connecting" });
 
+  // ── 看门狗（坑 16）：没有它，「一直连接中」会**永久**卡住输入框 ──────────────
+  //
+  // 两个真实的挂起窗口，各配一个超时：
+  //   ① **握手不回来**：网络层把这次 upgrade 吞掉（代理/防火墙/半开连接）时，
+  //      浏览器可能在几十秒内既不 `open` 也不 `error` —— 而 `running` 为真会禁用输入框，
+  //      用户看到的是「一直显示正在连接，没办法输入问题」；
+  //   ② **握手成功但这一轮没有回帧**：服务端进程被杀 / 连接被中间设备静默切断时，
+  //      客户端可能长时间收不到任何帧（也没有 close）。界面会永远转圈。
+  //
+  // 超时的取值是**实测校准**的，不是拍的：冷启动时后端要把 bge-m3 + reranker 拉进内存，
+  //   实测「真溯源」那一轮整轮可以到 **109.7s**（§11 的证据表），所以一轮的上限取 180s；
+  //   握手则应当很快（本机实测 < 100ms），8s 已经很宽松。
+  let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  let frameTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearTimers = () => {
+    if (handshakeTimer !== null) clearTimeout(handshakeTimer);
+    if (frameTimer !== null) clearTimeout(frameTimer);
+    handshakeTimer = null;
+    frameTimer = null;
+  };
+  const failWith = (code: string, message: string) => {
+    clearTimers();
+    push({ ...state, phase: "failed", error: { code, message } });
+  };
+
+  if (handshakeTimeoutMs > 0) {
+    handshakeTimer = setTimeout(() => {
+      if (!isCurrent() || state.phase !== "connecting") return;
+      // 主动收线（避免那条连接继续挂在后台），并显式说明「不是你的操作问题」
+      intentionalClose = true;
+      try {
+        // ⚠️ 传 1000 而不是裸 `close()`：关掉一条 CONNECTING 的连接时，
+        // 浏览器给的仍是 1006，但**我们这边**要表明「是主动放弃的」——
+        // 裸 `close()` 与 `close(1000)` 在真实浏览器里都会走 `error → close(1006)`，
+        // 差别只在于读代码的人能不能一眼看出意图（以及测试能不能断言）。
+        socket.close(1000);
+      } catch {
+        /* 已经坏了就算了 */
+      }
+      failWith(
+        "connect_timeout",
+        `握手超时：${Math.round(handshakeTimeoutMs / 1000)} 秒内没有收到服务端的 WebSocket 应答（${url}）。` +
+          "这种「既不成功也不报错」多半是网络层把这次 upgrade 吞了（代理/防火墙/半开连接）。" +
+          "先跑 `uv run python -m scripts.check_web_cors`（⑤ 会告诉你 upgrade 到底通不通），" +
+          "然后点页面上的「重连」再试一次。",
+      );
+    }, handshakeTimeoutMs);
+  }
+
+  const armFrameWatchdog = () => {
+    if (frameTimeoutMs <= 0) return;
+    if (frameTimer !== null) clearTimeout(frameTimer);
+    frameTimer = setTimeout(() => {
+      if (!isCurrent() || state.phase !== "streaming") return;
+      failWith(
+        "frame_timeout",
+        `等回帧超时：${Math.round(frameTimeoutMs / 1000)} 秒内没有收到任何帧。` +
+          "服务端可能正在被重启、或者这条连接被中间设备静默切断了（这种情况下浏览器不会给 close 事件）。" +
+          "点「重连」再试一次；若刚改过后端代码，确认它已经重启（本仓后端不带 --reload）。",
+      );
+    }, frameTimeoutMs);
+  };
+
   const socket = factory(url, protocols);
   const opened = new Promise<void>((resolve) => {
     socket.addEventListener("open", () => {
       if (!isCurrent()) return;
+      if (handshakeTimer !== null) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
       options.onOpen?.();
       resolve();
     });
@@ -350,6 +440,8 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
 
   socket.addEventListener("message", (event: unknown) => {
     if (!isCurrent()) return;
+    // 收到帧 = 这一轮还活着：把看门狗推后（见上面的两个挂起窗口）
+    armFrameWatchdog();
     const payload = (event as { data?: unknown }).data;
     try {
       push(reduceStream(state, parseFrame(typeof payload === "string" ? payload : String(payload)), now()));
@@ -365,6 +457,7 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
   });
 
   socket.addEventListener("close", (event: unknown) => {
+    clearTimers();
     const code = (event as { code?: number }).code ?? 1006;
     // 「主动关闭」不算失败（§10.1 坑 15）：CONNECTING 阶段被我们关掉时，
     // 浏览器给的就是 1006 —— 那句话面意思是「异常断开」，但成因是我们自己收的线
@@ -418,9 +511,12 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
       const body: Record<string, unknown> = { message };
       if (sessionId) body.session_id = sessionId;
       push(beginTurn(state));
+      // 发出问题后开始等回帧（`beginTurn` 把 phase 设成 streaming）
+      armFrameWatchdog();
       socket.send(JSON.stringify(body));
     },
     close() {
+      clearTimers();
       // ⚠️ **在 CONNECTING 阶段 close 会得到一个 `error`（实测，见 runbook §10.1 坑 15）**：
       // 浏览器还没握手就收到关闭请求，于是报一次 `error` 并以 1006 结束 —— 事件序列是
       // `error → close(1006)`，**看起来像连接失败，其实只是「还没来得及连就被收掉了」**。

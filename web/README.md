@@ -37,6 +37,10 @@ uv run python -m scripts.check_web_cors
 > 缺它的症状是页面上**一切**请求都 `TypeError: Failed to fetch` —— **没有任何状态码** ——
 > 而服务端日志里全是 `200 OK`。判据：**「令牌无效」会得到 401（能读到的响应），
 > 不是这种症状**。详见 runbook §10.1 坑 11。
+>
+> ⚠️ **连接有看门狗**（runbook §10.1 坑 16）：握手 8 秒没应答、或一轮 180 秒没有任何帧，
+> 都会被判成失败并给出「重连」按钮 —— 因为「一直显示正在连接」是比报错更糟的状态
+> （用户既得不到回答，也看不到原因）。两个值可用 `handshakeTimeoutMs` / `frameTimeoutMs` 注入覆盖。
 
 ## 命令
 
@@ -47,7 +51,7 @@ uv run python -m scripts.check_web_cors
 | `npm start` | 起构建产物 | 功能需要 |
 | `npm run typecheck` | 类型检查（`tsc --noEmit`） | 不需要 |
 | `npm run lint` | ESLint | 不需要 |
-| `npm test` | **离线**用例 91 条（帧时序 / 出处 / 图表 / 角色 / 令牌 / 传输 / 诊断 / 配置） | 不需要 |
+| `npm test` | **离线**用例 95 条（帧时序 / 出处 / 图表 / 角色 / 令牌 / 传输 / 诊断 / 配置） | 不需要 |
 | `node tests/run-live.mjs` | **真链路**用例 10 条（会自己签令牌；前端没起时它起） | 需要 |
 
 > ⚠️ `npm test` 只收 `tests/*.test.ts`，真链路那组在 `tests/live/`（**故意分开**：

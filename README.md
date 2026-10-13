@@ -39,7 +39,7 @@
 | 4–8 security / llm / tools / agents / graph | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/security/`、`app/llm/`、`app/tools/`、`app/agents/`、`app/graph/` | `uv run pytest -q -k "graph or agents or tools or llm or security"`；第 8 步口径：`79 passed, 1 skipped`（图）+ 全量 `730 passed` |
 | 9 **api** | ✅ **完成**（**首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答；含 WebSocket 流式、限流、审批通道） | `app/api/`、`app/main.py`、`scripts/api_demo.py` | `uv run pytest -q tests/api`（**138 passed**）；`uv run python -m scripts.api_demo`（七个场景，首帧 **10~13ms**）；全量 **870 passed** |
 | 10–15 rag / observability / queue / cache / eval / mcp | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/rag/`、`app/observability/`、`app/queue/`、`app/cache/`、`app/eval/`、`app/mcp/` | 见各步 runbook 的状态表；第 15 步口径：全量 **1613 passed, 50 skipped, 13 deselected, 6 errors** |
-| 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py`、`scripts/check_web_cors.py` | `cd web; npm test`（**91 passed**）；`npm run build`（**✓ 22.0s**）；`node tests/run-live.mjs`（**10 passed**）；`uv run python -m scripts.check_web_cors`（**五项全 ✅**）；全量 **1628 passed, 50 skipped, 13 deselected, 6 errors** |
+| 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py`、`scripts/check_web_cors.py` | `cd web; npm test`（**95 passed**）；`npm run build`（**✓ 22.0s**）；`node tests/run-live.mjs`（**10 passed**）；`uv run python -m scripts.check_web_cors`（**五项全 ✅**）；全量 **1628 passed, 50 skipped, 13 deselected, 6 errors** |
 
 > 📌 第 9 步的启动方式：`uv run uvicorn app.main:app --reload --port 8000`
 > （`/docs` 看 OpenAPI、`/health` 看依赖状态、`WS /api/chat/stream` 走流式；

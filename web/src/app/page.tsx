@@ -76,6 +76,23 @@ function ChatWorkspace({
   useEffect(() => {
     setConfigNotes(configWarnings());
   }, []);
+  /**
+   * 连接已耗时几秒（只在 `connecting` 时计时）。
+   *
+   * 为什么值得显示：坑 17 的现场是「一直显示正在连接…」而**没有任何时间信息** ——
+   * 用户无法判断是「刚打开」还是「卡死了」。有了秒数，「卡住」就变成一个可观察的事实，
+   * 而且它同时告诉用户「重连按钮在哪里」。
+   */
+  const [connectingSeconds, setConnectingSeconds] = useState(0);
+  useEffect(() => {
+    if (!chat.connecting) {
+      setConnectingSeconds(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = setInterval(() => setConnectingSeconds(Math.round((Date.now() - started) / 1000)), 500);
+    return () => clearInterval(timer);
+  }, [chat.connecting]);
 
   return (
     <div className="stack">
@@ -101,6 +118,18 @@ function ChatWorkspace({
             </div>
           </div>
           <div className="row">
+            {chat.connecting ? (
+              <>
+                <span className="badge warn">正在连接… {connectingSeconds}s</span>
+                <button className="btn ghost tiny" type="button" onClick={chat.reconnect}>
+                  重连
+                </button>
+              </>
+            ) : (
+              <span className={`badge ${chat.stream.phase === "failed" ? "danger" : "ok"}`}>
+                {chat.stream.phase === "failed" ? "连接已断开" : "已连接"}
+              </span>
+            )}
             {canUseInternal(role) ? (
               <Link className="btn ghost tiny" href="/internal">
                 切到对内查询
@@ -156,6 +185,16 @@ function ChatWorkspace({
         {chat.error ? (
           <div className="error-box" style={{ marginTop: 8 }}>
             {chat.error}
+            {/* ⚠️ 必须给「重连」按钮（坑 16）：卡在「正在连接」时，用户唯一的出路
+                不能是「点新会话」—— 那只是清了状态，socket 还是那条坏的 */}
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="btn tiny" type="button" onClick={chat.reconnect}>
+                重连
+              </button>
+              {chat.connectionAttempts > 1 ? (
+                <span className="small muted">已尝试 {chat.connectionAttempts} 次（自动重连过一次）</span>
+              ) : null}
+            </div>
           </div>
         ) : null}
         {refused.length > 0 ? (
