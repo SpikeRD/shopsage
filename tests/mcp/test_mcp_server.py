@@ -14,9 +14,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -25,6 +22,7 @@ from mcp import Client
 from app.mcp.server import build_server, describe_tools
 from app.mcp.settings import EXPOSED_TOOLS, McpSettings, SERVER_NAME, SERVER_VERSION
 from tests.mcp.conftest import tool_text
+from tests.mcp.demo_helpers import run_module
 
 #: 仓库根（CLI 必须在根目录跑：`uv run` 不改变工作目录，`app` 包从根解析）
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -134,24 +132,18 @@ def test_two_servers_with_different_identities_do_not_interfere(customer_setting
 # ── CLI 的两个入口 ─────────────────────────────────────────────────────────────
 
 
-def _run_cli(module: str, *args: str, actor_user_id: str = "1") -> subprocess.CompletedProcess[str]:
+def _run_cli(module: str, *args: str, actor_user_id: str = "1", io_encoding: str = "utf-8"):
     """在子进程里跑一次 CLI（`-m app.mcp` / `-m app.mcp.server`）。
 
     为什么必须起子进程：CLI 的坑几乎全在**进程边界**上（`sys.exit` 的码、
-    `-m` 与包的 `__import__` 顺序、stdout 与 stderr 的分工）。
-    用 `inspect` 读函数签名是看不出这些的 —— 本步实测就是靠这条用例抓到
-    「`-m app.mcp.server` 静默退出 0」的（runbook §10.1 坑 10）。
+    `-m` 与包的 `__import__` 顺序、stdout 与 stderr 的分工、**标准流编码**）。
+    用 `inspect` 读函数签名是看不出这些的 —— 本步实测就是靠这类用例抓到
+    「`-m app.mcp.server` 静默退出 0」与「cp936 下 print 崩掉」（runbook §10.1 坑 10/12）。
+
+    ⚠️ 环境由 `demo_helpers.child_env` 显式构造，**不继承**外层的 `PYTHONUTF8` ——
+    第一版直接继承 `os.environ`，于是用例只在我这台配好 UTF-8 的机器上绿。
     """
-    env = {**os.environ, "MCP_ACTOR_USER_ID": actor_user_id, "PYTHONUTF8": "1"}
-    return subprocess.run(
-        [sys.executable, "-m", module, *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        cwd=str(REPO_ROOT),
-        env=env,
-        timeout=120,
-    )
+    return run_module(module, *args, io_encoding=io_encoding, MCP_ACTOR_USER_ID=actor_user_id)
 
 
 def test_check_json_lists_the_exposure_and_exits_zero():
@@ -170,6 +162,19 @@ def test_check_refuses_to_start_without_an_identity():
     done = _run_cli("app.mcp", "--check", actor_user_id="")
     assert done.returncode == 2, f"stdout={done.stdout!r} stderr={done.stderr!r}"
     assert "MCP_ACTOR_USER_ID" in done.stdout, "报错必须说清怎么修（缺哪个配置项）"
+
+
+def test_check_survives_a_non_utf8_console():
+    """★`--check` 的输出在 cp936 控制台下必须照旧可读（`_pin_utf8_streams` 的作用）。
+
+    Windows 上 Python 默认按控制台代码页编码 stdout，而这段输出含中文、`≤` 等字符；
+    不钉 UTF-8 就会在 `print` 上抛 `UnicodeEncodeError`（本步实测：演示脚本就这么崩过，
+    见 runbook §10.1 坑 12）。这里用 `PYTHONIOENCODING=gbk` 显式模拟那台机器。
+    """
+    done = _run_cli("app.mcp", "--check", io_encoding="gbk")
+    assert done.returncode == 0, done.stderr
+    assert "UnicodeEncodeError" not in done.stderr, done.stderr[-1500:]
+    assert "sql_query" in done.stdout, "工具清单必须完整输出（不能在中途被编码问题截断）"
 
 
 def test_both_cli_entry_points_behave_identically():

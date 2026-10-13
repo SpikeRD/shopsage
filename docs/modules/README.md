@@ -20,7 +20,7 @@
 > [`12.queue-runbook.md`](../runbook/12.queue-runbook.md)（Arq 入队与 `job_id` 幂等 / 重试与死信 / 长任务不阻塞 API / 断点重放），
 > [`13.cache-runbook.md`](../runbook/13.cache-runbook.md)（语义缓存的三个阈值与灰区 / 命中率与成本口径 / 时效性旁路 / 十一个实测坑），
 > [`14.eval-runbook.md`](../runbook/14.eval-runbook.md)（golden dataset / Ragas 三指标的自持实现 / 单 vs 多 Agent 对照 / 报告与 CI 闸门 / 十一个实测坑），
-> [`15.mcp-runbook.md`](../runbook/15.mcp-runbook.md)（MCP 薄壳：四个工具与三层安全矩阵 / 身份边界（`MCP_POLICY` 与强制行级过滤）/ `caller_override` 审计归因 / 进程内 Client 与真 stdio 双证据 / 九个实测坑），
+> [`15.mcp-runbook.md`](../runbook/15.mcp-runbook.md)（MCP 薄壳：四个工具与三层安全矩阵 / 身份边界（`MCP_POLICY` 与强制行级过滤）/ `caller_override` 审计归因 / 进程内 Client 与真 stdio 双证据 / 十二个实测坑 —— 最后三个分别是「`-m` 的模块语义」「演示预期要随策略切换」「cp936 控制台编码」），
 > 另有不绑定某一步的底座命令手册 [`4.uv-pytest-basics.md`](../runbook/4.uv-pytest-basics.md)（uv 环境与 pytest 选用例）
 > 与 Docker 运维手册 [`17.docker-ops.md`](../runbook/17.docker-ops.md)（改了 `infra/` 配置或业务代码后，
 > Linux 上到底该跑 `up -d` 还是 `--force-recreate`/`--build`、从构建镜像到验收证据的完整链路）。

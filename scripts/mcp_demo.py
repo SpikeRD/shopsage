@@ -11,6 +11,10 @@
 | `retrieve` | 真检索的命中与引用长什么样？ | 真库 + pgvector + 本地 embedding |
 | `stdio` | 换一个进程、走真的 stdio 传输，客户端还能连上吗？ | 零依赖（起子进程） |
 
+⚠️ **`--policy internal` 时预期会变**（本步实测踩到的坑，见 runbook §10.1 坑 11）：
+`guard` 场景里「缺行级过滤 / 字面量过滤」两条**按设计放行**，它们会打印 `➖` 而不是 `✅`。
+其余场景照旧全绿（内部策略只是不再强制行级过滤，守卫与工具能力不变）。
+
 为什么要有 `stdio` 这一场（不是重复劳动）
 ------------------------------------------
 
@@ -33,12 +37,38 @@ import threading
 import time
 from typing import Any, Final
 
-from app.mcp import sync_calls, tools as tool_impl
+from app.mcp import sync_calls
 from app.mcp.server import build_server, describe_tools
 from app.mcp.settings import EXPOSED_TOOLS, McpSettings, SERVER_NAME, SERVER_VERSION
 from app.mcp.sync_calls import dumps
 from app.security.sql_guard import SQLSecurityError, validate_sql
 from mcp.server.mcpserver.exceptions import ToolError
+
+
+def _use_utf8_output() -> None:
+    """把本进程的 stdout/stderr 切到 UTF-8。
+
+    ⚠️ 这不是「顺手加一行」，而是**本脚本在 Windows 上能不能跑的前提**（实测报错）：
+
+        UnicodeEncodeError: 'gbk' codec can't encode character '\\u2705'
+
+    Windows 上 Python 默认按控制台的活动代码页编码标准输出（中文机器是 cp936/GBK），
+    而本脚本的输出里有 ✅ / ❌ / ➖ 这些 GBK 编不出来的字符 —— 于是**第一行明细就崩**，
+    更糟的是崩溃发生在 `print` 里、被场景级 `except` 接住，最后表现为
+    「所有场景都报 ❌ 且输出乱码」，看起来像功能坏了。
+
+    `reconfigure` 在 Python 3.7+ 可用；`errors="replace"` 是兜底（宁可显示成 `?`，
+    也不要让一次编码问题把整场演示炸掉）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - 极老的解释器或已被替换的流
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover - 已分离的流
+            continue
+
 
 #: 只读查询的演示 SQL（带行级过滤绑定；对客策略下这是**唯一**能通过的形态）
 DEMO_SQL: Final[str] = (
@@ -46,14 +76,23 @@ DEMO_SQL: Final[str] = (
     "WHERE user_id = :user_id ORDER BY order_id LIMIT 3"
 )
 
-#: 只读策略下必须被拦的形态（每一条都对应一个真实越权/越界场景）
+#: **两种策略下都必须被拦**的形态（静态守卫，与身份无关）。
+#: ⚠️ 这一组是 `scenario_guard` 的硬断言：任何一条没被拦住就说明守卫被绕过了。
 GUARD_DEMO: Final[tuple[tuple[str, str], ...]] = (
     ("写语句", "DELETE FROM orders"),
     ("多语句", "SELECT 1; DROP TABLE orders"),
     ("无 WHERE 全表", "SELECT order_id FROM orders"),
     ("白名单外的表", "SELECT order_id FROM secret_table WHERE user_id = :user_id"),
-    ("缺行级过滤", "SELECT order_id FROM orders WHERE status = :s LIMIT 5"),
-    ("字面量过滤", "SELECT order_id FROM orders WHERE user_id = 1 LIMIT 5"),
+)
+
+#: **只有 `customer` 策略才拦**的形态（本步新增的行级过滤那一层）。
+#: ⚠️ 它们在 `internal` 策略下**应该被放行** —— 那正是「内部策略是放宽」的具体含义
+#: （runbook §4.3 的风险清单）。实测踩到的形态：第一版把这两条和上面那四条写在一起，
+#: 于是 `--policy internal` 必然报「没拦住」（runbook §10.1 坑 11）——
+#: **演示脚本也必须随策略切换预期**，否则它会把「设计如此」报成「故障」。
+CUSTOMER_ONLY_DEMO: Final[tuple[tuple[str, str, dict[str, Any]], ...]] = (
+    ("缺行级过滤", "SELECT order_id FROM orders WHERE status = :s LIMIT 5", {"user_id": 1, "s": "paid"}),
+    ("字面量过滤", "SELECT order_id FROM orders WHERE user_id = 1 LIMIT 5", {"user_id": 1}),
 )
 
 
@@ -99,14 +138,23 @@ def scenario_discover(settings: McpSettings) -> bool:
 def scenario_guard(settings: McpSettings) -> bool:
     """静态守卫 + 行级过滤在这条入口上照旧生效（不需要库）。
 
-    ⚠️ 两种拒绝的**异常类型不同**，演示必须都接住（实测第一版漏了一个）：
+    三种拒绝的**异常类型不同**，演示必须都接住（实测漏接过一个）：
 
     * `SQLSecurityError`（带 `rule`）：`security.sql_guard` 的静态拦截；
     * `ToolError`：本层自己的拒绝（行级过滤那几条），规则名写在消息开头的方括号里。
 
-    「异常分三类」是第 6 步定下的口径，这里正是它在 MCP 入口处的样子。
+    ⚠️ 预期**随策略切换**（实测踩到的坑，见 runbook §10.1 坑 11）：
+
+    * `customer`：4 条守卫 + 2 条行级过滤，**全部**必须被拦（硬断言）；
+    * `internal`：只有 4 条守卫是硬断言；行级过滤那 2 条**应当被放行**，
+      它们这一场的价值变成「看见放宽的具体含义」（runbook §4.3 的风险清单）。
+
+    这一条之所以值得写进脚本而不是只写进文档：**演示脚本的预期也是一份断言**，
+    它写死了 `customer` 的预期却接受 `--policy internal`，就会把「设计如此」报成「故障」。
     """
     _section("场景 2：越权与写语句会被拦吗（零依赖，纯静态校验）")
+    print(f"策略：{settings.policy}（{_policy_note(settings)}）")
+
     all_blocked = True
     for label, sql in GUARD_DEMO:
         try:
@@ -116,13 +164,47 @@ def scenario_guard(settings: McpSettings) -> bool:
         except SQLSecurityError as exc:
             print(f"  ✅ {label}：BLOCK[{exc.rule}]（静态守卫）")
         except ToolError as exc:
-            rule = str(exc).split("]")[0].lstrip("[")
-            print(f"  ✅ {label}：BLOCK[{rule}]（MCP 入口的边界校验）")
+            print(f"  ✅ {label}：BLOCK[{_rule_of(exc)}]（MCP 入口的边界校验）")
+
+    for label, sql, params in CUSTOMER_ONLY_DEMO:
+        if settings.is_customer_scoped:
+            try:
+                sync_calls.sql_query_sync(sql, params, None, settings=settings)
+                print(f"  ❌ {label}：**没拦住** —— {sql}")
+                all_blocked = False
+            except (SQLSecurityError, ToolError) as exc:
+                print(f"  ✅ {label}：BLOCK[{_rule_of(exc)}]（MCP 入口的边界校验）")
+        else:
+            # 内部策略下这条**应该**放行：这是放宽，不是漏检。
+            # 只做静态校验（不执行），所以不需要库。
+            validate_sql(sql, max_rows=settings.max_rows)
+            print(f"  ➖ {label}：按设计放行（`internal` 策略不强制行级过滤，见 runbook §4.3）")
+
     # 正例只做**静态**校验（不执行）：本场景要能在没有库的机器上跑
     validate_sql(DEMO_SQL, max_rows=settings.max_rows)
-    sync_calls.assert_customer_row_filter(DEMO_SQL)
-    print("  ✅ 正例：带 `WHERE user_id = :user_id` 的查询通过静态校验（未执行）")
+    if settings.is_customer_scoped:
+        sync_calls.assert_customer_row_filter(DEMO_SQL)
+        print("  ✅ 正例：带 `WHERE user_id = :user_id` 的查询通过静态校验（未执行）")
+    else:
+        print("  ✅ 正例：带 `WHERE user_id = :user_id` 的查询通过静态校验（未执行）")
     return all_blocked
+
+
+def _policy_note(settings: McpSettings) -> str:
+    """一句话说清当前策略意味着什么（演示输出要能自己解释自己）。"""
+    return (
+        "强制行级过滤（缺过滤/字面量/跨用户一律拒绝）"
+        if settings.is_customer_scoped
+        else "不强制行级过滤（放宽：任何能连上本服务的客户端都能查全站，见 runbook §4.3）"
+    )
+
+
+def _rule_of(exc: BaseException) -> str:
+    """从异常里取规则名：`SQLSecurityError.rule` 是字段，`ToolError` 的写在消息开头。"""
+    rule = getattr(exc, "rule", None)
+    if isinstance(rule, str) and rule:
+        return rule
+    return str(exc).split("]")[0].lstrip("[")
 
 
 async def scenario_offline(settings: McpSettings) -> bool:
@@ -364,6 +446,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果摘要（给 CI 消费）")
     args = parser.parse_args(argv)
 
+    # ⚠️ 必须在**任何 print 之前**切 UTF-8：本脚本的输出含 ✅/❌/➖，
+    #    在 cp936 的 Windows 上不切换就会以 UnicodeEncodeError 崩溃（见 `_use_utf8_output`）。
+    _use_utf8_output()
+
     settings = McpSettings(policy=args.policy, actor_user_id=args.actor_user_id)
     problems = settings.validate()
     if problems:
@@ -382,15 +468,16 @@ def main(argv: list[str] | None = None) -> int:
                 outcome = asyncio.run(outcome)
             results[name] = bool(outcome)
         except Exception as exc:  # noqa: BLE001 - 演示脚本：任何场景崩了都要继续跑完
-            print(f"❌ 场景 {name}（{label}）崩了：{type(exc).__name__}: {exc}")
+            print(f"  ❌ 场景 {name}（{label}）崩了：{type(exc).__name__}: {exc}")
             results[name] = False
 
     _section("汇总")
     for name in selected:
         print(f"  {'✅' if results[name] else '❌'} {name:<12}{SCENARIOS[name][0]}")
+    summary = {"ok": all(results.values()), "scenarios": results}
     if args.json:
-        print(json.dumps({"ok": all(results.values()), "scenarios": results}, ensure_ascii=False))
-    return 0 if all(results.values()) else 1
+        print(json.dumps(summary, ensure_ascii=False))
+    return 0 if summary["ok"] else 1
 
 
 if __name__ == "__main__":  # pragma: no cover - 脚本入口

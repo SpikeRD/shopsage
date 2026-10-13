@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from typing import Any, Final, Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -62,6 +63,33 @@ from app.mcp.settings import (
 #: 传输方式（`MCPServer.run` 的白名单）。默认 stdio：MCP 客户端配置里最常见、
 #: 也最少暴露面（进程由客户端自己拉起，不监听端口）。
 Transport = Literal["stdio", "sse", "streamable-http"]
+
+
+def _pin_utf8_streams() -> None:
+    """把 stdin/stdout/stderr 钉成 UTF-8。
+
+    ⚠️ 这一条对 **stdio 传输是协议正确性**，不是显示偏好：
+
+    * MCP 的 stdio 传输是「一行一个 JSON-RPC 报文」，而**协议规定用 UTF-8**；
+      工具描述与错误消息里全是中文（`settings.TOOL_DESCRIPTIONS`）。
+    * Windows 上 Python 的默认标准流编码是**控制台活动代码页**（中文机器 = cp936）。
+      cp936 编得出中文，但编不出 emoji 之类的字符 —— 一旦某个客户端把工具结果里的
+      字符喂回来，写 stdout 就会抛 `UnicodeEncodeError`，
+      而它发生在**协议写出**这一侧，症状是客户端看到「连接莫名断掉」。
+    * `--check` 的输出同理：它给 CI 与人看，编码坏了就是乱码（本步实测：
+      `scripts/mcp_demo.py` 就因为这个坑在 cp936 shell 里崩过，见 runbook §10.1 坑 12）。
+
+    `errors="strict"` 而不是 `"replace"`：协议通道上把字符静默换成 `?` 会破坏 JSON 语义，
+    宁可报错也不要发一份「看起来正常但内容已被改写」的报文。
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - 已被替换/管道化的流
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except (OSError, ValueError):  # pragma: no cover - 已分离的流
+            continue
 
 
 def build_server(settings: McpSettings | None = None) -> MCPServer:
@@ -248,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         help="自检结果以 JSON 输出（给脚本/CI 消费；默认给人看）",
     )
     args = parser.parse_args(argv)
+    _pin_utf8_streams()
 
     try:
         settings = get_settings()
@@ -289,8 +318,6 @@ def main(argv: list[str] | None = None) -> int:
     server = build_server(settings)
     # ⚠️ stdio 传输下 **stdout 是协议通道**：任何调试打印都会污染 JSON-RPC 流
     # （症状是客户端报「无法解析服务端消息」）。所以日志一律走 stderr。
-    import sys
-
     print(
         f"[mcp] 启动 {SERVER_NAME} {SERVER_VERSION} | transport={args.transport} | "
         f"policy={settings.policy} | actor_user_id={settings.actor_user_id}",
@@ -302,7 +329,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = ["Transport", "build_server", "describe_tools", "main"]
-
 
 if __name__ == "__main__":  # pragma: no cover - 让 `python -m app.mcp.server` 与 `-m app.mcp` 等价
     # ⚠️ 这四行不是可有可无的装饰（本步实测撞到）：`python -m <module>` 把该模块当 `__main__`
