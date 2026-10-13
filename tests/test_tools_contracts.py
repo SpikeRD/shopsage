@@ -64,16 +64,30 @@ def test_public_tools_are_documented_and_callable():
 
 
 def test_every_public_tool_requires_caller_keyword():
-    """★审计不可绕过：每个公开工具都必须有一个**必填的关键字参数** `caller`。"""
+    """★审计不可绕过：每个公开工具都必须有一个 **keyword-only** 的 `caller`。
+
+    ⚠️ 第 15 步（mcp）之后这条契约的判据从「必填」改成「**可归属**」，理由是
+    `caller` 的取值现在有两个来源：显式传入，或由入口声明
+    （`app.tools.audit.caller_override`，供「一个入口服务多种调用者」的场景用）。
+    但「不可绕过」这条**没有被放宽**：两个来源都没有时，`audit_tool_call` 直接抛
+    `ToolContractError`（拒绝执行）。所以这里同时钉住两件事：
+    形状（keyword-only）与「两条来源都没有就拒绝」。
+    """
     missing: list[str] = []
     for name, func in _public_tools().items():
         signature = inspect.signature(func)  # type: ignore[arg-type]
         parameter = signature.parameters.get("caller")
         if parameter is None or parameter.kind is not inspect.Parameter.KEYWORD_ONLY:
             missing.append(f"{name}（缺 keyword-only 的 caller）")
-        elif parameter.default is not inspect.Parameter.empty:
-            missing.append(f"{name}（caller 有默认值，等于可选）")
-    assert not missing, "这些工具没有强制的 caller 审计参数：" + "; ".join(missing)
+    assert not missing, "这些工具没有 keyword-only 的 caller 审计参数：" + "; ".join(missing)
+
+    # 「两条来源都没有」必须拒绝：这是本契约的真正内核
+    from app.tools.audit import caller_override
+    from app.tools.errors import ToolContractError
+
+    assert caller_override.get() is None, "测试不该依赖外部设置的 caller_override"
+    with pytest.raises(ToolContractError, match="caller"):
+        tools_pkg.execute_readonly_query("SELECT order_id FROM orders WHERE user_id = :uid LIMIT 1", {"uid": 1})
 
 
 def test_no_public_tool_can_accept_raw_sql_from_llm_without_guard():

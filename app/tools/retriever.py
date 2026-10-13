@@ -155,7 +155,7 @@ def retrieve_docs(
     *,
     search: Searcher | None = None,
     min_score: float | None = None,
-    caller: str,
+    caller: str | None = None,
 ) -> list[RetrievedDoc]:
     """检索知识库，返回**带溯源**的结果（按 score 降序）。
 
@@ -164,10 +164,12 @@ def retrieve_docs(
         top_k: 期望条数（`1..MAX_TOP_K`，超出会被夹住）。
         search: 检索后端；`None` = 用 `app/rag/retriever.py::hybrid_search`（第 10 步）。
         min_score: 相似度下限（低于此值的命中丢弃）；`None` = 不过滤。
-        caller: 审计字段「谁在调用」（必填）。
+        caller: 审计字段「谁在调用」。`None` = 用**入口声明的**调用者
+            （`app/tools/audit.caller_override`，第 15 步 MCP 薄壳走这条）。
 
     异常：
-        `ToolContractError`：`query` 为空、`top_k` 不是正整数、`min_score` 不是数值；
+        `ToolContractError`：`query` 为空、`top_k` 不是正整数、`min_score` 不是数值，
+            或没有任何调用者信息（审计不可绕过）；
         `ToolNotAvailableError`：默认后端（`rag/`）尚未落地，且没有注入 `search=`。
     """
     if not isinstance(query, str) or not query.strip():

@@ -26,6 +26,7 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Final
@@ -34,6 +35,21 @@ from app.security.masking import mask_pii
 from app.tools.errors import ToolContractError
 
 logger = logging.getLogger("app.tools.audit")
+
+#: **入口声明的调用者**（第 15 步 mcp / 第 9 步 api 这类"外壳"用它给整条调用链盖章）。
+#:
+#: 为什么需要它（本步实测撞到的一个真问题）：工具函数的签名里 `caller` 是**必填**，
+#: 但它只有一个位置 —— 同一个 MCP 进程可能同时服务多个客户端，调用点自己拼 caller
+#: 既会漏也会漂（每次新增入口都要记得写对）。更坏的形态是外壳自己再包一层审计
+#: （`audit_tool_call(..., caller="mcp:sql_query")` 然后调用工具），于是
+#: **同一次调用产生两条审计记录**：`rows` 与耗时被记两遍，「被拒的调用」还会因为
+#: 内层先抛而看起来像两次失败。
+#:
+#: 所以正确的做法是让**入口声明、内层复用**：入口设一次 `caller_override`，
+#: 工具内部的 `audit_tool_call` 就用它，全链路只有一条记录、一个 caller。
+#: `ContextVar` 而不是全局变量：它是 per-task 的，并发请求不会互相串（实测见
+#: `tests/mcp/test_mcp_audit.py` 的并发用例）。
+caller_override: ContextVar[str | None] = ContextVar("app_tools_caller_override", default=None)
 
 # 审计日志用的**最严角色**口径：日志会被很多人、很多系统看到，不该出现任何等级的 PII。
 # `customer_service` 在 `policy.ROLE_MAX_SENSITIVITY` 里的上限是 SENSITIVITY_PUBLIC(0)，
@@ -208,9 +224,31 @@ class AuditHandle:
 
 
 @contextmanager
-def audit_tool_call(tool: str, *, caller: str, **args: Any) -> Iterator[AuditHandle]:
-    """给一次工具调用包上审计：成功记 INFO，失败记 WARNING，**两种情况都落一条**。"""
-    handle = AuditHandle(tool, caller, args)
+def audit_tool_call(
+    tool: str, *, caller: str | None = None, **args: Any
+) -> Iterator[AuditHandle]:
+    """给一次工具调用包上审计：成功记 INFO，失败记 WARNING，**两种情况都落一条**。
+
+    `caller`（审计字段「谁在调用」）的取值顺序：
+
+    1. 显式传进来的 `caller`（工具调用方知道自己在什么路径上时走这条 —— 例如
+       `agents/data.py` 传 `agent:data`、运维脚本传 `script:fix`）；
+    2. 入口声明的 `caller_override`（第 15 步 MCP / 第 9 步 API 这类"外壳"盖章，见其说明）；
+    3. 两者都没有 → `ToolContractError`（**拒绝执行**）。
+
+    第 3 条是关键：审计不可绕过（「不知道谁在调用」宁可不做）。
+    第 2 条解决的是「一个入口要服务多种调用者」的问题 —— 同一个 MCP 进程可能同时
+    服务多个客户端，让每个调用点自己拼 caller 会漏、会漂。
+    """
+    resolved = caller if isinstance(caller, str) and caller.strip() else caller_override.get()
+    if not resolved:
+        # 审计不可绕过：没有调用者就没有「谁干的」这个字段，宁可拒绝执行。
+        raise ToolContractError(
+            "工具调用必须显式传 caller（审计字段：谁在调用工具），"
+            "或由入口设置 app.tools.audit.caller_override。约定取值如 "
+            f"{', '.join(CALLER_PREFIXES)}…（见 6.tools-runbook §3.3）"
+        )
+    handle = AuditHandle(tool, resolved, args)
     try:
         yield handle
     except BaseException as exc:  # noqa: BLE001 - 审计要覆盖所有失败形态，包括取消
@@ -239,6 +277,7 @@ __all__ = [
     "AuditRecord",
     "audit_records",
     "audit_tool_call",
+    "caller_override",
     "new_audit_id",
     "redact_args",
 ]

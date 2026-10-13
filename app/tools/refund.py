@@ -145,7 +145,7 @@ def create_refund_request(
     amount: Any,
     *,
     idempotency_key: str,
-    caller: str,
+    caller: str | None = None,
     role: str = "customer_service",
     reason: str | None = None,
     session: Session | None = None,
@@ -276,7 +276,7 @@ def create_refund_request(
 def get_refund_status(
     refund_id: int,
     *,
-    caller: str,
+    caller: str | None = None,
     requester_user_id: int | None = None,
     session: Session | None = None,
 ) -> RefundRef | None:

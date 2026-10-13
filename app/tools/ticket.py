@@ -73,7 +73,7 @@ def create_ticket(
     ticket_type: str,
     *,
     idempotency_key: str,
-    caller: str,
+    caller: str | None = None,
     role: str = "customer",
     assignee_id: int | None = None,
     session: Session | None = None,
@@ -84,14 +84,15 @@ def create_ticket(
         user_id: 工单归属的客户。
         ticket_type: 工单类型（`TICKET_TYPES` 之一，如 `refund` / `logistics`）。
         idempotency_key: 幂等键（必填，形状校验见 `write_path.validate_idempotency_key`）。
-        caller: 审计字段「谁在调用」（必填）。
+        caller: 审计字段「谁在调用」。`None` = 用**入口声明的**调用者
+            （`app/tools/audit.caller_override`，第 15 步 MCP 薄壳走这条）。
         role: 调用方角色，决定有没有 `write:ticket` 权限（默认 `customer`：客户可以建工单）。
         assignee_id: 预分配的客服（可空；真实系统通常由派单规则决定）。
         session: 复用调用方的事务（测试/组合操作，**提交由调用方负责**）；`None` = 自己开写会话并提交。
 
     异常：
         `PermissionDenied`：角色缺 `write:ticket`；
-        `ToolContractError`：类型/幂等键/用户非法；
+        `ToolContractError`：类型/幂等键/用户非法，或没有任何调用者信息（审计不可绕过）；
         `RetryableToolError` / `PermanentToolError`：数据库侧失败（分类见 `errors.py`）。
     """
     if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
@@ -190,7 +191,7 @@ def create_ticket(
 def get_ticket_status(
     ticket_id: int,
     *,
-    caller: str,
+    caller: str | None = None,
     requester_user_id: int | None = None,
     session: Session | None = None,
 ) -> TicketRef | None:

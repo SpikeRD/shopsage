@@ -75,6 +75,10 @@ def pytest_configure(config) -> None:
         "markers",
         "llm_live: 需要真实 LLM API key 的探活用例（花钱；CI 与日常用 `-m 'not llm_live'` 排除）",
     )
+    config.addinivalue_line(
+        "markers",
+        "mcp_live: 需要真库/真检索的 MCP 端到端用例（默认跳过，用 --mcp-live 开门）",
+    )
 
 
 def pytest_addoption(parser) -> None:
@@ -86,6 +90,8 @@ def pytest_addoption(parser) -> None:
     于是 `uv run pytest -q -m "not llm_live" --rag-live`（全量 + 真模型）这条命令
     会直接启动失败，而 `uv run pytest -q tests/rag --rag-live`（只跑子目录）却是好的 ——
     这种「只有某种用法可用」的开关最容易被误认为「参数没生效」。
+
+    `--mcp-live`（第 15 步）同理：它必须在**这一层**注册，理由与上面完全一样。
     """
     group = parser.getgroup("rag")
     group.addoption(
@@ -93,6 +99,12 @@ def pytest_addoption(parser) -> None:
         action="store_true",
         default=False,
         help="跑需要真实 embedding/rerank 模型的用例（~20s 加载 + 真算力）",
+    )
+    parser.getgroup("mcp").addoption(
+        "--mcp-live",
+        action="store_true",
+        default=False,
+        help="跑 MCP 的真依赖端到端用例（真 PostgreSQL + 真检索 + 真写工单）",
     )
 
 

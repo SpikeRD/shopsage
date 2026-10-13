@@ -152,7 +152,7 @@ def build_chart_spec(
     max_points: int = DEFAULT_MAX_POINTS,
     sort_by: str | None = None,
     descending: bool = False,
-    caller: str,
+    caller: str | None = None,
 ) -> dict[str, Any]:
     """把查询结果组装成结构化图表 spec。
 

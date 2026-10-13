@@ -30,6 +30,7 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.1.2",
     "langgraph-checkpoint-redis>=0.5.2",
     "litellm>=1.50",
+    "mcp>=1.0",
     "openai>=1.0",
     "opentelemetry-exporter-otlp-proto-http>=1.45.1",
     "opentelemetry-sdk>=1.45.1",
@@ -80,4 +81,9 @@ asyncio_mode = "auto"
 markers = [
     # 真实厂商探活（花钱/需密钥）：默认不跑；CI 与日常用 `-m "not llm_live"` 排除
     "llm_live: 需要真实 LLM API key 的探活用例（见 tests/test_llm_live.py、docs/runbook/5.llm-runbook.md §4）",
+    # 需要真依赖栈（PostgreSQL + pgvector + 本地 embedding）：默认不跑；见 tests/mcp/test_mcp_live.py
+    "mcp_live: 需要真库/真检索的 MCP 端到端用例（默认跳过，用 --mcp-live 开门）",
 ]
+
+# MCP 端到端用例的开关：`uv run pytest tests/mcp --mcp-live` 才跑真依赖那几条
+# （与第 14 步 `--rag-live` 同一种写法：真依赖单独开门，默认回归零依赖）

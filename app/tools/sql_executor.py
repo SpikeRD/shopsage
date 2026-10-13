@@ -145,7 +145,7 @@ def execute_readonly_query(
     params: Mapping[str, Any] | None = None,
     *,
     max_rows: int | None = DEFAULT_MAX_ROWS,
-    caller: str,
+    caller: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """校验并执行一条只读查询，返回 `(rows, meta)`。
 
@@ -153,11 +153,13 @@ def execute_readonly_query(
         sql: 单条 SELECT（守卫会拒绝多语句/写语句/无 WHERE/超上限）。
         params: 绑定参数（`text()` 的 `:name` 形式）；**永远用参数绑定，不要拼字符串**。
         max_rows: 本次结果的行数上限（只能调低，见 `_resolve_rows_cap`）。
-        caller: 审计字段「谁在调用」，必填（见 `app/tools/audit.py`）。
+        caller: 审计字段「谁在调用」。`None` = 用**入口声明的**调用者
+            （`app/tools/audit.caller_override`，第 15 步 MCP 薄壳走这条）。
+            两者都没有 → `ToolContractError`：审计不可绕过（见 `app/tools/audit.py`）。
 
     异常：
         `SQLSecurityError`：SQL 未过校验（**原样抛出**，带 `rule` 字段，第 9 步映射成 400）；
-        `ToolContractError`：参数形状不合法；
+        `ToolContractError`：参数形状不合法，或没有任何调用者信息（审计不可绕过）；
         `RetryableToolError` / `PermanentToolError`：数据库侧执行失败（分类见 `errors.py`）；
         `PermissionDenied`：只读角色没有该表的 SELECT 权限（第 4 步的授权没跑）。
     """
