@@ -64,7 +64,7 @@ function toAssistantMessage(state: StreamState): Message {
   return {
     id: messageId("assistant"),
     role: "assistant",
-    text: turn.answer || "（这一轮没有产生回答：看下面的状态与拦下原因）",
+    text: turn.answer || fallbackText(turn),
     citations: turn.citations,
     flowState: turn.flowState,
     route: turn.route,
@@ -72,6 +72,27 @@ function toAssistantMessage(state: StreamState): Message {
     degraded: turn.degraded,
     refusals: [],
   };
+}
+
+/**
+ * `answer` 帧为空时给用户看的话 —— **必须按 flow_state 分情况**。
+ *
+ * ⚠️ 实测踩到（对客页问「帮我申请一笔退款」）：挂起等审批的那一轮，后端刻意**不发回答正文**
+ * （`answer.text` 是空串，什么都不做才是对的 —— 批准之前不该调用写路径），
+ * 而第一版这里一律显示「这一轮没有产生回答：看下面的状态与拦下原因」。
+ * 那句话会让用户以为**助手卡住了 / 坏了**，但页面上其实已经渲染出「需要人工确认」面板、
+ * 气泡也带了「待人工确认」徽章 —— **是文案在误导，不是链路有问题**。
+ *
+ * 所以：挂起时明确说「在等你在下面点批准」；被拦下与正常投递各自说自己的话。
+ */
+function fallbackText(turn: { flowState: string | null; blocked: boolean }): string {
+  if (turn.flowState === "approval_required") {
+    return "这一轮没有直接回答 —— 它被判定为需要人工确认的操作，已经在下方挂起。请点「批准并继续」或「拒绝」。";
+  }
+  if (turn.flowState === "blocked" || turn.blocked) {
+    return "这一轮被安全策略拦下了，没有产生回答。原因见下方面板的拦截信息。";
+  }
+  return "（这一轮没有产生回答：看下面的状态与拦下原因）";
 }
 
 export function useChatStream(options: UseChatStreamOptions): UseChatStreamResult {

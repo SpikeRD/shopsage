@@ -119,6 +119,63 @@ test("ask：带上 session_id 时原样发出；不带时不写这个键", () =>
   assert.deepEqual(JSON.parse(socket().sent[1]), { message: "再问一句" });
 });
 
+/**
+ * ★ 这条是**实测故障的防回归**（runbook §10.1 坑 20）：握手成功后 phase 必须离开 `connecting`。
+ *
+ * 现场症状：对客页徽章永远「正在连接… Ns」秒数一直涨、发消息没反应，而后端完全健康
+ * （`WS /api/chat/stream [accepted]`、`open` 都正常）。死锁是这样形成的：
+ *
+ * ```text
+ * ① useChatStream.send() 判 phase === "connecting" → 把消息排队，**不发送**；
+ * ② 那条排队只在 open 事件里冲一次 —— 而 open 早就在用户点发送之前发生了，队列当时是空的；
+ * ③ 后端不会主动发帧 → 收不到帧 → 而 phase 唯一能离开 connecting 的路径就是「收到帧」。
+ * ```
+ *
+ * 于是「没发 → 没帧 → 状态不动 → 更不发」自我锁死，页面一条消息都出不去。
+ * 修法是：open 时把 phase 推到 `idle`（可发状态）。本用例钉住那个推进。
+ */
+test("★握手成功后 phase 必须离开 connecting（否则 send 会永远排队 —— 坑 20）", () => {
+  const { handle, socket, states } = connect();
+  assert.equal(handle.state().phase, "connecting", "建连后初始状态就是握手忙");
+  assert.equal(socket().readyState, 0);
+
+  socket().readyState = 1; // 握手成功（浏览器里 readyState 变成 OPEN）
+  socket().emit("open", {});
+
+  assert.notEqual(
+    handle.state().phase,
+    "connecting",
+    "open 之后 phase 还停在 connecting：send 会把消息一直排进 pendingRef，" +
+      "而冲队列的时机（open）已经过去 → 页面永远发不出任何消息（实测故障）",
+  );
+  assert.equal(handle.state().phase, "idle", "握手成功后应当是「可发」状态");
+  assert.deepEqual(states.at(-1), "idle:0", "这个推进必须**推给调用方**（页面据此显示已连接）");
+});
+
+test("★握手成功后，onOpen 与 await ready() 照旧（推进 phase 不许顶掉它们）", async () => {
+  let opened = 0;
+  let ref: FakeSocket | null = null;
+  const handle = openChatStream({
+    token: "tok-123",
+    url: "ws://example.test/api/chat/stream",
+    socketFactory: (url, protocols) => {
+      ref = new FakeSocket(url, protocols);
+      return ref;
+    },
+    onState: () => {},
+    onOpen: () => {
+      opened += 1;
+    },
+    now: () => 5_000,
+    ...NO_WATCHDOG,
+  });
+  const socket = ref as unknown as FakeSocket;
+  socket.readyState = 1;
+  socket.emit("open", {});
+  await handle.ready();
+  assert.equal(opened, 1, "onOpen 必须被调用（排队中的消息靠它发出）");
+});
+
 test("ask 之后 phase=streaming，上一轮的产物被清掉", () => {
   const { handle, socket } = connect();
   handle.ask("第一轮", "s1");

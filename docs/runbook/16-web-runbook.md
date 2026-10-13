@@ -93,7 +93,9 @@
 | 「检索回 0 条 → 回答没有来源」 | Windows | §10.1 坑 6（向量库被全量回归清空了） |
 | 「图表出不来」 | Windows | §10.1 坑 5（Text-to-SQL 把绑定参数写成占位符） |
 | 「HTTP 好好的，一进对客页就说 WebSocket 连接失败」 | Windows | §10.1 坑 14（base 指到了前端自己；自检 ⑤ 一次定位） |
+| 「照 `next dev` 的 Network 地址打开：页面能开、却一直显示连不上，发消息也没反应」 | Windows | **§10.1 坑 18**（该来源不在 `API_CORS_ORIGINS`；自检加 `--web <你实际打开的地址>` 一次定位。**首选 `http://127.0.0.1:3000` 打开**） |
 | 「一直显示正在连接…、输入框点不动（点新会话就好了）」 | Windows | §10.1 坑 16 / 17（看门狗 + 重连接线；页面现在显示 `正在连接… Ns`） |
+| 「秒数一直涨、消息也上屏了但**永远等不到回答**，刷新也没用」 | Windows | **§10.1 坑 20**（握手成功但 phase 没离开 `connecting` → `send` 永远排队；真 bug，已修） |
 | 「聊得好好的，忽然弹一条 WebSocket 连接失败」 | Windows | §10.1 坑 15（僵尸连接；看后端日志里同一端口的两条 `accepted`） |
 | 「令牌明明是对的，登录页却说它是刷新令牌」 | Windows | §10.1 坑 13（`typ` 被读成 `type`） |
 | 「一切请求都 `Failed to fetch`，而服务端日志是 200」 | Windows | §10.1 坑 11（缺 CORS）**别重签令牌** |
@@ -1261,6 +1263,159 @@ React 的双挂载、热更新、切页都会产生「被抛弃但仍会发事�
 而它们的 `error`/`close` 与真实故障**长得一模一样**。
 凡是共享一份状态的地方（我这里就是 hook 里的 `stream` state），都要有世代号。
 
+**坑 18：照 `next dev` 打印的 Network 地址打开页面 → 页面能开、WS 也连得上，但「连不上」且发消息没反应**
+
+坑 14 附带那条（网卡地址不在白名单）的**实测复发记录**（第二次踩，值得单列成一条完整的坑）：
+
+```text
+现象（用户原话）：对客入口进入页面后一直无法连接，也无法正常与助手对话。
+                 —— 而且「两个进程都已经起了、真链路 10 条全绿」之后**依然如此**。
+
+三条现场证据（缺一条就会误判）：
+  ① 后端日志：只有 WebSocket accepted，**一条 POST /api/chat 都没有**
+  ② 前端日志：⚠ Cross origin request detected from 192.168.167.141 to /_next/* resource
+              （说明浏览器实际是用**网卡地址**打开的页面）
+  ③ 自检（唯一能一次定位的一条）：
+     uv run python -m scripts.check_web_cors --web http://192.168.167.141:3000
+     ③ ❌ Access-Control-Allow-Origin = （空）   ④ ❌ 预检 HTTP 400   ⑤ ✅ WS 101
+```
+
+**为什么症状是「既连不上、又没反应」**（两条相反的结论叠在一起）：
+
+| 出口 | 受不受 CORS 约束 | 网卡地址打开时 |
+|---|---|---|
+| `WS /api/chat/stream` | **不受**（WS 不跨源） | ✅ 能升级 —— 所以前端**看着像连上了** |
+| `GET /health`（登录页探活） | 受 | ❌ 读不到响应 → 页面显示「连不上后端」 |
+| `POST /api/chat`、`/api/chat/approve` | 受 | ❌ 一律失败 → 发消息后没有任何反应 |
+
+⚠️ 还有一个更隐蔽的后果：`OPTIONS` 预检不是 200 而是 **400**（来源不合格时预检本来就该失败），
+所以「跨源被拦」在浏览器里表现为**两种不同的错**（探活是 `Failed to fetch`、预检是 400）——
+别把它们当成两个问题。
+
+**修法（`.env`，然后必须重启后端）**：
+
+```powershell
+# .env —— ⚠️⚠️ 这一项一旦设置就【完全替代】开发期默认值（默认只有 localhost:3000 与 127.0.0.1:3000），
+#      不是「追加」。所以三个来源都要列上，少一个就又变成「换个地址打开就坏」。
+API_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://192.168.167.141:3000
+# 然后重启后端（.env 是启动时读的，坑 8 同一类顺序问题）
+```
+
+**两条纪律（这条坑真正的教训）**：
+
+1. **网卡地址是 DHCP 给的，会变**。本机实测被 `next dev` 打印过 `.156`，后来变成 `.141` ——
+   `.env` 里写死的那一行早晚会失效，而症状与这次**一模一样**（用户只会说「又连不上了」）。
+   ⚠️ 所以**首选 `http://127.0.0.1:3000` 或 `http://localhost:3000` 打开页面**（默认就在白名单里）；
+   只有真的要给「局域网里另一台设备」访问时才需要配网卡地址。
+   IP 变了怎么查：`check_web_cors --web http://<新IP>:3000`，它会直接给出该写进 `.env` 的那一行。
+2. **「真链路全绿」不等于「浏览器能用」**。这次的顺序很值得记住：
+   我先跑完 `node tests/run-live.mjs` **10 passed**，而用户的浏览器**依然不能用** ——
+   因为真链路是 Node 直接 fetch（**永远看不到 CORS 的效果**，§7.5 / 坑 11）。
+   判据只有一个：**`check_web_cors --web <你实际打开的那个地址>`**，来源必须**逐字**对上
+   （`localhost` / `127.0.0.1` / 网卡地址是**三个**不同来源）。
+
+**坑 19：页面长期开着时，后端被重启 / 前端热更新 → 徽章卡在「正在连接… Ns」，发消息无反应**
+
+坑 15/16/17 的**配套现象**，第三次报「一直无法连接」时实测定位到的那一层：
+
+```text
+用户现象：访问 http://127.0.0.1:3000（**来源本来就是对的**）：
+          徽章「正在连接… Ns」秒数一直涨；发消息没有任何反应。
+Console：  stream.ts:529 WebSocket connection to 'ws://127.0.0.1:8000/api/chat/stream' failed:
+           WebSocket is closed before the connection is established.
+```
+
+**`stream.ts:529` 就是 `socket.close(1000)` 那一行** —— 也就是说，那句报错是**客户端自己**
+主动收线造成的（握手看门狗 8s 超时，或 React 双挂载 / 热更新的 cleanup），
+**不是服务端拒绝**。判据三件事可以同时确认：
+
+| 判据 | 实测 |
+|---|---|
+| 控制台行号是否落在 `close()` 上 | ✅ `stream.ts:529` = `socket.close(1000)` |
+| 后端日志有没有收到这次握手 | ✅ `WebSocket /api/chat/stream [accepted]` + `connection open`（**accept 发生在鉴权之前**，所以有日志只代表「到了后端」） |
+| 裸 socket 自己完成一次握手 | ✅ `HTTP/1.1 101` + `Sec-WebSocket-Protocol: shopsage.v1`（服务端完全正常） |
+
+**成因（三条叠在一起，各占一部分）**：
+
+1. **本仓后端没有 `--reload`**（坑 8），所以每次改后端代码都得**手动重启** ——
+   而重启会让**所有已建立的 WS 连接一起断**（浏览器侧就是一次 1006）；
+2. **React 开发模式的双挂载 + 热更新**会在 `CONNECTING` 阶段就 `close()` 掉一条连接（坑 15），
+   那条连接必然在控制台留下「closed before the connection is established」——
+   **它是噪音，不是根因**；
+3. 真正让人卡住的是**界面状态**：自动重连「最多一次」由 `attemptsRef` 计数，
+   而 `reconnect()`（以及 `send()` 在 `failed` 分支里）会把它**重置为 1** ——
+   于是「重连→失败→点重连」这个循环里，徽章会反复回到「正在连接… Ns」，
+   用户看到的就是「秒数一直涨、什么都发不出去」。
+
+**修法（按代价从低到高）**：
+
+1. **硬刷新页面**：`Ctrl+F5`。多数情况到此为止（页面里那条坏连接与坏状态一起没了）；
+2. **还不行就关掉这个标签页重开**：热更新有可能让 React 树停在坏状态，`Ctrl+F5` 未必救得回来；
+   这也是「为什么开发者自己那边永远是好的」—— 开发者的页面是刚打开的；
+3. 重新登录（本仓演示令牌**只活 30 分钟**，坑 13 那条徽章会显示剩余分钟数）；
+
+
+**坑 20：握手成功了，但 `phase` 永远停在 `connecting` → 页面**一条消息都发不出去**（真 bug，已修）**
+
+坑 19 是「环境 + 噪音」，这一条是**前端的真逻辑缺陷**：它让对客页在**后端完全健康**时
+100% 不可用，而且**刷新页面修不好** —— 这正是与坑 19 的关键区别（坑 19 刷新/重开标签页就能好）。
+
+```text
+用户现象：徽章「正在连接… Ns」秒数一直涨（9s / 17s / 31s…），发消息永远没有回复。
+Console：  stream.ts:529 … WebSocket is closed before the connection is established.
+后端日志：WebSocket /api/chat/stream [accepted] + connection open —— **服务端一切正常**
+```
+
+**定位手法（这一步值得记）**：HTTP 侧全绿、裸 WS 也能 `101` 时，**别再用 curl 猜** ——
+用**真实浏览器**跑一次（`--headless=new` + CDP 驱动；本仓没有 Playwright，脚本见 §10.4）。
+实测拿到的页面侧时间线（临时给源码插 `window.__csdbg`）把死锁钉死了：
+
+```text
+hook effect run  connectionKey=0
+openChatStream  gen=1  → push connecting      ← StrictMode 第一次挂载
+openChatStream  gen=2  → push connecting      ← 第二次挂载（真正生效的那条）
+error  gen=1 current=false                    ← 旧连接被 cleanup 收线（**就是 Console 那句噪音**）
+close  gen=1 intentionalClose=true
+open   gen=2 current=true   → onOpen()
+6s 后探针：gen=2 readyState=1 protocol=shopsage.v1 phase=connecting   ← **open 了，phase 没动**
+```
+
+**根因是一条自锁**（三件事互相依赖，缺一都不会发生）：
+
+```text
+① useChatStream.send() 判 `phase === "connecting"` → 把消息**排队**（pendingRef），不发送；
+② 那条排队只在 `open` 事件里冲一次 —— 而 open 早在用户点发送**之前**就发生了，队列当时是空的；
+③ 后端不会主动发帧；而 `phase` 唯一能离开 `connecting` 的路径是**收到一帧**。
+```
+
+于是：**没发送 → 没有帧 → 状态不动 → 更不发送**。`frame_timeout` 看门狗（180s）也救不了它 ——
+它只在 `phase === "streaming"` 时计时，而这个页面**永远进不到 streaming**。
+
+**修法**：`openChatStream` 的 `open` 监听里，握手成功就把 phase 推出 `connecting`
+（`web/src/lib/stream.ts`）：
+
+```ts
+push({ ...state, phase: "idle" });   // open 之后「可发」，send 不再把消息排进黑洞
+```
+
+**为什么以前没测出来**：`transport.test.ts` 的假 socket **从来不发 `open`**（看门狗默认关掉，
+见 `NO_WATCHDOG` 的注释），所以「open 之后会发生什么」这一格一直是空的；而真链路用例跑在 Node 里，
+没有 React、也没有「先排队再 open」这个时序。**这就是必须用真浏览器跑一次的判据。**
+
+**防回归（两层，都已加）**：
+
+* 运行期：`transport.test.ts` ★「握手成功后 phase 必须离开 connecting」——真开一条连接、
+  发一次 `open` 事件、断言 phase 与推给调用方的状态；
+* 源码级：`hook-wiring.test.ts` ★「握手成功的 open 里必须推进 phase」——挡住有人把这一行删掉。
+
+**判据（下次一眼分清是坑 19 还是坑 20）**：
+
+| | 坑 19 | 坑 20 |
+|---|---|---|
+| 刷新页面（`Ctrl+F5`）后 | **好了** | **照样卡住**（刷新不改变代码里的自锁） |
+| 后端日志 | 有 `accepted`，之后可能没帧 | 有 `accepted` + `connection open`，**永远没有帧**（客户端根本没发） |
+| 输入框 | 卡住 / 点不动 | **能打字、能点发送，消息也上屏**，就是永远等不到回答 |
+
 ### 10.2 排障顺序（三条路，别乱）
 
 1. **先确认两个进程各自在跑哪一版、连的是谁**：
@@ -1283,7 +1438,9 @@ React 的双挂载、热更新、切页都会产生「被抛弃但仍会发事�
 | **11 / 12（跨源 / 进程没起）** | **是**（「连不上后端」「令牌全无效」） | **后端缺 CORS 中间件** + 两个进程都得人来起 |
 | **13（`typ` 被读成 `type`）** | **是**（「这是刷新令牌」—— 而令牌完全正确） | **前端读错契约键名**（真令牌为准的验证能一次抓到，见 §7.6） |
 | **14（base 指到前端自己）** | **是**（「HTTP 通、WebSocket 死」） | **HTTP 有两个出口而 WS 只有一个** + `NEXT_PUBLIC_API_BASE` 是构建期变量 |
+| **18（照网卡地址打开页面）** | **是**（「一直无法连接」+「发消息没反应」——而同一条 WS 明明连上了） | `API_CORS_ORIGINS` 白名单里没有那个来源（**且设了它就替代默认值**）+ 网卡 IP 会变 |
 | **15（被抛弃的旧连接报错）** | **是**（「聊得好好的忽然报连接失败」——URL 还是对的） | **React 双挂载 / 热更新**产生的僵尸连接 + `CONNECTING` 阶段 close 会得到 `error` |
+| **20（握手成功但 phase 卡在 connecting）** | **是**（「秒数一直涨、发不出去」，而**后端日志一切正常**） | **前端自己的状态机**：`send` 判 `connecting` 就排队，而 phase 只能靠「收到帧」离开 `connecting` → 自锁（真 bug，已修 + 两层防回归） |
 | 9（把前端当安全边界） | 不是（它是设计纪律） | 分层 |
 
 这张表的用途只有一个：**下次看到「前端坏了」，先按 10.2 的三步确认根因在哪一层** ——
@@ -1299,6 +1456,27 @@ React 的双挂载、热更新、切页都会产生「被抛弃但仍会发事�
 * **坑 15**：**能用不代表没有错** —— 报错可能来自一条已经没人要的连接。
   判据是后端日志里「同一个客户端端口出现两条 `accepted`」；
   修法是**世代号**（旧连接不许改状态），而不是去查后端。
+
+### 10.4 用真浏览器复现（本仓没有 Playwright，靠 CDP）
+
+离线用例覆盖不到「React + 真实握手时序」这一类问题（坑 20 就是这么漏掉的），
+所以这类故障要**用真浏览器**跑一次。无头 Chrome + Node 自带 WebSocket 就够，不需要装任何依赖：
+
+```powershell
+# ① 起一个客户令牌并写进页面登录态 → ② 驱动 Chrome 打开对客页、点一条建议问题、回读徽章与帧
+.\.venv\Scripts\python.exe -m scripts.dev_token --role customer --user-id 2 --ttl 7200 --json
+node .appdata\cdp-repro.mjs
+```
+
+脚本做的事（`.appdata/cdp-repro.mjs`，走 `DevToolsActivePort` + CDP 协议）：
+写 `localStorage` 的 `shopsage.token.customer` → 打开 `/` → 回读徽章与消息气泡 →
+点一条建议问题 → 打印 WebSocket 生命周期与浏览器 console。
+
+⚠️ 两条环境限制（都是本机沙箱的边界，**不是代码问题**）：
+
+* Chrome 需要创建 mojo 命名管道，受限沙箱下会
+  `FATAL:mojo\public\cpp\platform\platform_channel.cc: Check failed: 拒绝访问` —— 要在放宽的模式下跑；
+* `next build` 在受限沙箱下会 `spawn EPERM`，此时以 `npm test` + 真浏览器实测为准。
 
 ---
 

@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ShopSage 对客页连接自检</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 860px; margin: 28px auto; padding: 0 16px; line-height: 1.6; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .muted { opacity: .7; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 14px; font-size: 14px; }
+  th, td { border: 1px solid rgba(128,128,128,.35); padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { background: rgba(128,128,128,.12); width: 44px; text-align: center; }
+  .ok { color: #0a7d33; font-weight: 600; }
+  .bad { color: #c0392b; font-weight: 600; }
+  code { background: rgba(128,128,128,.16); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+  #summary { margin-top: 16px; padding: 12px 14px; border-radius: 8px; border: 1px solid rgba(128,128,128,.35); }
+</style>
+</head>
+<body>
+<h1>对客页连接自检</h1>
+<p class="muted">这一页在<b>你的浏览器里</b>真实地打后端与前端，把结果列在下面 —— 用来判断「连不上」到底卡在哪一层。</p>
+
+<table id="rows">
+  <thead><tr><th>#</th><th>检查项</th><th>结果</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<div id="summary">正在自检…</div>
+
+<script>
+const API = "http://127.0.0.1:8000";
+const rowTemplate = (n, name) => {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<th>${n}</th><td>${name}</td><td class="detail">…</td>`;
+  document.querySelector("#rows tbody").appendChild(tr);
+  return tr.querySelector(".detail");
+};
+
+function report(cell, ok, text) {
+  cell.innerHTML = `<span class="${ok ? "ok" : "bad"}">${ok ? "✅" : "❌"}</span> ${text}`;
+}
+
+const results = [];
+
+/**
+ * 读「对客入口」存的令牌。
+ *
+ * ⚠️ `auth.ts::writeSession` 存的是**裸 JWT 字符串**（`storage.setItem(key, session.token)`），
+ * 不是 JSON。第一版这里先 `JSON.parse`，于是把一个**完全正确**的登录态报成
+ * 「解析失败：Unexpected token 'e'」—— 自检工具自己给出了假信号（比没有工具更糟）。
+ * 所以两种形状都认：裸串直接用；万一将来改成存对象，也能取 `.token`。
+ */
+function readStoredToken() {
+  let raw = null;
+  try { raw = localStorage.getItem("shopsage.token.customer"); } catch {}
+  if (!raw) return null;
+  let token = raw.trim();
+  if (token.startsWith("{")) {
+    try { token = JSON.parse(token)?.token ?? token; } catch {}
+  }
+  return token;
+}
+
+(async function run() {
+  // ① 当前页面来源 —— 「谁在连谁」的第一个未知量
+  const origin = location.origin;
+  {
+    const cell = rowTemplate(1, "当前页面的来源（浏览器实际用的那个）");
+    cell.innerHTML = `<code>${origin}</code>`;
+    results.push(true);
+  }
+
+  // ② 直连后端 /health（跨源）
+  let healthOk = false;
+  {
+    const cell = rowTemplate(2, "跨源请求后端 <code>GET /health</code>");
+    try {
+      const res = await fetch(`${API}/health`);
+      const body = await res.json();
+      healthOk = res.ok;
+      report(cell, res.ok, `HTTP ${res.status} · status=<code>${body.status}</code> · env=<code>${body.env}</code>`);
+    } catch (exc) {
+      report(cell, false, `${exc.name}: <code>${exc.message}</code> —— 响应没被读到（跨源被拦 / 后端没起 / 地址错）`);
+    }
+    results.push(healthOk);
+  }
+
+  // ③ 把来源与后端白名单对照 —— 这是「跨源被拦」的判据
+  {
+    const cell = rowTemplate(3, "该来源是否在后端白名单里");
+    if (!healthOk) {
+      report(cell, false, "上头 ② 就没通，先修 ② 再看这一项");
+      results.push(false);
+    } else {
+      report(cell, true, "能读到响应 ⇒ 这个来源已被后端放通（否则 ② 必然失败）");
+      results.push(true);
+    }
+  }
+
+  // ④ WebSocket 握手（对客页的主链路；WS 不受跨源约束）
+  {
+    const cell = rowTemplate(4, "WebSocket <code>/api/chat/stream</code> 握手");
+    const ok = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      let ws;
+      try { ws = new WebSocket(`${API.replace("http", "ws")}/api/chat/stream`, ["shopsage.v1"]); }
+      catch (exc) { report(cell, false, `构造失败：<code>${exc.message}</code>`); return finish(false); }
+      const timer = setTimeout(() => { report(cell, false, "8 秒超时（端口上没人接 upgrade）"); finish(false); }, 8000);
+      ws.addEventListener("open", () => {
+        clearTimeout(timer);
+        report(cell, true, `握手成功（子协议 <code>${ws.protocol || "（无）"}</code>）；关闭码 <code>4401</code>=未带令牌，属正常`);
+        ws.close(); finish(true);
+      });
+      ws.addEventListener("error", () => { clearTimeout(timer); report(cell, false, "error 事件（地址错 / 进程没起）"); finish(false); });
+      ws.addEventListener("close", (e) => {
+        clearTimeout(timer);
+        if (e.code === 4401) { report(cell, true, `握手成功且被鉴权拒（关闭码 <code>4401</code>）—— WS 这条路是通的`); finish(true); }
+      });
+    });
+    results.push(ok);
+  }
+
+  // ⑤ 前端页面自己的路由（同源）
+  {
+    const cell = rowTemplate(5, "前端自己的 <code>/api/kb</code>（同源，永远该通）");
+    try { const res = await fetch("/api/kb"); report(cell, res.ok, `HTTP ${res.status}`); results.push(res.ok); }
+    catch (exc) { report(cell, false, `${exc.name}: ${exc.message}`); results.push(false); }
+  }
+
+  // ⑥ 登录态：对客页要的那把钥匙在不在、有没有过期
+  {
+    const cell = rowTemplate(6, "对客入口的登录态（<code>localStorage</code>）");
+    const token = readStoredToken();
+    if (!token) {
+      report(cell, false, "没有登录态 —— 页面会显示「需要先登录」，先去 <code>/login</code> 粘贴令牌");
+      results.push(false);
+    } else {
+      try {
+        const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+        const left = Math.round((payload.exp * 1000 - Date.now()) / 60000);
+        const ok = left > 0;
+        report(cell, ok, `role=<code>${payload.role}</code> · user_id=<code>${payload.sub}</code> · typ=<code>${payload.typ ?? payload.type ?? "(缺)"}</code> · 剩余 <b>${left}</b> 分钟${ok ? "" : "（已过期，要重签）"}`);
+        results.push(ok);
+      } catch (exc) { report(cell, false, `解析失败：<code>${exc.message}</code>`); results.push(false); }
+    }
+  }
+
+  // ⑦ 真链路：拿**你的真令牌**完整问一轮 —— 这是对客页做的同一件事，只是没有 React。
+  //    目的：把「链路问题」与「页面状态问题」分开。
+  //    ⑦ 通 + 对客页仍卡在「正在连接」 ⇒ 问题 100% 在 React 那一层的状态，不在网络/后端/令牌。
+  {
+    const cell = rowTemplate(7, "真链路：用你的令牌完整问一轮（<code>message</code> → 等待回帧）");
+    const token = readStoredToken();
+    if (!token) {
+      report(cell, false, "没有登录态，先去 <code>/login</code> 粘贴令牌再刷新本页");
+      results.push(false);
+    } else {
+      const ok = await new Promise((resolve) => {
+        let settled = false;
+        const finish = (v, html) => { if (!settled) { settled = true; if (html) cell.innerHTML = html; resolve(v); } };
+        let ws;
+        try {
+          // ⚠️ 子协议必须是这两个、且顺序一致（runbook §10.1 坑 7）：少 shopsage.v1 服务端挑不到
+          ws = new WebSocket(`${API.replace("http", "ws")}/api/chat/stream`, ["shopsage.v1", `bearer.${token}`]);
+        } catch (exc) { report(cell, false, `构造失败：<code>${exc.message}</code>`); return finish(false); }
+
+        const frames = [];
+        let answer = "";
+        const timer = setTimeout(() => {
+          report(cell, false, `等待回帧超时。已收到的帧：<code>${frames.join("→") || "（一帧都没有）"}</code>`);
+          try { ws.close(); } catch {}
+          finish(false);
+        }, 240_000);
+
+        ws.addEventListener("open", () => {
+          frames.push("open");
+          ws.send(JSON.stringify({ message: "7天无理由退货的运费由谁承担？", session_id: "diag-probe" }));
+        });
+        ws.addEventListener("message", (e) => {
+          let f;
+          try { f = JSON.parse(e.data); } catch { return; }
+          frames.push(`${f.seq}:${f.event}`);
+          if (f.event === "answer") answer = f.data?.text ?? "";
+          if (f.event === "error") {
+            clearTimeout(timer);
+            report(cell, false, `收到 error 帧：<code>${JSON.stringify(f.data)}</code>`);
+            finish(false);
+          }
+          if (f.event === "done") {
+            clearTimeout(timer);
+            const good = answer.length > 0;
+            report(cell, good, good
+              ? `答出来了（${answer.length} 字）：<br><span class="muted">${answer.slice(0, 120)}…</span><br>帧序列：<code>${frames.join("→")}</code>`
+              : `帧走完了但回答为空。帧序列：<code>${frames.join("→")}</code>`);
+            try { ws.close(); } catch {}
+            finish(good);
+          }
+        });
+        ws.addEventListener("error", () => {
+          clearTimeout(timer);
+          report(cell, false, `error 事件（已收到：<code>${frames.join("→") || "无"}</code>）`);
+          finish(false);
+        });
+        ws.addEventListener("close", (e) => {
+          if (e.code === 4401) {
+            clearTimeout(timer);
+            report(cell, false, "被 4401 拒（令牌无效/过期）—— 重签一个再试");
+            finish(false);
+          }
+        });
+      });
+      results.push(ok);
+    }
+  }
+
+  const passed = results.filter(Boolean).length;
+  const total = results.length;
+  const summary = document.querySelector("#summary");
+  summary.innerHTML =
+    `<b>${passed}/${total} 项通过</b>（页面来源：<code>${origin}</code>）<br>` +
+    (passed === total
+      ? "这 " + total + " 项都过了 ⇒ <b>浏览器侧整条链路是通的</b>。" +
+        "若对客页仍卡在「正在连接… Ns」，那问题在<b>页面的 React 状态</b>（坏连接/热更新），" +
+        "不是网络、后端或令牌 —— <b>把对客页那个标签页整个关掉重开</b>即可。"
+      : "把上面 ❌ 的项连同行一起截图/复制发出来即可定位。");
+})();
+</script>
+</body>
+</html>

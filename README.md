@@ -51,6 +51,11 @@
 > ③ 登录令牌：`uv run python -m scripts.dev_token --role internal_employee`（粘贴到 `/login`）。
 > ⚠️ 页面报 `Failed to fetch` 时先跑 `uv run python -m scripts.check_web_cors`
 > （**别去重签令牌** —— 没有状态码的 fetch 失败不是令牌问题，是「进程没起」或「跨源被拦」）；
+> ⚠️ **打开页面请用 `http://127.0.0.1:3000`（或 `http://localhost:3000`）**：
+> `next dev` 打印的 `Network: http://<网卡IP>:3000` **默认不在跨源白名单里**，照它打开会
+> 「页面能开、WebSocket 也能连，但一直显示连不上、发消息没反应」（症状极像后端坏了）。
+> 要按实际打开的地址核对，加 `--web`：`... check_web_cors --web http://<该地址>:3000`；
+> 故障记录与修法见 [`docs/runbook/16-web-runbook.md`](docs/runbook/16-web-runbook.md) §10.1 坑 18。
 > 若「HTTP 通但对客页说 WebSocket 连接失败」，多半是 `NEXT_PUBLIC_API_BASE` 指到了前端自己
 > （它是**构建期**变量，改了要重启 `npm run dev`）。
 > 逐步操作、坑与分诊见 [`docs/runbook/16-web-runbook.md`](docs/runbook/16-web-runbook.md)。

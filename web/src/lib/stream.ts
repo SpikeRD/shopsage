@@ -433,6 +433,15 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
         clearTimeout(handshakeTimer);
         handshakeTimer = null;
       }
+      // ⚠️ **握手成功必须把 phase 推出 `connecting`**（实测踩到，见 runbook §10.1 坑 20）：
+      // 这一层以前只清看门狗 + 回调 `onOpen`，而 `phase` 唯一能离开 `connecting` 的路径
+      // 是「收到一帧」。两者一叠就成了**死锁**：
+      //   * `useChatStream.send()` 判 `phase === "connecting"` → 把消息**排队**、不发送；
+      //   * 而那条排队只在 `open` 事件里冲一次，此时（用户还没点）队列是空的；
+      //   * 后端不会主动发帧 → 永远收不到帧 → 永远收不到帧就不会有帧让 phase 前进。
+      // 结果：**页面上一条消息都发不出去**，徽章永远「正在连接… Ns」秒数一直涨。
+      // `push` 带 `isCurrent()` 守卫，且这里是「当前连接」才会走到，所以安全。
+      push({ ...state, phase: "idle" });
       options.onOpen?.();
       resolve();
     });

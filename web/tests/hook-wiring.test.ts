@@ -93,6 +93,32 @@ test("★`send` 在 connecting 时要**排队**，而不是丢弃、也不是直
   assert.match(slice, /setConnectionKey\(\(key\) => key \+ 1\)/, "failed 时没有自动换连接");
 });
 
+/**
+ * ★ 坑 20：`send` 判 `connecting` 就排队，**这个前提是「connecting 是暂时的」**。
+ *
+ * 而 `phase` 唯一能离开 `connecting` 的路径是「收到一帧」，后端又不会主动发帧 ——
+ * 所以握手成功的那一刻**必须**显式推进 phase，否则整个页面自我锁死：
+ * 排队 → 不发送 → 没有帧 → phase 不动 → 更不发送（实测：徽章「正在连接…」秒数一直涨、
+ * 发消息永远没反应，而后端日志一切正常）。
+ *
+ * 这条把「推进」钉在**源码级**，与 `transport.test.ts` 的运行期用例互为双保险：
+ * 运行期用例证明行为对，这条挡住有人把推进删掉（纯接线漏项正是坑 17 的同类）。
+ */
+test("★握手成功的 open 里必须推进 phase（否则 connecting 永久化 = 页面自我锁死 —— 坑 20）", () => {
+  const streamSource = readFileSync(path.resolve(HERE, "../src/lib/stream.ts"), "utf8");
+  const openHandler = streamSource.slice(
+    streamSource.indexOf('socket.addEventListener("open"'),
+    streamSource.indexOf('socket.addEventListener("message"'),
+  );
+  assert.ok(openHandler.length > 0, "找不到 socket 的 open 监听（源码结构变了？）");
+  assert.match(
+    openHandler,
+    /push\(\{\s*\.\.\.state,\s*phase:\s*"idle"\s*\}\)/,
+    "open 监听里没有把 phase 推到 idle：phase 只能靠「收到帧」离开 connecting，" +
+      "而后端不会主动发帧 —— 结果是 send 永远排队、页面一条消息都发不出去（坑 20 实测故障）",
+  );
+});
+
 test("页面：connecting 时给出「正在连接… Ns」与「重连」出口", () => {
   assert.match(PAGE_SOURCE, /正在连接…/, "页面没有显示握手中的计时");
   assert.match(PAGE_SOURCE, /chat\.connecting/, "页面没有读 connecting");
