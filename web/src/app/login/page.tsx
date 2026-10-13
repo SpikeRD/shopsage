@@ -38,12 +38,25 @@ import {
   clearSession,
   decodeJwtPayload,
   DEMO_PRESETS,
-  isAccessToken,
   isExpired,
+  tokenKind,
   writeSession,
 } from "@/lib/auth";
 import { apiBase } from "@/lib/config";
+import { probeFailureHint } from "@/lib/diagnostics";
 import type { Entry } from "@/lib/auth";
+
+/**
+ * 令牌还剩多少分钟（负数 = 已过期）。
+ *
+ * ⚠️ 页面上**必须显示这个**（第一版只显示 `exp` 的绝对时间）：本仓演示令牌默认 **30 分钟**，
+ * 而「签一次、想半天、回来再试」是常态 —— 不显示剩余时间的话，
+ * 过期会被误判成「令牌类型不对 / 后端坏了」（本次实测就发生了这个混淆，见 runbook §10.1 坑 13）。
+ */
+function remainingMinutes(exp: number, now: number = Date.now()): number {
+  if (!exp) return 0;
+  return Math.round((exp * 1000 - now) / 60000);
+}
 
 export default function LoginPage() {
   const [tokenText, setTokenText] = useState("");
@@ -55,7 +68,8 @@ export default function LoginPage() {
 
   const claims = decodeJwtPayload(tokenText.trim());
   const expired = claims ? isExpired(tokenText.trim()) : false;
-  const wrongType = claims ? !isAccessToken(tokenText.trim()) : false;
+  const kind = claims ? tokenKind(tokenText.trim()) : "unknown";
+  const wrongType = claims ? kind !== "access" : false;
 
   useEffect(() => {
     setNow(new Date().toLocaleString());
@@ -72,7 +86,16 @@ export default function LoginPage() {
       return;
     }
     if (wrongType) {
-      setMessage("这是刷新令牌（`type=refresh`），后端会当 401 处理 —— 用 `--kind access` 重新签发一个。");
+      // ⚠️ 「声明是 refresh」与「没有类型声明」要分开说（§10.1 坑 13）：
+      // 前者的修法是「别加 --kind refresh」，后者是「这个令牌不是本仓签的」。
+      // 第一版把两者混成一句「这是刷新令牌」，于是**真的访问令牌**被误判时，
+      // 提示语会让人反复重签同一个（正确的）令牌 —— 那正是这次实测踩的坑。
+      setMessage(
+        kind === "refresh"
+          ? "这是刷新令牌（`typ=refresh`），后端会当 401 处理 —— 默认签发出来的就是访问令牌（`--kind refresh` 才会得到这种）。"
+          : "这个令牌没有类型声明（payload 里既没有 `typ` 也没有 `type`）：它多半不是本仓 `scripts/dev_token.py` 签的，" +
+            "或者被截断了。后端对「类型缺失」也是拒绝，所以请用 `uv run python -m scripts.dev_token` 重签一个。",
+      );
       return;
     }
     if (expired) {
@@ -95,10 +118,7 @@ export default function LoginPage() {
       const payload = await getHealth();
       setHealth(payload);
     } catch (exc) {
-      setHealthError(
-        `连不上后端（${apiBase()}）：${exc instanceof Error ? exc.message : String(exc)}。` +
-          "先确认 `uv run uvicorn app.main:app --port 8000` 在跑、且 NEXT_PUBLIC_API_BASE 指向它。",
-      );
+      setHealthError(probeFailureHint(exc, { apiBase: apiBase() }));
     }
   };
 
@@ -147,10 +167,11 @@ export default function LoginPage() {
             <>
               <span className="badge accent">sub={claims.sub}</span>
               <span className="badge">role={claims.role}</span>
-              <span className={`badge ${wrongType ? "danger" : "ok"}`}>type={claims.tokenType || "(未标注)"}</span>
+              <span className={`badge ${wrongType ? "danger" : "ok"}`}>typ={claims.tokenType || "(未标注)"}</span>
               <span className={`badge ${expired ? "danger" : "ok"}`}>
                 exp={claims.exp ? new Date(claims.exp * 1000).toLocaleString() : "缺失"}
               </span>
+              <span className="badge">剩余 {remainingMinutes(claims.exp)} 分钟</span>
               <span className="muted">
                 （解出来的角色只用来选界面；它不验签，因此不能当权限依据）
               </span>

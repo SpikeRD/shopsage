@@ -26,7 +26,7 @@
  *    所以 `running` 期间**禁止再发**（UI 上把发送键禁掉，见 §4.4）。
  */
 
-import { streamUrl } from "./config.ts";
+import { isSelfReferentialBase, streamUrl } from "./config.ts";
 import {
   type ApprovalGate,
   type ChatDebug,
@@ -292,6 +292,26 @@ export interface ChatStreamHandle {
 }
 
 /**
+ * **当前活着的那条连接**（模块级世代号）。
+ *
+ * ## 为什么需要它（实测踩到，见 runbook §10.1 坑 15）
+ *
+ * React 开发模式（StrictMode）会把 effect **跑两遍**：第一条连接被 cleanup `close()`
+ * 掉，第二条接管。热更新（Fast Refresh）时也一样。而**被抛弃的那条连接**的事件
+ * 仍会到达它的监听器 —— 其中 `error` 尤其麻烦：
+ *
+ * ```text
+ * 用户视角：聊得好好的，忽然弹一条「WebSocket 连接失败：ws://…」
+ * 后端日志：同一个客户端端口出现两条 /api/chat/stream accepted（一条被强行关掉）
+ * ```
+ *
+ * 也就是说：**当前连接完全正常，报错来自一条已经没人要的旧连接**。
+ * 处置：每次建连领一个世代号，事件回调先比对 —— 不是当前世代就**直接扔掉**。
+ * 这与「最后写入者胜」的竞态是同一类问题，只是这里的「最后写入者」是一条死连接。
+ */
+let activeGeneration = 0;
+
+/**
  * 建立一条流式连接。
  *
  * ⚠️ **子协议的顺序与内容都不是可选的**：`shopsage.v1` 必须在列表里
@@ -305,8 +325,15 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
   const url = options.url ?? streamUrl();
   const protocols = [WS_SUBPROTOCOL, `${WS_TOKEN_PREFIX}${options.token}`];
 
+  // 本连接的世代号：**所有事件回调都先问一句「我还是当前那条连接吗」**
+  const generation = (activeGeneration += 1);
+  const isCurrent = () => generation === activeGeneration;
+
   let state = initialState();
+  /** 调用方是否主动 `close()` 过（见 `close()` 的注释：CONNECTING 阶段关闭会得到 1006）。 */
+  let intentionalClose = false;
   const push = (next: StreamState) => {
+    if (!isCurrent()) return; // 旧连接不许再改状态（它已被 close / 被新连接取代）
     state = next;
     options.onState(next);
   };
@@ -315,12 +342,14 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
   const socket = factory(url, protocols);
   const opened = new Promise<void>((resolve) => {
     socket.addEventListener("open", () => {
+      if (!isCurrent()) return;
       options.onOpen?.();
       resolve();
     });
   });
 
   socket.addEventListener("message", (event: unknown) => {
+    if (!isCurrent()) return;
     const payload = (event as { data?: unknown }).data;
     try {
       push(reduceStream(state, parseFrame(typeof payload === "string" ? payload : String(payload)), now()));
@@ -337,8 +366,9 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
 
   socket.addEventListener("close", (event: unknown) => {
     const code = (event as { code?: number }).code ?? 1006;
-    // 正常收尾（done 之后服务端不会主动关；客户端主动关也不该报错）
-    const failed = state.phase !== "done";
+    // 「主动关闭」不算失败（§10.1 坑 15）：CONNECTING 阶段被我们关掉时，
+    // 浏览器给的就是 1006 —— 那句话面意思是「异常断开」，但成因是我们自己收的线
+    const failed = state.phase !== "done" && !intentionalClose;
     push({
       ...state,
       phase: failed ? "failed" : state.phase,
@@ -348,18 +378,34 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
           ? { code: `close_${code}`, message: closeCodeMessage(code) }
           : state.error,
     });
-    options.onClose?.(code);
+    // ⚠️ 回调也要挡（`onClose` 会改调用方的状态）：旧连接的关闭不该触发界面上的反应
+    if (isCurrent()) options.onClose?.(code);
   });
 
   socket.addEventListener("error", () => {
+    if (!isCurrent()) return; // 被抛弃的连接：直接扔掉（见 `activeGeneration` 的注释）
+    // ⚠️ 消息里**必须带上试过的 URL 与子协议**（第一版只有一句「先确认后端在跑」）：
+    // 实测那次故障里后端完全正常，真正的原因是「URL 指到了前端自己」——
+    // 而「后端在跑吗」这个方向把人带偏了很久（runbook §10.1 坑 14）。
+    // 判据（写进话里）：`ws:` 连不上 + HTTP 侧正常 = 十有八九是**地址**问题，不是后端问题。
+    const sameOrigin = isSelfReferentialBase(url);
     push({
       ...state,
       phase: "failed",
       error: {
         code: "socket_error",
         message:
-          "WebSocket 连接失败：先确认后端在跑（uv run uvicorn app.main:app --port 8000）、" +
-          "再确认 NEXT_PUBLIC_API_BASE 指向它，最后看浏览器控制台里那条握手失败的原因。",
+          `WebSocket 连接失败：${url}（子协议 ${WS_SUBPROTOCOL}）` +
+          "。按这个顺序查三件事：" +
+          "① 地址对不对 —— 页面上那行「后端 …」是不是后端的地址（不是前端自己的 3000）；" +
+          "② 后端在不在 —— 另开终端跑 `uv run python -m scripts.check_web_cors`（它会一次问完后端/前端/跨源/预检）；" +
+          "③ 浏览器 DevTools → Console 里那条握手失败的具体原因（子协议、混合内容、连接被拒都会写在那里）。" +
+          (sameOrigin
+            ? "⚠️ 当前 URL 指向**前端自己**：Next 的 dev server 不代理 WebSocket upgrade，" +
+              "所以它一定连不上 —— 用后端地址重启前端：" +
+              '$env:NEXT_PUBLIC_API_BASE="http://127.0.0.1:8000"; npm run dev'
+            : "如果 ① ② 都正常，再看后端日志里有没有这次握手（没有任何日志 = 请求根本没到后端，多半是被代理/防火墙拦了）；" +
+              "地址本身没问题的话，多半就是 `NEXT_PUBLIC_API_BASE` 指向了前端自己的端口（见 ①）。"),
       },
     });
   });
@@ -375,6 +421,15 @@ export function openChatStream(options: OpenStreamOptions): ChatStreamHandle {
       socket.send(JSON.stringify(body));
     },
     close() {
+      // ⚠️ **在 CONNECTING 阶段 close 会得到一个 `error`（实测，见 runbook §10.1 坑 15）**：
+      // 浏览器还没握手就收到关闭请求，于是报一次 `error` 并以 1006 结束 —— 事件序列是
+      // `error → close(1006)`，**看起来像连接失败，其实只是「还没来得及连就被收掉了」**。
+      // React 开发模式的双挂载（cleanup 在同一个 tick 里 close）正好命中这个序列。
+      //
+      // 这里的处置：**仍然按 1000 关**（语义是「我们主动放弃」），
+      // 但把这个 `close()` 标成「主动关闭」—— 之后那条 1006 只作为**信息**记录，
+      // 不再变成「连接失败」的报错（真正的失败由 `error` 处理器判断，而它已经被世代守卫过滤）。
+      intentionalClose = true;
       socket.close(1000);
     },
     state() {

@@ -84,10 +84,30 @@ export interface TokenClaims {
   role: string;
   /** 过期时间（秒级 UNIX 时间戳）；缺失 = 0，视作「已过期」 */
   exp: number;
+  /** 令牌类型：`access` / `refresh`（见 `decodeJwtPayload` 的注释：声明的键名是 `typ`） */
   tokenType: string;
 }
 
-/** 把 `JWT` 的 payload 段解出来；形状不对时返回 null（**不抛**）。 */
+/**
+ * 把 `JWT` 的 payload 段解出来；形状不对时返回 null（**不抛**）。
+ *
+ * ## ⚠️ 类型声明的键名是 `typ`，不是 `type`（实测踩到，见 runbook §10.1 坑 13）
+ *
+ * 后端 `app/security/auth.py::_create_token` 写的是 `{"typ": token_type}`，
+ * 而 `parse_token` 也读 `payload.get("typ")`。前端第一版读的是 **`type`** —— 于是：
+ *
+ * ```text
+ * 所有**真的**访问令牌都被前端判成「不是访问令牌」→ 登录页一律拒绝：
+ *   这是刷新令牌（type=refresh），后端会当 401 处理 —— 用 --kind access 重新签发一个。
+ * ```
+ *
+ * 也就是说：**报错信息本身是错的**（令牌是 access，声明键名前缀对不上），
+ * 而后端完全能用这个令牌 —— 这类「前后端对同一个契约读不同键名」的 bug
+ * 最容易被误判成「令牌签错了」，因为报错看起来非常具体。
+ *
+ * 处置：**两个键名都认**（`typ` 优先），并且把认不出来的情况与「确实是刷新令牌」
+ * 分开报（见 `tokenTypeOf` / 登录页的提示语）—— 「未知」与「refresh」的修法完全不同。
+ */
 export function decodeJwtPayload(token: string): TokenClaims | null {
   const parts = String(token ?? "").split(".");
   if (parts.length !== 3) return null;
@@ -100,12 +120,31 @@ export function decodeJwtPayload(token: string): TokenClaims | null {
     const role = typeof payload.role === "string" ? payload.role : "customer";
     const sub = payload.sub === undefined || payload.sub === null ? "" : String(payload.sub);
     const exp = typeof payload.exp === "number" ? payload.exp : 0;
-    const tokenType = typeof payload.type === "string" ? payload.type : "";
+    // `typ` 是本仓后端的声明键名；`type` 留给「别处签发、按 OAuth 惯例命名」的令牌
+    const typeValue = payload.typ ?? payload.type;
+    const tokenType = typeof typeValue === "string" ? typeValue : "";
     if (!sub) return null;
     return { sub, role, exp, tokenType };
   } catch {
     return null;
   }
+}
+
+/** 令牌类型的三态：`access` / `refresh` / **`unknown`**（没有任何类型声明）。 */
+export type TokenKind = "access" | "refresh" | "unknown";
+
+/**
+ * 归一化令牌类型。
+ *
+ * 为什么要有 `unknown` 这一态：**「声明缺失」与「声明 refresh」的修法不同** ——
+ * 前者是「这个令牌不是本系统签的（或走了别处的签发工具）」，后者是「签的时候选了刷新令牌」。
+ * 把它们混成一句话（第一版就是混着的）会把人引到错误的修法上（§10.1 坑 13）。
+ */
+export function tokenKind(token: string): TokenKind {
+  const value = (decodeJwtPayload(token)?.tokenType ?? "").trim().toLowerCase();
+  if (value === "access") return "access";
+  if (value === "refresh") return "refresh";
+  return "unknown";
 }
 
 /** 令牌是否已过期（或根本解不出来）。`skewSeconds` 给一点余量，避免「正好卡在边界」。 */
@@ -115,9 +154,15 @@ export function isExpired(token: string, nowSeconds: number = Date.now() / 1000,
   return claims.exp <= nowSeconds + skewSeconds;
 }
 
-/** 令牌类型是不是访问令牌（**刷新令牌不能当访问令牌用**，后端会 401）。 */
+/**
+ * 令牌类型是不是访问令牌（**刷新令牌不能当访问令牌用**，后端会 401）。
+ *
+ * ⚠️ 这里只放行 `access`：声明缺失（`unknown`）的令牌一律**不接受** ——
+ * 后端 `parse_token` 对缺失类型的令牌也是拒绝（`收到 (缺失)`），前端放行只会让
+ * 用户「粘进去看着成功、一发消息就 401」。两端的判据必须一致。
+ */
 export function isAccessToken(token: string): boolean {
-  return decodeJwtPayload(token)?.tokenType === "access";
+  return tokenKind(token) === "access";
 }
 
 // ── 存储（localStorage）──────────────────────────────────────────────────────

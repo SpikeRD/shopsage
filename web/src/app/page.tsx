@@ -8,9 +8,9 @@
  * **没有任何业务判断**：能不能查到这行数据、这句话能不能答，全在后端。
  */
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import Link from "next/link";
-import { apiBase } from "@/lib/config";
+import { apiBase, configWarnings, resolvedApiBase, streamUrl } from "@/lib/config";
 import { canUseInternal } from "@/lib/auth";
 import { Composer } from "@/components/Composer";
 import { MessageList } from "@/components/MessageList";
@@ -70,6 +70,12 @@ function ChatWorkspace({
   const chat = useChatStream({ entry, token });
   const refused = useMemo(() => chat.messages.flatMap((message) => message.refusals ?? []), [chat.messages]);
   const [reason, setReason] = useState("");
+  // ⚠️ 配置问题要在**发请求之前**就说（坑 14）：`NEXT_PUBLIC_API_BASE` 指到前端自己时，
+  // HTTP 可能看着正常（同源的 /api/kb 由 Next 自己答）而 WS 一定失败 —— 那种「半通」最难查
+  const [configNotes, setConfigNotes] = useState<string[]>([]);
+  useEffect(() => {
+    setConfigNotes(configWarnings());
+  }, []);
 
   return (
     <div className="stack">
@@ -80,7 +86,14 @@ function ChatWorkspace({
               对客问答（流式）
             </h1>
             <div className="small muted">
-              后端 <span className="mono">{apiBase()}</span> · 身份{" "}
+              后端 <span className="mono">{apiBase()}</span>
+              {apiBase() !== resolvedApiBase() ? (
+                <>
+                  {" "}
+                  → 实际用 <span className="mono">{resolvedApiBase()}</span>
+                </>
+              ) : null}{" "}
+              · 流式 <span className="mono">{streamUrl()}</span> · 身份{" "}
               <span className="chip">
                 user_id={userId} · {role}
               </span>{" "}
@@ -122,6 +135,17 @@ function ChatWorkspace({
             <li>首帧（骨架）来自后端：先出「正在理解你的问题…」，再补节点与回答。</li>
             <li>回答底部的「来源」可点开看文档 / 页码 / 片段。</li>
             <li>敏感操作会挂起（<span className="mono">approval_required</span>），需要在这里点「批准」或「拒绝」。</li>
+          </ul>
+        </div>
+      ) : null}
+
+      {configNotes.length > 0 ? (
+        <div className="error-box">
+          <strong>配置问题（发请求之前先看这条）</strong>
+          <ul className="hint-list">
+            {configNotes.map((note) => (
+              <li key={note}>{note}</li>
+            ))}
           </ul>
         </div>
       ) : null}

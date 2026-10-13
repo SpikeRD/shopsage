@@ -26,6 +26,7 @@ import {
   readSessionId,
   ROLE_PERMISSIONS,
   tokenKey,
+  tokenKind,
   writeSession,
   writeSessionId,
 } from "../src/lib/auth.ts";
@@ -61,12 +62,51 @@ test("默认入口：内部角色进对内页，客户进对客页", () => {
   assert.equal(defaultEntry("customer"), "customer");
 });
 
-test("解码令牌：能取出 sub/role/exp/type", () => {
-  const token = fakeJwt({ sub: "7", role: "internal_employee", exp: future(), type: "access" });
+test("解码令牌：能取出 sub/role/exp/typ", () => {
+  const token = fakeJwt({ sub: "7", role: "internal_employee", exp: future(), typ: "access" });
   const claims = decodeJwtPayload(token);
   assert.equal(claims?.sub, "7");
   assert.equal(claims?.role, "internal_employee");
   assert.equal(claims?.tokenType, "access");
+});
+
+test("★实测形状：本仓后端的声明键名是 `typ`（不是 `type`）", () => {
+  // 后端 `app/security/auth.py::_create_token` 写的是 `{"typ": token_type}`，
+  // 而前端第一版读的是 `type` —— 结果是**所有真的访问令牌都被判成「类型不对」**，
+  // 登录页还给出「这是刷新令牌，用 --kind access 重签」这句**错误**的提示。
+  // 这一条用例钉住「`typ` 必须被认」；下面一条钉住「`type` 也认」（别处签发的令牌）。
+  const real = fakeJwt({ sub: "7", role: "internal_employee", typ: "access", exp: future() });
+  assert.equal(isAccessToken(real), true, "后端签的 access 令牌必须被前端认成访问令牌");
+  assert.equal(tokenKind(real), "access");
+});
+
+test("兼容 OAuth 惯例的 `type` 声明（别处签发的令牌）", () => {
+  const legacy = fakeJwt({ sub: "7", role: "customer", type: "access", exp: future() });
+  assert.equal(isAccessToken(legacy), true);
+  assert.equal(tokenKind(legacy), "access");
+});
+
+test("类型三态：access / refresh / unknown（unknown 与 refresh 的修法不同）", () => {
+  assert.equal(tokenKind(fakeJwt({ sub: "1", exp: future(), typ: "access" })), "access");
+  assert.equal(tokenKind(fakeJwt({ sub: "1", exp: future(), typ: "refresh" })), "refresh");
+  assert.equal(tokenKind(fakeJwt({ sub: "1", exp: future() })), "unknown", "没有类型声明 = unknown");
+  assert.equal(tokenKind("not-a-jwt"), "unknown");
+  // 大小写不敏感（同一个声明可能被写成 ACCESS）
+  assert.equal(tokenKind(fakeJwt({ sub: "1", exp: future(), typ: "ACCESS" })), "access");
+});
+
+test("`typ` 优先于 `type`（两个都在时以本仓后端为准）", () => {
+  const both = fakeJwt({ sub: "1", exp: future(), typ: "access", type: "refresh" });
+  assert.equal(tokenKind(both), "access");
+});
+
+test("刷新令牌（`typ=refresh`）不算访问令牌", () => {
+  assert.equal(isAccessToken(fakeJwt({ sub: "1", exp: future(), typ: "refresh" })), false);
+});
+
+test("类型缺失的令牌同样不接受（与后端 `parse_token` 的判据一致）", () => {
+  // 后端对缺失类型也是拒绝（「收到 (缺失)」）；前端若放行，用户会「粘进去看着成功、一发消息就 401」
+  assert.equal(isAccessToken(fakeJwt({ sub: "1", exp: future() })), false);
 });
 
 test("解码令牌：三段不对/坏 base64 一律返回 null（**不抛**）", () => {
@@ -79,6 +119,16 @@ test("过期判定", () => {
   assert.equal(isExpired(fakeJwt({ sub: "1", exp: past() })), true);
   assert.equal(isExpired(fakeJwt({ sub: "1", exp: future() })), false);
   assert.equal(isExpired("坏令牌"), true, "解不出来 = 当成过期（别把坏令牌放进去）");
+});
+
+test("readSession：`typ=access` 的令牌（**实测形状**）能过，`typ=refresh` 被拒", () => {
+  const storage = memoryStorage();
+  const good = fakeJwt({ sub: "2", role: "customer", exp: future(), typ: "access" });
+  writeSession({ token: good, userId: "2", role: "customer", entry: "customer" }, storage);
+  assert.equal(readSession("customer", storage)?.role, "customer");
+
+  storage.setItem(tokenKey("customer"), fakeJwt({ sub: "2", exp: future(), typ: "refresh" }));
+  assert.equal(readSession("customer", storage), null);
 });
 
 test("令牌类型：刷新令牌不算访问令牌（它在后端一定 401）", () => {

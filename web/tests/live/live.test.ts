@@ -121,6 +121,60 @@ test("对客页的两条 HTTP 契约：/api/kb 白名单与目录穿越拦截", 
   assert.equal(list.status, 200, "不带 name 时列文件清单");
 });
 
+test("★浏览器跨源这一层：后端必须放通前端来源（否则页面上只有 Failed to fetch）", async () => {
+  // ## 为什么这条用例必须在这里（§7.6）
+  //
+  // 上面所有用例都是 **Node 的 fetch**，而 Node **不受 CORS 约束** —— 也就是说
+  // 「这条测试文件全绿」完全不能证明浏览器能打开页面。实测警示（第 16 步）：
+  // 后端当时一个 CORS 中间件都没有，Node 侧一切正常，而浏览器里
+  // `GET /health` 只得到一句 `TypeError: Failed to fetch`（没有任何状态码）。
+  //
+  // Node 能验的部分：**带 `Origin` 头打进去，看响应里有没有 `Access-Control-Allow-Origin`**。
+  // 这一条正是浏览器读响应所依赖的那个头。
+  const origin = process.env.SHOPSAGE_WEB_BASE ?? "http://127.0.0.1:3000";
+
+  const simple = await fetch(`${API_BASE}/health`, { headers: { Origin: origin } });
+  assert.equal(simple.status, 200);
+  assert.equal(
+    simple.headers.get("access-control-allow-origin"),
+    origin,
+    "后端没回 Access-Control-Allow-Origin：浏览器会把这次跨源读拦掉（页面显示 Failed to fetch）。" +
+      "修法：后端 .env 里 API_CORS_ORIGINS 加上这个来源并重启后端",
+  );
+  assert.match(
+    simple.headers.get("access-control-expose-headers") ?? "",
+    /x-request-id/i,
+    "X-Request-Id 没暴露给浏览器：前端排障时读不到它",
+  );
+
+  // 预检：浏览器发 POST + Authorization 之前会先发它，而它**带不了令牌**
+  const preflight = await fetch(`${API_BASE}/api/chat`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: origin,
+      "Access-Control-Request-Method": "POST",
+      "Access-Control-Request-Headers": "authorization,content-type",
+    },
+  });
+  assert.equal(preflight.status, 200, "预检被拦了（不该要求鉴权）：浏览器会直接判定 CORS 失败");
+  assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+  const allowedHeaders = (preflight.headers.get("access-control-allow-headers") ?? "").toLowerCase();
+  assert.ok(allowedHeaders.includes("authorization"), `预检没放通 Authorization：${allowedHeaders}`);
+
+  // 错误响应也要带 CORS 头，否则前端连「401 未授权」都读不出来
+  const unauthorized = await fetch(`${API_BASE}/api/chat`, {
+    method: "POST",
+    headers: { Origin: origin, "Content-Type": "application/json" },
+    body: JSON.stringify({ message: "hi" }),
+  });
+  assert.equal(unauthorized.status, 401);
+  assert.equal(unauthorized.headers.get("access-control-allow-origin"), origin);
+
+  // 不在白名单的来源不许拿到这个头（它是白名单，不是「谁问都给」）
+  const evil = await fetch(`${API_BASE}/health`, { headers: { Origin: "http://evil.test" } });
+  assert.equal(evil.headers.get("access-control-allow-origin"), null);
+});
+
 test("真流式：一帧不漏地走完 skeleton→node→answer→done（B2 的首帧 < 1s）", { skip: skipNoCustomer }, async () => {
   const state = await askOnce(TOKEN_CUSTOMER, "我的订单到哪了？");
   const events = state.seqs;

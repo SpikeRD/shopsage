@@ -36,6 +36,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from starlette.middleware.cors import CORSMiddleware
 
 from app.api import config as api_config
 from app.api import deps
@@ -43,7 +44,7 @@ from app.api.chat import router as chat_router
 from app.api.errors import install_exception_handlers
 from app.api.health import router as infra_router
 from app.api.metrics import MetricsRegistry
-from app.api.middleware import ApiMiddleware
+from app.api.middleware import ApiMiddleware, REQUEST_ID_HEADER
 from app.api.ratelimit import open_rate_limiter
 from app.api.scope import SCOPE_BY_ROUTE
 from app.api.tasks import router as tasks_router
@@ -303,6 +304,28 @@ def create_app(
     # ⚠️ 不给 `limiter=`：限流器在 `lifespan` 里才建好，中间件在请求期从 `app.state` 取
     #    （理由见 `middleware.ApiMiddleware` 的注释）。
     app.add_middleware(ApiMiddleware)
+    # ⚠️ **CORS 必须最后加 = 最外层**（第 16 步新增）：两个理由，缺一个都会出怪事
+    #    ① 预检（OPTIONS）要在**进入鉴权/限流之前**就被答掉 —— 预检请求带不了
+    #       `Authorization`，让限流中间件先处理它就会得到「浏览器说 CORS 失败，
+    #       而服务端日志里只有一条 401/429」这种两侧对不上的现象；
+    #    ② 错误响应（401/429/500）也要带上 `Access-Control-Allow-Origin`，
+    #       否则前端连「被限流了」都读不到，只会看到一句 `Failed to fetch`。
+    #
+    #    ⚠️ 这一层**不是鉴权**：CORS 只管浏览器；`curl` 与 Node 完全不受它约束
+    #    （所以本步的真链路用例永远测不出 CORS 问题，见 `16-web-runbook.md` §7.6）。
+    cors = api_config.cors_origins(settings)
+    if cors:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors,
+            # 令牌走 `Authorization` 头，不靠 Cookie —— 所以不开放 credentials
+            # （开放它意味着「任意允许的来源都能带着用户凭据发请求」，那是另一个量级的风险）
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-Id"],
+            expose_headers=[REQUEST_ID_HEADER],
+            max_age=600,
+        )
 
     install_exception_handlers(app)
 
@@ -326,14 +349,15 @@ def create_app(
             "rate_limited": [f"{method} {path}" for method, path in sorted(SCOPE_BY_ROUTE)],
         }
 
-    # 让「哪些路径吃配额」「哪些角色要过闸门」在启动日志里可见
-    # （新增接口/角色时最容易忘，日志比文档更容易被看到）
+    # 让「哪些路径吃配额」「哪些角色要过闸门」「哪些来源能跨源读」在启动日志里可见
+    # （新增接口/角色/前端来源时最容易忘，日志比文档更容易被看到）
     logger.info(
-        "路由就绪：prefix=%r 限流路径=%s 闸门角色=%s 敏感分支=%s",
+        "路由就绪：prefix=%r 限流路径=%s 闸门角色=%s 敏感分支=%s 跨源白名单=%s",
         prefix,
         sorted(f"{method} {path}" for method, path in SCOPE_BY_ROUTE),
         sorted(GATED_ROLES),
         sorted(SENSITIVE_ROUTES),
+        cors or "（无：只允许同源；第 16 步的前端在另一个端口，会被浏览器拦掉）",
     )
     return app
 

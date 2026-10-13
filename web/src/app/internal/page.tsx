@@ -31,6 +31,7 @@ import { canUseInternal, ROLE_PERMISSIONS } from "@/lib/auth";
 import { chartWarnings, toEChartsOption, toTableView } from "@/lib/chart";
 import type { ChatResponse, ChartSpec } from "@/lib/contracts";
 import { apiBase } from "@/lib/config";
+import { probeFailureHint } from "@/lib/diagnostics";
 import { Composer } from "@/components/Composer";
 import { EChart } from "@/components/EChart";
 import { useSession } from "@/components/useChatStream";
@@ -97,7 +98,10 @@ function InternalConsole({ token, role, userId }: { token: string; role: string;
           `${exc.message}（HTTP ${exc.status} · code=${exc.code}${exc.requestId ? ` · request_id=${exc.requestId}` : ""}）`,
         );
       } else {
-        setError(String(exc));
+        // ⚠️ 走到这里的是 **fetch 本身抛的 TypeError**（跨源被拦 / 后端没起 / 地址写错）——
+        // 它与「后端返回了一个错误」是两件事，所以用同一套诊断话术（`lib/diagnostics.ts`），
+        // 而不是把一句 `TypeError: Failed to fetch` 直接甩给用户
+        setError(probeFailureHint(exc, { apiBase: apiBase() }));
       }
       setResponse(null);
     } finally {

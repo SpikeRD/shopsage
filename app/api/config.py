@@ -42,6 +42,13 @@ logger = logging.getLogger(__name__)
 #: 路由前缀的默认值（与 `9.api.md` §2 的 `/api/chat` 一致）
 DEFAULT_PREFIX: Final[str] = "/api"
 
+#: 开发期的跨源白名单（第 16 步 Web 端）：Next 默认跑在 3000，localhost 与 127.0.0.1 都列上
+#: —— 两者在浏览器眼里是**不同的来源**，只列一个会让「用另一个地址打开的页面」被拦。
+DEV_CORS_ORIGINS: Final[tuple[str, ...]] = (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+
 #: 前缀的卫生规则：必须是 `/xxx` 形状，末尾斜杠由规范化去掉（`/api/` + `/chat` 会变成 `/api//chat`）
 _MALFORMED_PREFIX_HINT: Final[str] = "前缀必须形如 `/api`（以 `/` 开头、不含空白；末尾斜杠会被自动去掉）"
 
@@ -204,10 +211,63 @@ def _env_value(settings: Any, field: str, default: Any) -> Any:
     return getattr(settings, field, default)
 
 
+def cors_origins(settings: Any = None) -> list[str]:
+    """允许跨源读 API 的**前端来源白名单**（`API_CORS_ORIGINS`）。
+
+    ## 为什么必须有这一项（第 16 步实测撞到，见 `16-web-runbook.md` §10.1 坑 11）
+
+    Web 前端（`http://127.0.0.1:3000`）与 API（`http://127.0.0.1:8000`）**不同源**
+    （端口不同就是不同源）。第 9 步的 API 从来没有跨源调用方，所以一个 CORS 中间件都没注册 ——
+    于是第 16 步前端一探活就得到 `TypeError: Failed to fetch`，
+    **没有任何 HTTP 状态码**，看起来像「后端没起 / 令牌无效」。
+
+    ⚠️ 这个症状的判据（写进前端提示语里了，因为这是最容易误判的一条）：
+    `fetch` 抛 `TypeError: Failed to fetch`（而不是拿到 4xx/5xx）说明**请求的结果没被读到**，
+    三种可能：① 服务没起/地址写错；② **跨源被浏览器拦掉**；③ 网络/证书。
+    「令牌无效」不在其中 —— 令牌无效会得到 **401**，那是一个正常的 HTTP 响应。
+
+    ## 取值口径
+
+    | 环境 | 默认 | 说明 |
+    |---|---|---|
+    | `ENV=dev`（默认） | `http://localhost:3000`、`http://127.0.0.1:3000` | 本仓开发拓扑：Next 跑在 3000 |
+    | `ENV=prod` | **空**（= 不允许任何跨源） | 生产应当同源部署（反代），或显式列出域名 |
+
+    ⚠️ **不用 `["*"]`**：`allow_origins=["*"]` 看着省事，但它把「谁能从浏览器里读这个 API」
+    交给了任何网站（配合 `Authorization` 时虽然还要求令牌，但「哪些站点能发起调用」这条边界就没了）。
+    白名单是显式的、可审计的 —— 与 `4.security.md` 的「表白名单」是同一条纪律。
+
+    ⚠️ **这一层不是鉴权**：CORS 只约束**浏览器**的读取，`curl` / 脚本完全不受它约束
+    （本仓的真链路用例就是 Node 直接 fetch，永远看不到 CORS 的效果 ——
+    这也是「真链路用例全绿但浏览器打不开」的成因，见 runbook §7.6）。
+    真正的门在 `Authorization: Bearer <JWT>`。
+    """
+    raw = str(_env_value(settings, "api_cors_origins", "") or "").strip()
+    if raw:
+        origins = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+        for origin in origins:
+            if origin == "*":
+                raise ValueError(
+                    "API_CORS_ORIGINS 不允许写成 `*`：请显式列出前端来源（例："
+                    "`http://localhost:3000,http://127.0.0.1:3000`）"
+                )
+            if not origin.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"API_CORS_ORIGINS 里的 {origin!r} 不是合法来源：必须带协议"
+                    "（例：`http://localhost:3000`）"
+                )
+        return origins
+    if str(_env_value(settings, "env", "dev") or "dev").strip().lower() == "prod":
+        return []
+    return list(DEV_CORS_ORIGINS)
+
+
 __all__ = [
     "DEFAULT_PREFIX",
+    "DEV_CORS_ORIGINS",
     "api_prefix",
     "checkpoint_backend",
+    "cors_origins",
     "debug_payload_enabled",
     "parse_rate_limit",
     "probe_timeout",

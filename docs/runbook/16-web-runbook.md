@@ -15,18 +15,20 @@
 > |---|---|---|
 > | 构建（验收第 1 条的判据） | `npm run build` | **✓ Compiled successfully in 22.0s**；9/9 静态页生成；6 条路由（`/`、`/internal`、`/login`、`/citation`、`/api/kb`、`/_not-found`） |
 > | 类型检查 | `npm run typecheck` | **无输出（0 错）** |
-> | 本步离线用例 | `npm test` | **65 passed / 0 failed**（5 个文件；0.22s） |
-> | 本步真链路用例 | `node tests/run-live.mjs`（前端已在跑时加 `SHOPSAGE_SKIP_WEB=1`） | **9 passed / 0 failed**；两次实测：**41.9s**（后端刚热身）与 **81.9s**（后端刚重启，含模型冷加载） |
+> | 本步离线用例 | `npm test` | **91 passed / 0 failed**（7 个文件；0.21s） |
+> | 本步真链路用例 | `node tests/run-live.mjs`（前端已在跑时加 `SHOPSAGE_SKIP_WEB=1`） | **10 passed / 0 failed**；三次实测 **41.9s / 81.9s / 143.2s** —— 差距全在「真溯源」那一条（第一次检索要把 bge-m3 + bge-reranker 拉进内存，实测该条 2.5s ~ 109.7s） |
+> | **浏览器跨源 + WebSocket upgrade** | `uv run python -m scripts.check_web_cors` | **五项全 ✅、退出码 0**（后端可达 / 前端可达 / 放通来源 / 预检 / **WS 升级 101**） |
+> | **HTTP 通但 WS 死**的定位（坑 14） | 三条对照：直连 8000 / 直连 localhost / 经 3000 | `8000` → open（54ms）；`localhost:8000` → open（27ms）；**经前端 3000 → 8s 超时** |
+> | **真令牌过前端判定**（坑 13 的收尾验证） | 真签两个令牌 → 跑 `web/src/lib/auth.ts` 的同一份代码 | `typ=access` → `isAccessToken=true`；`typ=refresh` → `false`（修复前**两个都是 false**） |
+> | Python 侧新增的 CORS 用例 | `uv run pytest -q tests/api/test_cors.py` | **11 passed**（简单请求 / 白名单外来源 / 预检不吃配额 / 错误响应带头 / Expose-Headers） |
 > | 页面可访问性 | `Invoke-WebRequest http://127.0.0.1:3000{/,\/internal,\/login,\/citation}` | 四条路由都 **HTTP 200**、title 为 `ShopSage · 智能助手` |
 > | `/api/kb` 安全面 | 真链路用例里的一条 | 正常名 200；`../.env` → **400**；不带 `name` → 200 列清单 |
-> | Python 全量回归 | `uv run pytest -q -m "not llm_live"` | **1617 passed, 50 skipped, 13 deselected, 6 errors**（140s） |
+> | Python 全量回归 | `uv run pytest -q -m "not llm_live"` | **1628 passed, 50 skipped, 13 deselected, 6 errors**（150s） |
 > | Python 全量回归（**本步之前**的基线） | 同上 | **1613 passed, 50 skipped, 13 deselected, 6 errors**（见 [`15.mcp-runbook.md`](15.mcp-runbook.md) 状态表） |
 >
-> ✅ 增量可逐项对上：`+4` 条用例里，3 条来自本步新增的占位符守卫
-> （`tests/test_agents_data.py`：示例不许有尖括号 / 占位符会重试 / 一直给占位符会降级，
-> 另有一条 4 条断言的识别器用例也在同一个 patch 里），
-> 其余改动是**修既有用例的一个判据**（`tests/cache/test_cache_contracts.py` 换调用名，见 §10.1 坑 4）——
-> `1617 − 1613 = 4` 与「新增 4 条、修 1 条判据」完全吻合。
+> ✅ 增量可逐项对上：`+15` = `tests/api/test_cors.py` 的 **11 条**（本步新增的跨源行为）+ 3 条占位符守卫
+> + 1 条 few-shot 示例用例（`tests/test_agents_data.py`）；
+> 其余改动是**修既有用例的一个判据**（`tests/cache/test_cache_contracts.py` 换调用名，见 §10.1 坑 4）。
 >
 > ⚠️ 6 个 error 是 `tests/test_config.py` 里用 `tmp_path` 的老问题（沙箱 `PermissionError: [WinError 5]`），
 > **改动之前就是这个数**。
@@ -72,6 +74,7 @@
 | 「WebSocket 连不上，控制台一行握手失败」 | Windows | §10.1 坑 7（子协议少写了 `shopsage.v1`） |
 | 「检索回 0 条 → 回答没有来源」 | Windows | §10.1 坑 6（向量库被全量回归清空了） |
 | 「图表出不来」 | Windows | §10.1 坑 5（Text-to-SQL 把绑定参数写成占位符） |
+| 「HTTP 好好的，一进对客页就说 WebSocket 连接失败」 | Windows | §10.1 坑 14（base 指到了前端自己；自检 ⑤ 一次定位） |
 | 「页面昨天还好，今天 500 且报 `React Client Manifest`」 | Windows | §10.1 坑 10（`next build` 与 `next dev` 同时在跑，`.next` 被覆盖） |
 | 回填验收证据 | Windows | §11 → `docs/modules/16.web.md` §8 |
 
@@ -88,6 +91,8 @@
 3. **令牌、`user_id`、`thread_id` 都不是前端能造的东西**。令牌来自服务端签发；
    `thread_id` 一律用响应里回传的那个；请求体里**永不**出现 `user_id` / `role`
    （后端 `ChatRequest` 是 `extra="forbid"`，多写一个键就是 422）。
+   ⚠️ 而「令牌是什么形状」也**必须以后端为准**：类型声明的键名是 `typ`，
+   第一版前端按 `type` 读，于是**所有真令牌都被拒**（§10.1 坑 13）。
 
 另一条（本步最值钱的认知）：**「流式」与「图表」在后端是两条不同的出口，前端必须选一条**。
 WebSocket 的 `answer` 帧只带一个布尔 `chart`（`app/api/chat.py` 刻意不把 spec 塞进帧），
@@ -174,7 +179,8 @@ web/
 │  ├─ chart.ts             # ★`chart_spec` → ECharts option / 表格视图（纯函数）
 │  ├─ api.ts               # HTTP 客户端：一套错误信封解析 + 令牌注入
 │  ├─ auth.ts              # 登录态、角色→权限表（**界面边界**）、会话 id、令牌解码
-│  └─ config.ts            # 唯一一处读 `NEXT_PUBLIC_*` 的地方（apiBase / streamUrl）
+│  ├─ diagnostics.ts       # ★「探活失败」的提示语（把「先别怀疑令牌」钉进代码，见 §10.1 坑 11）
+│  └─ config.ts            # 唯一一处读 `NEXT_PUBLIC_*` 的地方 + **地址纠正**（base 指到前端自己时改用它，见坑 14）
 ├─ src/components/
 │  ├─ useChatStream.ts     # 把 WS 连接与消息列表缝起来（hook）
 │  ├─ MessageList.tsx      # 气泡 + 出处（纯展示）
@@ -195,15 +201,18 @@ web/
    ├─ chart.test.ts        # 图表适配（含 table / 空数据 / 截断警告）
    ├─ citations.test.ts    # 出处串解析（含**实测形状** `docs/kb/退货政策.md #<hex>`）
    ├─ auth.test.ts         # 角色分流 / 令牌过期 / 会话 id 字符集
+   ├─ diagnostics.test.ts  # 「探活失败」提示语（先别怀疑令牌 / 三条动作 / 可粘贴的 .env 行）
+   ├─ config.test.ts       # 地址推导与**纠正**（base 指到前端自己时必须纠正并说出来，坑 14）
    ├─ live/live.test.ts    # 真链路（真后端 + 真前端；缺令牌时整组 skip）
    └─ run-live.mjs         # 真链路启动器（签令牌 + 起前端 + 跑用例）
 ```
 
-仓库根新增的两个脚本（都是**给本步用的工具**，不是业务代码）：
+仓库根新增的四个脚本（都是**给本步用的工具**，不是业务代码）：
 
 | 文件 | 作用 | 为什么值得进仓库 |
 |---|---|---|
 | `scripts/dev_token.py` | 签发演示用 JWT（`--role` / `--user-id` / `--kind refresh` / `--json`） | 本仓没有登录接口，而浏览器要真令牌才能连后端；同时它是「401 分支怎么试」的唯一入口（§4.1） |
+| `scripts/check_web_cors.py` | 一条命令自检「两个进程 + 跨源 + 预检」，退出码可当门禁 | 前端 `Failed to fetch` 有三种成因，判断它要同时看三处；这条命令把三处问完并给出修法（§1.5 / §10.1 坑 11） |
 | `scripts/probe_rag_sources.py` | 打印 `rag_chunks` 的来源文档与片段 id 形状 | 前端的出处解析必须知道**真实形状**（`docs/kb/退货政策.md #c00bcbd…`），靠猜会写出错一个目录名的解析器（§4.3） |
 | `scripts/probe_internal_query.py` | 用内部角色问 5 种「报表句式」，看哪一个出图 | 「出不出图」取决于 Text-to-SQL 的写法，人工筛句式比在页面上反复试快得多（§6.4） |
 
@@ -221,7 +230,7 @@ web/
 外加**一条自己的路由**：`GET /api/kb?name=<文档名>`（Next 侧，只读语料原文）——
 它不是后端接口，是为「出处能点开」补的最后一公里（§4.3）。
 
-### 1.4 两条起前端的命令
+### 1.5 一条命令自检「两个进程 + 跨源」（本步最常用的一条）
 
 ```powershell
 # ── 执行位置：web/ ──
@@ -245,6 +254,66 @@ $env:NEXT_PUBLIC_API_BASE = "http://192.168.167.156:8000"; npm run dev
 > 所以「改了地址要重启 `npm run dev`（生产模式要重新 `npm run build`）」——
 > 与后端 `.env` 的「重启进程就生效」不同，这一点很容易被误解成「配置没生效」。
 > 唯一读它的地方是 `src/lib/config.ts`（前端也守「配置取值只有一处」）。
+
+### 1.5 一条命令自检「两个进程 + 跨源」（本步最常用的一条）
+
+```powershell
+# ── 执行位置：仓库根 ──
+uv run python -m scripts.check_web_cors
+```
+
+实测输出（两个进程都正常时）：
+
+```text
+① 后端可达（http://127.0.0.1:8000）
+  ✅ HTTP 200 status=ok env=dev
+② 前端可达（http://127.0.0.1:3000）
+  ✅ HTTP 200（15366 字节）
+③ 后端放通前端来源吗（浏览器唯一真正在意的一件事）
+  ✅ Access-Control-Allow-Origin = http://127.0.0.1:3000
+  ✅ Access-Control-Expose-Headers = X-Request-Id
+④ 预检（OPTIONS /api/chat，**不带令牌**）
+  ✅ HTTP 200（预检不该要求鉴权）
+⑤ WebSocket 流式端点**真的能 upgrade** 吗（对客页的主链路）
+  ✅ ws://127.0.0.1:8000/api/chat/stream → HTTP/1.1 101 Switching Protocols（upgrade 成功）
+
+结论：两个进程都在、浏览器可以跨源读这个 API、WebSocket 能 upgrade —— 打开前端页面按 runbook §5 试。
+退出码 = 0
+```
+
+五项各挡一类问题，其中 ⑤ 是**坑 14 的判据**（「HTTP 通但 WS 连不上」时它一次就能定位）：
+
+| 项 | 挡的问题 |
+|---|---|
+| ① 后端可达 | 进程没起 / 端口被占 / 地址写错 |
+| ② 前端可达 | `next dev` 没起（或还在首次编译） |
+| ③ 放通来源 | **CORS 白名单**（坑 11）；认得出「这是网卡地址」（坑 14 附带那条） |
+| ④ 预检 | CORS 中间件位置（是不是最外层）；来源不在白名单时会明确说「根因在 ③」而不是误导 |
+| ⑤ WebSocket upgrade | **地址指错**（坑 14）：`ws:` 连不上而 HTTP 正常 ⇒ 先怀疑地址 |
+
+> 🎯 ⑤ 的用法：它直接用**裸 socket** 发一次 WebSocket 握手（不打令牌），
+> 所以结果分得清：「101 = upgrade 通了」「401/403 = 通了但被鉴权拒（也说明通）」
+> 「404 = 这个地址上没有 WS 路由（URL 指错地方）」「超时 = 那个端口上没人接 upgrade（最典型的是指到了前端自己的 3000）」。
+
+为什么值得有这条命令：前端的 `Failed to fetch` 有**三种**成因（进程没起 / 跨源被拦 / 地址写错），
+而判断它需要同时看三处（两个终端 + 后端配置）。这条命令把三件事一次问完，
+**每一项不通过时都打印出「怎么办」**，退出码可直接当门禁用。
+⚠️ 它不需要令牌，也不需要语料 —— 只回答连通性与跨源（§10.1 坑 11 就是它要挡的那类问题）。
+
+⚠️ **`next dev` 是「按路由现编译」的**：重启后第一次请求 `/` 实测要 **8.1s**（`/internal` 11.7s）。
+所以这个自检的默认单项超时是 **20 秒**（`--timeout` 可调）—— 设小了会把「正在编译」
+报成「前端没起」，那是一个**自查工具自己给出的假信号**，比没有工具更糟。
+
+不通过时它长这样（前端没起 + 跨源没配）：
+
+```text
+② 前端可达（http://127.0.0.1:3000）
+  ❌ 连不上：timed out
+     → 起前端：cd web; npm run dev
+③ 后端放通前端来源吗（浏览器唯一真正在意的一件事）
+  ❌ Access-Control-Allow-Origin = （空）
+     → 在后端 .env 里加一行：API_CORS_ORIGINS=http://127.0.0.1:3000 然后**重启后端**
+```
 
 ---
 
@@ -385,6 +454,41 @@ spec 里三件事前端**不许自作主张**：
 **扩展名白名单** `.md/.txt/.html`、**大小上限 256KB**，并且解析之后再校验一次真实路径仍在
 `docs/kb` 之下（真链路用例里有一条 `../.env` → 400，§7.4）。
 
+### 3.6 第 9 步的 API 为第 16 步补了唯一一处东西：CORS 中间件
+
+这是**本步对后端的第一处契约级改动**，也是最容易漏的一处：前端与 API 不同源，而 CORS 不是「优化」，
+是**浏览器读不读得到响应**的前提（§10.1 坑 11 是实测记录）。
+
+```text
+        browser (127.0.0.1:3000)                API (127.0.0.1:8000)
+             │  GET /health   Origin: http://127.0.0.1:3000
+             └──────────────────────────────────────────────▶
+                                                           处理，回 200
+             ◀──────────────────────────────────────────────┘
+        ⚠️ 响应里**没有** Access-Control-Allow-Origin
+           → 浏览器拒绝把响应交给页面 → fetch 抛 TypeError: Failed to fetch
+           → 页面上看起来跟「后端没起」一模一样（服务端日志里却是 200 OK）
+```
+
+落地两处（`app/api/config.py::cors_origins` + `app/api/main.py` 的中间件），三个决定：
+
+| 决定 | 取值 | 理由 |
+|---|---|---|
+| 中间件**位置** | 最后加 = **最外层** | ① 预检（OPTIONS）带不了 `Authorization`，必须在鉴权/限流之前被答掉；② 401/429/422 也要带上 CORS 头，否则前端连「为什么失败」都读不到 |
+| 白名单 | 显式来源列表，**不写 `*`** | 白名单可审计（`4.security.md` 的「表白名单」同一纪律）；配置校验会拒绝 `*` 与漏协议的值 |
+| `allow_credentials` | `False` | 令牌走 `Authorization` 头，不靠 Cookie；开放 credentials 是另一个量级的风险 |
+
+⚠️ 三点必须记牢：
+
+1. **CORS 不是鉴权**：它只约束浏览器，`curl` / Node 不受影响 ——
+   所以**真链路用例永远测不出这个坑**（§7.6 专门讲这件事，并补了服务端侧的断言）；
+2. **`localhost` 与 `127.0.0.1` 是两个不同的来源**，开发期默认两个都放通
+   （只配一个的症状是「换个地址打开就坏」）；
+3. **来源不带末尾斜杠**（浏览器发的 `Origin` 就是没有斜杠的），代码里做了归一化。
+
+生产形态（第 19 步）：**同源部署**最省事（反代把页面与 `/api` 放同一个域，CORS 直接不需要），
+或者显式列域名；所以 `ENV=prod` 且未配置时，白名单是**空**（宁可浏览器拒绝，也不要默认放开）。
+
 ---
 
 ## 4. 身份：令牌从哪来，怎么进前端
@@ -403,6 +507,10 @@ uv run python -m scripts.dev_token --role internal_employee --user-id 7
 #   令牌（粘到 http://localhost:3000/login）：
 #   eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9….
 
+# ⚠️ 令牌 payload 的**真实形状**（用 --json 的 parsed 字段或前端徽章核对；别凭记忆写解析代码）：
+#   {"sub": "7", "role": "internal_employee", "typ": "access", "iat": 1791896230, "exp": 1791898030, "jti": "f6f09…"}
+#                                 ↑ 类型声明的键名是 **typ**（不是 `type`）—— 见 §10.1 坑 13
+
 # 机器可读（给真链路启动器用）
 uv run python -m scripts.dev_token --json --role customer --user-id 2
 
@@ -412,6 +520,9 @@ uv run python -m scripts.dev_token --kind refresh
 # 故意签一个已过期的：用来试 4401（WebSocket 关闭码）
 uv run python -m scripts.dev_token --ttl -5
 ```
+
+> ⏱ **默认只活 30 分钟**（`DEFAULT_TTL_SECONDS`）。「签一次、想半天、回来再试」是很常见的顺序，
+> 所以登录页会显示「剩余 N 分钟」徽章 —— 看到负数/接近 0 先重签，别去怀疑别的（§10.1 坑 13）。
 
 **为什么不做登录接口**：`16.web.md` §6 第 4 条写的是「接 JWT 登录」，但本仓第 9 步只交付了
 「令牌怎么被验」（`app/security/auth.py::parse_token`）——签发工具一直只被测试与演示脚本使用。
@@ -569,8 +680,9 @@ uv run python -m scripts.probe_internal_query
 
 | 层 | 文件 | 条数 | 回答的问题 |
 |---|---|---|---|
-| **纯逻辑**（离线） | `tests/stream.test.ts`（15）/ `citations`（9）/ `chart`（11）/ `auth`（14）/ `transport`（16） | **65** | 「帧序列意味着什么」「出处怎么拆」「spec 怎么画」「角色怎么分流」「子协议发了什么」 |
-| **真链路** | `tests/live/live.test.ts` | **9** | 「我们抄的契约是真的吗」：真 WS 帧序列 / 真出处 / 真 `chart_spec` / 4401 / `/api/kb` 越界拦截 |
+| **纯逻辑**（离线） | `tests/stream.test.ts`（15）/ `citations`（9）/ `chart`（11）/ `auth`（20）/ `transport`（19）/ `diagnostics`（6）/ `config`（10） | **91** | 「帧序列意味着什么」「出处怎么拆」「spec 怎么画」「角色怎么分流」「子协议发了什么」「探活失败怎么说」「令牌类型怎么认」「配置指错会怎样」「僵尸连接会不会污染状态」 |
+| **真链路**（Node 打真服务） | `tests/live/live.test.ts` | **10** | 「我们抄的契约是真的吗」：真 WS 帧序列 / 真出处 / 真 `chart_spec` / 4401 / `/api/kb` 越界 / **跨源头** |
+| **服务端跨源** | `tests/api/test_cors.py` | **11** | 「浏览器读得到响应吗」：允许来源 / 白名单外 / 预检 / 预检不吃配额 / 错误响应带头 |
 | **构建** | `npm run build` | — | 「能不能出产物」：9/9 静态页、6 条路由、0 类型错 |
 
 ### 7.2 离线用例：一条命令，不连任何后端
@@ -578,7 +690,7 @@ uv run python -m scripts.probe_internal_query
 ```powershell
 cd web
 npm test
-# 实测：tests 65 / pass 65 / fail 0 / duration_ms 218
+# 实测：tests 71 / pass 71 / fail 0 / duration_ms 201
 ```
 
 ### 7.3 用例的三条纪律（沿用前几步的口径）
@@ -600,7 +712,57 @@ npm test
   不是「模型今天稳不稳」 —— 把模型的随机失败算成前端用例的红，最后会让人无视这组用例，
   那比没有用例更糟。
 
-### 7.5 收尾后确认演示库状态
+### 7.5 「真链路全绿」为什么不能证明浏览器能打开页面（本步最贵的一课）
+
+真链路用例跑在 **Node** 里，而 **Node 不受 CORS 约束**：Node 的 `fetch` 会把你带的
+`Origin` 头原样发出去、把响应原样读回来，哪怕响应里一个 CORS 头都没有。
+
+实测代价（第 16 步）：后端当时**一个 CORS 中间件都没有**，而
+`node tests/run-live.mjs` **9 条全绿**；同一时刻浏览器打开页面只得到一句
+`Failed to fetch`（服务端日志里全是 200）。也就是说：
+
+| 证据 | 能证明 | **不能**证明 |
+|---|---|---|
+| `npm test`（离线） | 前端逻辑对 | 真后端、真浏览器 |
+| `node tests/run-live.mjs` | 真后端 + 真前端的**服务端侧**契约对 | **浏览器跨源这一层**（Node 不看 CORS） |
+| `uv run python -m scripts.check_web_cors` | 浏览器读响应所依赖的那个头在 | 页面渲染（需要人眼或 Playwright） |
+
+**处置**：把「跨源」这件事用**三处**钉住（缺一处就会再退回到「Node 绿 / 浏览器红」）：
+
+1. `tests/api/test_cors.py`（服务端，11 条）：拿 `Origin` 打进去看响应头，含预检与错误响应；
+2. `web/tests/live` 里的「浏览器跨源这一层」：对**真服务**做同样的断言（Node 能验到「头在不在」）；
+3. `scripts/check_web_cors.py`：给人用的一条命令，附修法。
+
+⚠️ 剩下的那一格（**页面真的渲染出来了吗**）本步**没有**自动化覆盖 ——
+没有 Playwright 依赖，也没有做（§8 的接线点）。所以 `16.web.md` §8 的验收第 1 条里
+「两个入口可用」这一半，最终仍需要**人眼在浏览器里确认一次**（§5.2 / §5.3 就是那个清单）。
+
+### 7.6 为什么必须拿**真令牌**过一遍前端判定（坑 13 的教训）
+
+坑 13（§10.1）的成因值得单独讲一遍，因为它是**测试方法本身的漏洞**，不是某一行代码写错：
+
+```text
+实现：读 payload.type          ← 错（后端写的是 payload.typ）
+测试：fakeJwt({ type: "access" })  ← 按同一个错理解造的 fixture
+结果：14 条用例全绿，真令牌 100% 被拒
+```
+
+> **手写 fixture 只能证明「实现与我对契约的理解一致」，不能证明「我的理解对」。**
+
+所以本步的证据链里必须有一格是**真来源**：
+
+| 数据 | 来源 | 谁在用 |
+|---|---|---|
+| 帧形状 / 信封形状 | 真后端（真链路用例） | `parseFrame` / `parseChatResponse` |
+| **令牌形状** | **后端真签**（`scripts/dev_token.py`） | `decodeJwtPayload` / `tokenKind`（坑 13 的收尾验证） |
+| 出处串形状 | 真库（`scripts/probe_rag_sources.py`）+ 真链路用例 | `parseCitation` |
+| `chart_spec` 形状 | 真后端（真链路用例） | `toEChartsOption` / `toTableView` |
+
+⚠️ 反过来说：`tests/auth.test.ts` 里那些 `fakeJwt` 用例**不是没价值** ——
+它们覆盖的是「过期 / 坏段 / 类型混用 / 存储清理」这些**分支**，跑 0.2s、可穷举。
+两类数据的**分工**才是重点：fixture 管分支，真数据管形状。
+
+### 7.7 收尾后确认演示库状态
 
 ```powershell
 uv run python -m scripts.probe_rag_sources   # 实测：61 活跃片段 / 8 份文档
@@ -628,9 +790,14 @@ uv run python -m scripts.db_check            # users 8 / orders 30 / products 20
 
 | 症状 | 先看哪里 | 多半是 |
 |---|---|---|
+| **一切请求都 `Failed to fetch`，而服务端日志是 200** | `uv run python -m scripts.check_web_cors` | **跨源被拦**（后端没配 `API_CORS_ORIGINS`）—— §10.1 坑 11。**别去重签令牌** |
+| **HTTP 那半正常，但一进对客页就提示「WebSocket 连接失败」** | 页面上那行「后端 … / 流式 …」+ 自检 ⑤ | **地址指到了前端自己**（`NEXT_PUBLIC_API_BASE` 是构建期变量，改了要重启 dev）—— §10.1 坑 14 |
+| **聊天能用，但时不时弹「WebSocket 连接失败」（URL 还是对的）** | 后端日志里同一端口有没有两条 `accepted` | **被抛弃的旧连接**在报错（StrictMode 双挂载 / 热更新）—— §10.1 坑 15，已由世代守卫修掉 |
+| **登录页说「这是刷新令牌」，而令牌明明是刚签的** | 粘贴后看那排徽章：`typ=` / `剩余 N 分钟` | ① 声明键名读错（**已修**，坑 13）；② 真的过期了（默认只活 30 分钟，看「剩余」徽章） |
 | 页面能开，一问就「什么都不发生」 | 浏览器 Console + Network | WS 握手失败（子协议）/ 后端没起 / `NEXT_PUBLIC_API_BASE` 指错（§10.1 坑 7） |
+| 用 `http://<本机 IP>:3000` 打开时 HTTP 全红、但流式却能连 | `check_web_cors --web http://<本机 IP>:3000` | 网卡来源不在白名单（坑 14 附带那条）—— 加进 `API_CORS_ORIGINS` 或改用 127.0.0.1 |
 | 顶栏是亮的但正文一直「正在检查登录状态…」 | Console 有没有报错 | `localStorage` 不可用（隐私模式）→ 退化为内存存储，本会话可用 |
-| 一进 `/` 就提示「需要先登录」 | `/login` 里的令牌状态徽章 | 令牌过期 / 是刷新令牌 / 复制时缺了一段 |
+| 一进 `/` 就提示「需要先登录」 | `/login` 里的令牌状态徽章（含「剩余」） | 令牌过期 / 复制时缺了一段（这与上面的 `Failed to fetch` **是两件事**） |
 | 回答出来了但没有「来源」 | 先看后端日志有没有 `retrieve_knowledge` 的 tool_error | 向量库空（跑过全量回归）或问法没走知识库（§6.5） |
 | 图表区域空着 | 后端日志里 `sql_query` 的 tool_error | 绑定参数占位符（§10.1 坑 5）；或这一轮确实没有 `chart_spec`（页面会有一句说明） |
 | 点出处页 404 | `/api/kb?name=...` 的响应体 | 出处解析出的文档名不在 `docs/kb/` 里（页面上会列出可用清单） |
@@ -648,7 +815,7 @@ uv run python -m scripts.db_check            # users 8 / orders 30 / products 20
 
 ## 10. 坑与分诊
 
-### 10.1 本步实测撞到的 10 个坑
+### 10.1 本步实测撞到的 15 个坑
 
 **坑 1：`npm install` 报 `spawn EPERM` 并整包回滚（postinstall 脚本起子进程被拒）**
 
@@ -801,6 +968,215 @@ GET / 500 in 9707ms
 ⚠️ 由此得出一条操作纪律：**验收构建时先停 dev**（或至少别指望 dev 还能用），
 这与「改了后端代码要重启后端」（坑 8）是同一类「顺序错了会得到假红」的坑。
 
+**坑 11：浏览器里一切请求都 `Failed to fetch`，而服务端日志里全是 200（**后端当时没有 CORS**）**
+
+这是本步**唯一一个「Node 侧全绿、浏览器侧全红」**的坑，也是整套手册里最值得记住的一条。
+
+```text
+页面（登录 页的探活）：
+  连不上后端（http://127.0.0.1:8000）：Failed to fetch
+
+后端日志（同一时刻）：
+  INFO: 127.0.0.1:5xxxx - "GET /health HTTP/1.1" 200 OK
+```
+
+**成因**：前端在 `http://127.0.0.1:3000`、API 在 `http://127.0.0.1:8000` ——
+**端口不同就是不同源**。第 9 步的 API 从来没有跨源调用方（演示脚本与测试都是同进程 / Node），
+所以 `app/api/main.py` 里一个 CORS 中间件都没注册。浏览器发出请求、也**拿到了 200 响应**，
+但因为响应里没有 `Access-Control-Allow-Origin`，它**拒绝把响应交给页面** ——
+页面侧看到的就是一句没有任何状态码的 `TypeError: Failed to fetch`。
+
+> **判据（先记这一条，比记代码有用）**：
+> `fetch` 抛 `TypeError`（拿不到任何状态码）= **响应没被读到**，三种可能：
+> ① 服务没起 / 地址写错；② **跨源被拦**；③ 网络/证书。
+> **「令牌无效」不在其中** —— 令牌无效会得到 **401**，那是一个能读到的正常响应。
+> 所以看到 `Failed to fetch` 时，**别去重签令牌**（那是这个坑最常见的错误反应）。
+
+**修法（已在仓库里）**：
+
+1. `app/api/config.py` 新增 `cors_origins()`：读 `API_CORS_ORIGINS`（逗号分隔）；
+   开发期默认 `http://localhost:3000` + `http://127.0.0.1:3000`（两个都列是有原因的，见下）；
+   `ENV=prod` 且未配置时为**空**（不允许任何跨源）；
+2. `app/api/main.py` 加 `CORSMiddleware`，并且**必须最后加 = 最外层**（见 §3.6）；
+3. 登录页的探活失败提示语改成 `lib/diagnostics.ts::probeFailureHint()` ——
+   第一句就是「先别怀疑令牌」，并给出三条可执行动作（起后端 / 查地址 / 查 CORS）。
+
+⚠️ **两个容易配错的细节**：
+
+* `localhost` 与 `127.0.0.1` 在浏览器眼里是**不同的来源**，只配一个的症状是
+  「用 localhost 打开能用、换 127.0.0.1 就失败」（反之亦然）—— 这种「换个地址就坏」最容易被归因成别的东西；
+* 来源**不加末尾斜杠**：浏览器发的 `Origin` 头没有斜杠，配成 `http://host:3000/` 永远匹配不上。
+  代码里做了 `rstrip("/")`，配置校验也会拒绝漏协议 / 写 `*` 的值（fail-fast，与限流表达式同一口径）。
+
+⚠️ **这一层不是鉴权**（写在这里免得有人拿它当门）：CORS 只约束**浏览器**，
+`curl` / Node 完全不受它约束 —— 真正的门是 `Authorization: Bearer <JWT>`。
+
+**为什么这组用例必须写在服务端**：本步的真链路用例是 **Node 直接 fetch**，
+它**永远看不到 CORS 的效果**。所以「真链路 9 条全绿」不能证明浏览器能打开页面。
+现在三处都钉住了：`tests/api/test_cors.py`（11 条，含预检、错误响应、白名单）、
+`web/tests/live` 里的「浏览器跨源这一层」（拿 `Origin` 打真服务）、
+以及 `scripts/check_web_cors.py`（一条命令的现场自检，见 §1.5）。
+
+**坑 12：前端与后端都得**由人起**，前端页面会把「后端没起」显示成「令牌无效」**
+
+本机没有把这两个进程做成服务（`2.infra.md` 的容器化到第 19 步才做）。所以：
+
+* 关掉终端 / 会话结束 → 进程就没了 → 页面报 `Failed to fetch`；
+* 这时候用户的第一反应往往是「那我去重新签一个令牌」—— **令牌是好的**，
+  重签一万次也没用（令牌只在服务端活着时才可能验通过）。
+
+**判据**：`Invoke-RestMethod http://127.0.0.1:8000/health` 都连不上，
+说明是进程/网络问题，与令牌无关（§10.2 第 1 条）。
+**修法**：两个终端分别起后端与前端（§5.1），或用 §1.5 的一条命令自检「两个进程 + 跨源」都正常。
+
+**坑 13：令牌类型声明的键名是 `typ`，前端读的是 `type` —— **所有真令牌都被拒**
+
+这是本步第二类「Node 侧全绿、浏览器全红」的坑（坑 11 是跨源，这一条是**契约读错键名**），
+而且它的报错**看起来非常具体、非常可信**，所以更难查：
+
+```text
+登录页（粘贴一个刚签出来的、完全正确的访问令牌）：
+  这是刷新令牌（`type=refresh`），后端会当 401 处理 —— 用 --kind access 重新签发一个。
+
+而实际：
+  payload = {"sub": "7", "role": "internal_employee", "typ": "access", ...}
+                                                      ↑ 后端写的键名是 typ
+  后端 parse_token(同一个令牌) → Principal(user_id=7, role='internal_employee', token_type='access')  ✅
+```
+
+**成因**：后端 `app/security/auth.py::_create_token` 写的是 `{"typ": token_type}`，
+`parse_token` 也读 `payload.get("typ")`；而前端第一版读的是 **`type`**（OAuth 里常见的命名）。
+于是前端**永远**读不到类型 → 所有令牌都被判成「不是访问令牌」→ 登录页一律拒绝。
+**后端的提示语是对的、令牌也是对的** —— 错的是前端那一行读取，
+但症状（「令牌有问题」）把注意力全引到了令牌上。
+
+⚠️ **为什么它躲过了整套测试**：`web/tests/auth.test.ts` 里的 `fakeJwt(...)` 是**手写的形状** ——
+而它是按 `{"type": "access"}` 造的，也就是说**测试与实现犯了同一个错**，
+于是 14 条用例全绿，真令牌却被拒。这条教训比 bug 本身值钱：
+
+> **手写 fixture 只能证明「实现与我对契约的理解一致」，不能证明「我的理解对」。**
+> 所以真链路用例必须拿**后端真签的**令牌过一遍前端的判定（§7.8）。
+
+**修法（已落地，三处）**：
+
+1. `web/src/lib/auth.ts::decodeJwtPayload` **两个键名都认**（`payload.typ ?? payload.type`），
+   并新增 `tokenKind()` 返回三态（`access` / `refresh` / **`unknown`**）；
+2. 登录页把「声明是 refresh」与「没有类型声明」**分开报**（第一版混成一句「这是刷新令牌」——
+   正是这句话把「键名读错」伪装成了「令牌签错」）；
+3. 登录页新增「剩余 N 分钟」徽章：本仓演示令牌默认只活 **30 分钟**，
+   而「签一次、想半天、回来再试」是常态 —— 不显示剩余时间的话，过期也会被读成「令牌类型不对」。
+
+**离线用例**（`web/tests/auth.test.ts`，新增 6 条）：`typ` 必须被认 / `type` 也认 /
+三态区分 / `typ` 优先 / 刷新令牌被拒 / **类型缺失同样被拒**（与后端 `parse_token` 的判据一致：
+后端对缺失类型也报「收到 (缺失)」）。
+
+**真令牌验证**（这次修复的收尾动作，见 §7.8）：拿 `scripts/dev_token.py` 真签的两个令牌，
+过一遍前端页面用的**同一份**判定代码：
+
+```text
+✅ access（--kind 默认）   payload 键 = sub,role,typ,iat,exp,jti   payload.typ = access
+                          前端解出 = {"sub":"2","role":"internal_employee","exp":…,"tokenType":"access"}
+                          isAccessToken=true  tokenKind=access
+✅ refresh（--kind refresh）payload.typ = refresh   → isAccessToken=false  tokenKind=refresh
+```
+
+**坑 14：HTTP 那半是好的、WebSocket 那半一定死（`NEXT_PUBLIC_API_BASE` 指到了前端自己）**
+
+症状（实测报告）：**对客页能与 AI 对话**，但一进页面就提示
+「WebSocket 连接失败：先确认后端在跑…」。而 HTTP 侧完全正常 —— 这正是它难查的地方。
+
+三条对照实验（把「后端问题」与「地址问题」分开，Node 的 WebSocket 直接给结论）：
+
+```text
+① ws://127.0.0.1:8000/api/chat/stream   → open，子协议=shopsage.v1（54ms）   ← 后端完全正常
+② ws://localhost:8000/api/chat/stream   → open（27ms）
+③ ws://127.0.0.1:3000/api/chat/stream   → error 事件（8s 超时）              ← 页面上的症状
+```
+
+**成因（一条容易被忽略的不对称）**：HTTP 侧有**两个**出口，而 WebSocket 只有**一个**：
+
+| 出口 | 谁在答 | base 指错时会怎样 |
+|---|---|---|
+| `/api/kb`（出处原文） | **Next 自己**（同源） | **永远正常** ← 「半通」错觉的来源 |
+| `/api/chat`（对内报表） | 后端（走 `NEXT_PUBLIC_API_BASE`） | 打到 Next 自己 → 404/500，像「后端坏了」 |
+| `WS /api/chat/stream`（对客流式） | 后端（走同一个 base） | **一定失败** —— Next 的 dev server **不代理 WebSocket upgrade** |
+
+所以「HTTP 看着好、WS 死」= 十有八九是**地址**问题，不是后端问题。
+⚠️ 附带一条：`NEXT_PUBLIC_API_BASE` 是**构建期**变量 —— 设错之后即使改 `.env` 也没用，
+必须**带着正确的值重启 `npm run dev`**（或重新 `npm run build`）。
+
+**修法（两层，缺一不可）**：
+
+1. **代码层：能纠正的自动纠正，且必须说出来**（`web/src/lib/config.ts::resolvedApiBase`）：
+   `NEXT_PUBLIC_API_BASE` 指到**页面自己**时，自动改用 `http://127.0.0.1:8000`；
+   页面上同时显示「后端 … → 实际用 …」并弹一条配置提示
+   —— 这是**有声音的降级**，不是静默兜底（静默兜底会让「配置到底生效没有」永远说不清）。
+   判据：`isSelfReferentialBase()`（`new URL(base).origin === new URL(pageOrigin).origin`）。
+2. **提示层：`socket_error` 的话术要带 URL 与可执行动作**。
+   第一版只有一句「先确认后端在跑」，而实测那次后端**完全正常** ——
+   方向错了，排查时间就全花在没问题的东西上。现在它打印**实际试过的 URL**、
+   指向 `scripts/check_web_cors.py`、并在 URL 指向前端自己时直接给出重启命令。
+
+**为什么不让 Next 去代理 WebSocket**（一个被否掉的方案）：Next 的 App Router **不支持**
+在 route handler / rewrite 里代理 WebSocket upgrade（那要自建 server）。也就是说
+「页面同源转发 WS」这条路在本仓的形态下走不通 —— 把它写在这里，免得下一个人再试一遍。
+
+**顺带实测到的一个相关坑（网卡地址）**：`next dev` 会打印一行
+`Network: http://192.168.167.156:3000`，照着它打开页面时：
+HTTP 侧**会失败**（那个来源不在白名单里 → 没有 `Access-Control-Allow-Origin`），
+而 WebSocket 侧**却能升级成功**（WS 不受 CORS 约束）。
+两个方向相反的结论叠在一起 = 「界面能开、流式也能连、但一问就 Failed to fetch」。
+处置：要么把该来源写进 `API_CORS_ORIGINS`，要么就用 `http://127.0.0.1:3000` 打开。
+`check_web_cors.py` 现在会**认出来这是网卡地址**并直接说这两条（§1.5）。
+
+**坑 15：聊天能用，但时不时弹「WebSocket 连接失败」—— 报错来自一条**已经没人要**的旧连接**
+
+症状（实测报告）：**对客页一切正常、回答也能出来**，但页面上时不时出现
+「WebSocket 连接失败：ws://127.0.0.1:8000/api/chat/stream（子协议 shopsage.v1）…」。
+注意 URL 是**对的**、后端也**是好的** —— 这条报错与「连不上」无关。
+
+两条现场证据：
+
+```text
+后端日志：同一个客户端端口出现两条 /api/chat/stream accepted（其中一条被强行关掉）
+          INFO: 127.0.0.1:52269 - "WebSocket /api/chat/stream" [accepted]
+          INFO: 127.0.0.1:52270 - "WebSocket /api/chat/stream" [accepted]
+          Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)
+          ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+
+Node 实测（建连后立刻 close）：
+          ① 立刻 close(1000)          → error → close(1006)     ← 没有 open！
+          ② 等 300ms 再 close(1000)   → open → close(4401)
+```
+
+两条证据拼起来就是成因：
+
+1. **React 开发模式（StrictMode）会把 effect 跑两遍**：第一条连接被 cleanup `close()` 掉，
+   第二条接管（热更新 Fast Refresh 同理）。所以后端看到「同一端口两条连接」；
+2. **在 `CONNECTING` 阶段 `close()` 会得到一个 `error`**（浏览器还没握手就收到关闭请求），
+   以 `close(1006)` 收尾 —— 事件序列是 `error → close(1006)`，**看起来完全像连接失败**；
+3. 旧连接的事件仍然会到达它的监听器，而第一版**照单全收**：
+   `push()` 里直接 `options.onState(...)` —— 于是**一条已死连接的错误覆盖了正在工作的那条连接的状态**，
+   用户看到的就是「聊得好好的忽然报连接失败」。
+
+**修法（两处，各治一半）**：
+
+1. **世代守卫**（`activeGeneration`）：每次建连领一个号，`push()` 与 `open/close/error` 回调
+   先问一句「我还是当前那条连接吗」，不是就**直接扔掉**。
+   这条治的是「旧连接不许改状态」，而且**连回调也要挡**（`onClose` 会改调用方的状态）；
+2. **主动关闭不算失败**（`intentionalClose`）：`close()` 之后到达的 1006 只作为**信息**记下来
+   （`closeCode` 保留），不再渲染成「连接失败」。这条治的是「我们主动收线不该报错」——
+   不然每次 StrictMode 双挂载、每次热更新、每次切页都会在界面上留一句假报错。
+
+**用例**（`web/tests/transport.test.ts`，新增 3 条）：旧连接再抛 `error` 不许污染当前状态 /
+旧连接的 `error` 不进当前状态 / **主动 close 之后的 1006 不算失败**。
+两条守卫都做了「去掉就红」的验证 —— 否则它们只是装饰。
+
+⚠️ 这条坑的通用教训：**WebSocket 的生命周期不是「一条连接一个组件」**。
+React 的双挂载、热更新、切页都会产生「被抛弃但仍会发事件的连接」，
+而它们的 `error`/`close` 与真实故障**长得一模一样**。
+凡是共享一份状态的地方（我这里就是 hook 里的 `stream` state），都要有世代号。
+
 ### 10.2 排障顺序（三条路，别乱）
 
 1. **先确认两个进程各自在跑哪一版、连的是谁**：
@@ -812,7 +1188,7 @@ GET / 500 in 9707ms
 3. **最后才怀疑前端**：此时用 `npm test`（离线）与浏览器 Console 夹逼 ——
    离线绿 + Console 报错 = 环境/契约问题；离线红 = 前端逻辑问题。
 
-### 10.3 坑的分布（为什么这十条里有一半不是前端的问题）
+### 10.3 坑的分布（为什么这些坑大半不是前端的问题）
 
 | 坑 | 表面症状在前端？ | 根因所在 |
 |---|---|---|
@@ -820,10 +1196,25 @@ GET / 500 in 9707ms
 | 4 / 5（检索 / 出图） | **是**（「没有来源」「没有图表」） | **后端**：异步节点调同步检索、few-shot 教坏了模型 |
 | 6（语料被清空） | 是 | 测试顺序（全量回归会 `downgrade base`） |
 | 7 / 8 / 10（子协议 / 没重启 / 两个 next 抢 `.next`） | 是 | 契约细节 + **操作顺序** |
+| **11 / 12（跨源 / 进程没起）** | **是**（「连不上后端」「令牌全无效」） | **后端缺 CORS 中间件** + 两个进程都得人来起 |
+| **13（`typ` 被读成 `type`）** | **是**（「这是刷新令牌」—— 而令牌完全正确） | **前端读错契约键名**（真令牌为准的验证能一次抓到，见 §7.6） |
+| **14（base 指到前端自己）** | **是**（「HTTP 通、WebSocket 死」） | **HTTP 有两个出口而 WS 只有一个** + `NEXT_PUBLIC_API_BASE` 是构建期变量 |
+| **15（被抛弃的旧连接报错）** | **是**（「聊得好好的忽然报连接失败」——URL 还是对的） | **React 双挂载 / 热更新**产生的僵尸连接 + `CONNECTING` 阶段 close 会得到 `error` |
 | 9（把前端当安全边界） | 不是（它是设计纪律） | 分层 |
 
 这张表的用途只有一个：**下次看到「前端坏了」，先按 10.2 的三步确认根因在哪一层** ——
-本步一半的「前端 bug」最后都改在后端或操作顺序上。
+本步大半的「前端 bug」最后都改在后端、契约理解或操作顺序上。
+其中四条最值得记住，因为它们的**症状都极像「后端/令牌坏了」，而真相都不是**：
+
+* **坑 11**：`fetch` 抛 `TypeError`（**没有任何状态码**）= 响应没被读到 → 进程没起 / **跨源被拦** / 地址错；
+  **不是令牌问题**（令牌无效会得到 401）；
+* **坑 13**：报错说得**非常具体**（「这是刷新令牌」）时也要留个心眼 ——
+  先看一眼页面上那排徽章里的 `typ=` 与「剩余 N 分钟」，再决定要不要重签；
+* **坑 14**：**HTTP 通不代表地址对** —— `/api/kb` 是 Next 自己的路由，它永远通。
+  判据是自检的 ⑤（WebSocket 能否 upgrade）：`ws:` 连不上而 HTTP 正常 ⇒ 先怀疑**地址**；
+* **坑 15**：**能用不代表没有错** —— 报错可能来自一条已经没人要的连接。
+  判据是后端日志里「同一个客户端端口出现两条 `accepted`」；
+  修法是**世代号**（旧连接不许改状态），而不是去查后端。
 
 ---
 
@@ -832,42 +1223,57 @@ GET / 500 in 9707ms
 ```powershell
 # ① 离线用例（本模块，零依赖）
 cd web; npm test
-# 实测：tests 65 / pass 65 / fail 0（0.22s）
+# 实测：tests 91 / pass 91 / fail 0（0.21s）
 
 # ② 类型检查 + 构建（验收「构建通过」）
 npm run typecheck      # 实测：无输出
 npm run build          # 实测：✓ Compiled successfully in 22.0s；9/9 静态页
 
-# ③ 真链路（需要后端 + 语料；前端没起时启动器会自己起）
-node tests/run-live.mjs
-# 实测：tests 9 / pass 9 / fail 0（41.9s 热身态 / 81.9s 冷启动态）
+# ③ **先自检「两个进程 + 跨源 + WebSocket upgrade」**（浏览器能不能用的前提）
+cd ..
+uv run python -m scripts.check_web_cors
+# 实测：五项全 ✅、退出码 0
+# ⚠️ 如果你是照 `next dev` 打印的 Network 地址打开的页面，再跑一次带 --web 的那条：
+uv run python -m scripts.check_web_cors --web http://192.168.167.156:3000
+# 实测：③ 会明确说「这个来源不在白名单里」并给出要写进 .env 的那一行
 
-# ④ 四条路由可访问（前端在跑时）
+# ④ 真链路（需要后端 + 语料；前端没起时启动器会自己起）
+cd web; node tests/run-live.mjs
+# 实测：tests 10 / pass 10 / fail 0（41.9s 热身态 / 81.9s 冷启动态）
+
+# ⑤ 四条路由可访问（前端在跑时）
 foreach ($p in '/', '/internal', '/login', '/citation?q=%E9%80%80%E8%B4%A7%E6%94%BF%E7%AD%96.md') {
   $r = Invoke-WebRequest "http://127.0.0.1:3000$p" -UseBasicParsing
   "$p -> $($r.StatusCode)"
 }
 # 实测：四条都是 200
 
-# ⑤ 语料与依赖栈状态（回填时一起记）
-cd ..
+# ⑥ 跨源的服务端用例（改了 CORS 相关代码才需要，通常随全量回归一起跑）
+cd ..; uv run pytest -q tests/api/test_cors.py
+# 实测：11 passed
+
+# ⑦ 语料与依赖栈状态（回填时一起记）
 uv run python -m scripts.probe_rag_sources     # 实测：61 活跃片段 / 8 份文档
 uv run python -m scripts.db_check              # 实测：users 8 / orders 30 / products 20 / order_items 65
 
-# ⑥ Python 全量回归（改了后端三处，必须跑）
+# ⑧ Python 全量回归（改了后端四处，必须跑）
 uv run pytest -q -m "not llm_live"
-# 实测：1617 passed, 50 skipped, 13 deselected, 6 errors（140s）
+# 实测：1628 passed, 50 skipped, 13 deselected, 6 errors（150s）
 ```
 
 回填到 [`docs/modules/16.web.md`](../modules/16.web.md) §8 的四条验收标准 + 一张证据表（§12 有模板）。
 
 ---
 
-## 12. 四组自查命令（收尾必跑）
+## 12. 六组自查命令（收尾必跑）
 
 ```powershell
 # ── 执行位置：web/ ──
 $env:npm_config_cache = "..\.npm-cache"
+
+# ⓪ 「两个进程 + 跨源」一条命令（**本步最该先跑的一条**）
+cd ..; uv run python -m scripts.check_web_cors; cd web
+# 实测：四项全 ✅、退出码 0（含「后端放通前端来源」与「预检答得掉」）
 
 # ① 前端不许有业务判断：SQL / ORM / 模型 SDK / prompt
 #    ⚠️ 路径要**逐个列**（`src\**\*.ts` 这种写法在 PowerShell 里要求 -Recurse，直接写会「零匹配」——
@@ -899,7 +1305,23 @@ Get-ChildItem -Recurse src\app -Include page.tsx,route.ts |
 
 # ④ 交叉核对：离线用例数、真链路用例数、构建产物路径
 npm test 2>&1 | Select-String 'tests |pass |fail '
-# 实测：tests 65 / pass 65 / fail 0
+# 实测：tests 78 / pass 78 / fail 0
+
+# ⑤ 跨源这一层：前后端的「来源」必须对得上（坑 11 的判据）
+#    ⚠️ 别只看「后端配了没有」：要确认**前端实际打开的地址**在后端白名单里
+Select-String -Path '..\app\api\config.py' -Pattern 'DEV_CORS_ORIGINS' -Context 0,4 |
+  ForEach-Object { $_.Context.PostContext }
+# 实测：
+#     "http://localhost:3000",
+#     "http://127.0.0.1:3000",
+#   两个都在（它们**不是**同一个来源；只配一个会「换个地址打开就坏」）
+
+# ⑥ 令牌类型判定的**契约键名**（坑 13 的判据）：后端写 `typ`，前端必须两个都认
+Select-String -Path '..\app\security\auth.py' -Pattern '"typ": token_type' | ForEach-Object { "后端：$($_.Line.Trim())" }
+Select-String -Path 'src\lib\auth.ts' -Pattern 'payload.typ \?\? payload.type' | ForEach-Object { "前端：$($_.Line.Trim())" }
+# 实测：
+#   后端："typ": token_type,
+#   前端：const typeValue = payload.typ ?? payload.type;
 ```
 
 ---
