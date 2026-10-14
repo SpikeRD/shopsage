@@ -9,7 +9,7 @@ Redis 那条在开发机上**跑不了** —— `langgraph-checkpoint-redis` 用
 用法（在仓库根执行）：
 
     uv run python -m scripts.redis_checkpointer_probe            # 用 .env 里的 REDIS_URL
-    uv run python -m scripts.redis_checkpointer_probe --url redis://192.168.167.130:6380/0
+    uv run python -m scripts.redis_checkpointer_probe --url redis://192.168.1.6:6380/0
 
 它做**三步检查**，每步失败都给出可照做的下一步：
 

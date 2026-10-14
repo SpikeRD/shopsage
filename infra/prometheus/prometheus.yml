@@ -6,7 +6,7 @@
 # ⚠️ 那该写什么地址？**不要凭记忆写「宿主机=172.17.0.1」** —— 这句话只在
 #    「业务也在 Linux VM 上、且容器在默认 bridge（docker0）里」时才成立。
 #    本仓的开发拓扑是【Windows 开发者机 + 独立的 Linux 依赖机】两台机器，
-#    此时唯一正确的地址是 **Windows 在 VMware 网段上的那张网卡 IP**（本仓实测 192.168.167.148，
+#    此时唯一正确的地址是 **Windows 在 VMware 网段上的那张网卡 IP**（本仓实测 192.168.1.13，
 #    见文件末尾的「本机实测拓扑」）。取法（在 Windows 上执行）：
 #      Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' }
 #    判据是它必须与 Linux 的 `ip -4 -o addr show` 里 ens33/eth0 那张网卡**在同一个 /24**。
@@ -64,13 +64,13 @@ scrape_configs:
       #     （`%7B`/`%7D` 就是 `{`/`}` 的 URL 编码，是「没替换成功」的指纹。）
       #   * 改地址的两种情形（**看你在哪儿跑业务**）：
       #       ① 业务在 Windows 开发者机（本仓开发拓扑）→ 写 Windows 在 VMware 网段的网卡 IP，
-      #          即下面这个 192.168.167.148:8000。它必须与 Linux 的 ens33 同网段。
+      #          即下面这个 192.168.1.13:8000。它必须与 Linux 的 ens33 同网段。
       #       ② 业务也搬到 Linux VM 上跑（.env 里 host 改回 localhost）→ 写 172.18.0.1:8000，
       #          即**容器 `ip route` 里 `default via` 那个地址**（compose 自定义网桥的网关，
       #          不是 docker0 的 172.17.0.1）。
       #   * 想让地址可配置：部署期生成/替换这个文件，或升级到 Prometheus 3.x ——
       #     **不是**在这里写 `${...}`。scripts/check_infra.py 会把这类写法直接判为错误。
-      - targets: ["192.168.167.148:8000"]
+      - targets: ["192.168.1.13:8000"]
         labels:
           service: api
 
@@ -87,14 +87,14 @@ scrape_configs:
   #    不是 172.17.0.1（那是 docker0，本栈没用它）。
   # - job_name: shopsage-worker
   #   static_configs:
-  #     - targets: ["192.168.167.148:9100"]
+  #     - targets: ["192.168.1.13:9100"]
 
 # ── 本机实测拓扑（2026-10-11 排障时逐条验证过，改地址前先读这段）─────────────
 #
 #   Windows 开发者机（业务 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000）
-#     Ethernet0                192.168.167.148/24     ← 业务实际监听的地址
+#     Ethernet0                192.168.1.13/24      ← 业务实际监听的地址
 #   Linux 依赖机（Docker Engine + compose 全套依赖）
-#     ens33                    192.168.167.130/24     ← 与 Windows 同 /24，双向可达
+#     ens33                    192.168.1.6/24       ← 与 Windows 同 /24，双向可达
 #     docker0                  172.17.0.1/16          ← 默认 bridge，**本栈没用它**
 #     br-40dcd5210154          172.18.0.1/16          ← compose 自定义网桥，本栈用这张
 #   容器内（shopsage-dev-prometheus）

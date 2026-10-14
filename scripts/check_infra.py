@@ -112,7 +112,7 @@ def check_prometheus_scrape() -> list[str]:
                         "Prometheus 2.x 不替换 static_configs 里的 `${...}`（只作用于 external_labels，"
                         "3.0 才默认生效），它既不报错也不替换：target 会永久 down"
                         "（`invalid URL escape \"%7B\"` 或 `invalid port \":8000%7D\"`）。"
-                        "请把地址写死，例如 targets: [\"192.168.167.148:8000\"]（Windows 网卡 IP，"
+                        "请把地址写死，例如 targets: [\"192.168.1.13:8000\"]（Windows 网卡 IP，"
                         "地址取法见 11.observability-runbook.md §6.2）；"
                         "需要可配置就在部署期生成这个文件，或升级 Prometheus 3.x"
                     )

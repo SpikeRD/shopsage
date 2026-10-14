@@ -21,7 +21,7 @@
 > | **HTTP 通但 WS 死**的定位（坑 14） | 三条对照：直连 8000 / 直连 localhost / 经 3000 | `8000` → open（54ms）；`localhost:8000` → open（27ms）；**经前端 3000 → 8s 超时** |
 > | **真令牌过前端判定**（坑 13 的收尾验证） | 真签两个令牌 → 跑 `web/src/lib/auth.ts` 的同一份代码 | `typ=access` → `isAccessToken=true`；`typ=refresh` → `false`（修复前**两个都是 false**） |
 > | **连接生命周期**（坑 15/16/17） | `npm test` 的 `transport` / `hook-wiring` 两组 | 僵尸连接不污染状态（3 条）/ 握手与回帧看门狗（4 条）/ 重连接线（7 条） |
-> | 网卡来源（`next dev` 的 Network 那一行） | `check_web_cors --web http://192.168.167.156:3000` | ③ 明确报「不在白名单」并给出要写进 `.env` 的那一行（WS 侧却能升级 101） |
+> | 网卡来源（`next dev` 的 Network 那一行） | `check_web_cors --web http://192.168.1.13:3000` | ③ 明确报「不在白名单」并给出要写进 `.env` 的那一行（WS 侧却能升级 101） |
 > | Python 侧新增的 CORS 用例 | `uv run pytest -q tests/api/test_cors.py` | **11 passed**（简单请求 / 白名单外来源 / 预检不吃配额 / 错误响应带头 / Expose-Headers） |
 > | 页面可访问性 | `Invoke-WebRequest http://127.0.0.1:3000{/,\/internal,\/login,\/citation}` | 四条路由都 **HTTP 200**、title 为 `ShopSage · 智能助手` |
 > | `/api/kb` 安全面 | 真链路用例里的一条 | 正常名 200；`../.env` → **400**；不带 `name` → 200 列清单 |
@@ -180,8 +180,8 @@ Invoke-RestMethod http://127.0.0.1:8000/health | Select-Object status, env, vers
 #    代价是「改了后端代码必须手动重启」，见 §10.1 坑 8。
 
 # ② 依赖栈可达（前端本身不需要，但「真溯源」与「对内图表」需要）
-Test-NetConnection 192.168.167.130 -Port 5432 -InformationLevel Quiet   # True
-Test-NetConnection 192.168.167.130 -Port 6379 -InformationLevel Quiet   # True
+Test-NetConnection 192.168.1.6 -Port 5432 -InformationLevel Quiet   # True
+Test-NetConnection 192.168.1.6 -Port 6379 -InformationLevel Quiet   # True
 
 # ③ 前端依赖已装（`--ignore-scripts` 是必须的，见 §10.1 坑 1）
 cd web
@@ -278,7 +278,7 @@ npm run dev
 # 实测：
 #    ▲ Next.js 15.5.27
 #    - Local:        http://localhost:3000
-#    - Network:      http://192.168.167.156:3000
+#    - Network:      http://192.168.1.13:3000
 #    ✓ Ready in 4.7s
 
 # ② 生产模式（构建 + 起；验收「构建通过」用这条）
@@ -286,7 +286,7 @@ npm run build      # ✓ Compiled successfully in 22.0s（9/9 静态页）
 npm start          # http://localhost:3000
 
 # ③ 指向别的后端（默认 http://127.0.0.1:8000）
-$env:NEXT_PUBLIC_API_BASE = "http://192.168.167.156:8000"; npm run dev
+$env:NEXT_PUBLIC_API_BASE = "http://192.168.1.13:8000"; npm run dev
 ```
 
 > ⚠️ **`NEXT_PUBLIC_API_BASE` 是构建期变量**（`NEXT_PUBLIC_*` 会被字面替换进客户端包），
@@ -1208,7 +1208,7 @@ GET / 500 in 9707ms
 「页面同源转发 WS」这条路在本仓的形态下走不通 —— 把它写在这里，免得下一个人再试一遍。
 
 **顺带实测到的一个相关坑（网卡地址）**：`next dev` 会打印一行
-`Network: http://192.168.167.156:3000`，照着它打开页面时：
+`Network: http://192.168.1.13:3000`，照着它打开页面时：
 HTTP 侧**会失败**（那个来源不在白名单里 → 没有 `Access-Control-Allow-Origin`），
 而 WebSocket 侧**却能升级成功**（WS 不受 CORS 约束）。
 两个方向相反的结论叠在一起 = 「界面能开、流式也能连、但一问就 Failed to fetch」。
@@ -1273,10 +1273,10 @@ React 的双挂载、热更新、切页都会产生「被抛弃但仍会发事�
 
 三条现场证据（缺一条就会误判）：
   ① 后端日志：只有 WebSocket accepted，**一条 POST /api/chat 都没有**
-  ② 前端日志：⚠ Cross origin request detected from 192.168.167.141 to /_next/* resource
+  ② 前端日志：⚠ Cross origin request detected from 192.168.1.13 to /_next/* resource
               （说明浏览器实际是用**网卡地址**打开的页面）
   ③ 自检（唯一能一次定位的一条）：
-     uv run python -m scripts.check_web_cors --web http://192.168.167.141:3000
+     uv run python -m scripts.check_web_cors --web http://192.168.1.13:3000
      ③ ❌ Access-Control-Allow-Origin = （空）   ④ ❌ 预检 HTTP 400   ⑤ ✅ WS 101
 ```
 
@@ -1297,7 +1297,7 @@ React 的双挂载、热更新、切页都会产生「被抛弃但仍会发事�
 ```powershell
 # .env —— ⚠️⚠️ 这一项一旦设置就【完全替代】开发期默认值（默认只有 localhost:3000 与 127.0.0.1:3000），
 #      不是「追加」。所以三个来源都要列上，少一个就又变成「换个地址打开就坏」。
-API_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://192.168.167.141:3000
+API_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://192.168.1.13:3000
 # 然后重启后端（.env 是启动时读的，坑 8 同一类顺序问题）
 ```
 
@@ -1496,7 +1496,7 @@ cd ..
 uv run python -m scripts.check_web_cors
 # 实测：五项全 ✅、退出码 0
 # ⚠️ 如果你是照 `next dev` 打印的 Network 地址打开的页面，再跑一次带 --web 的那条：
-uv run python -m scripts.check_web_cors --web http://192.168.167.156:3000
+uv run python -m scripts.check_web_cors --web http://192.168.1.13:3000
 # 实测：③ 会明确说「这个来源不在白名单里」并给出要写进 .env 的那一行
 
 # ④ 真链路（需要后端 + 语料；前端没起时启动器会自己起）

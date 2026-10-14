@@ -94,7 +94,7 @@ services:
       #    在原生 Docker Engine 上 `host-gateway` 解析成的是 **Linux VM 自己**的网关
       #    （本栈实测 172.18.0.1），不是 Windows 开发者机。
       #    → 采集 Windows 上的业务必须写 Windows 的真实网卡 IP
-      #      （实测 192.168.167.148:8000），见 infra/prometheus/prometheus.yml 末尾的拓扑说明。
+      #      （实测 192.168.1.13:8000），见 infra/prometheus/prometheus.yml 末尾的拓扑说明。
       #    这条 extra_hosts 保留的意义：将来「业务也搬到 Linux 上跑」时，
       #    host.docker.internal 就等于那台 Linux，比写死网桥 IP 更耐改网络配置。
       - "host.docker.internal:host-gateway"

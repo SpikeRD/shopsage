@@ -31,8 +31,8 @@ def test_plain_url_defaults_to_psycopg2_in_sqlalchemy():
 
 def test_to_sqlalchemy_url_adds_psycopg_dialect():
     assert (
-        to_sqlalchemy_url("postgresql://shopuser:shoppass@192.168.167.130:5432/shopsage")
-        == "postgresql+psycopg://shopuser:shoppass@192.168.167.130:5432/shopsage"
+        to_sqlalchemy_url("postgresql://shopuser:shoppass@192.168.1.6:5432/shopsage")
+        == "postgresql+psycopg://shopuser:shoppass@192.168.1.6:5432/shopsage"
     )
 
 
