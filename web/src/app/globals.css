@@ -8,10 +8,24 @@
  * 一旦和后端构建环境里的版本不一致，症状是「类名静默失效」（页面能用但没样式），
  * 那是最难查的一类前端问题。所以动画直接写 CSS 关键帧。
  *
- * 主题用 **CSS 变量 + `data-theme` 属性**：
- * 组件里全用 `var(--xxx)`，切主题只改 `<html data-theme>`（见 `layout.tsx` 里那段
- * `beforeInteractive` 脚本：它把 localStorage 里的偏好**在首帧之前**写上去，
- * 否则会闪一下浅色）。
+ * ## 变更 002：主题改成**单一浅色护眼**（不再有 `data-theme`）
+ *
+ * 变更前这里有两套变量：`:root` 是深色、`[data-theme="light"]` 是浅色，
+ * 而**没有任何界面在写 `shopsage.theme`**（`layout.tsx` 只读过它）——
+ * 于是浅色分支是**死代码**，实际呈现永远是深色，与「浅色护眼」的需求相反。
+ *
+ * 现在只留一套浅色变量，`data-theme` 属性与那段 `beforeInteractive` 脚本一并删除
+ * （见 `layout.tsx`）。取色口径：
+ *
+ * | 变量 | 取值 | 为什么 |
+ * |---|---|---|
+ * | `--bg` | `#f6f7f4` | 米白略偏暖：纯白 `#fff` 满屏反光，是「刺眼」的主要来源 |
+ * | `--text` | `#23282d` | 近黑不纯黑：纯黑在浅底上对比过强，久看疲劳 |
+ * | `--accent` | `#2f7d6e` | 低饱和青绿，替代原高饱和蓝 `#5b8cff` |
+ *
+ * ⚠️ **已知取舍**：`--accent` 改成青绿后与 `--ok` 同属绿色系，所以 `--ok` 刻意取得更饱和、
+ * `--accent` 偏青，让「按钮」与「成功徽章」仍能区分。色弱场景下的可区分性**未实测**
+ * （见变更单 002 §8 遗留 L4）。
  */
 
 :root {
@@ -19,29 +33,23 @@
     "Hiragino Sans GB", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
-  --bg: #0b1020;
-  --bg-soft: #131a2e;
-  --bg-card: #171f36;
-  --border: #263052;
-  --text: #e8ecf8;
-  --text-dim: #9aa6c8;
-  --accent: #5b8cff;
-  --accent-soft: #1e2a4d;
-  --ok: #35c07f;
-  --warn: #e0a63a;
-  --danger: #ff6b6b;
+  --bg: #f6f7f4;
+  --bg-soft: #ffffff;
+  --bg-card: #ffffff;
+  --border: #dfe3dc;
+  --text: #23282d;
+  --text-dim: #6b7280;
+  --accent: #2f7d6e;
+  --accent-soft: #e7f1ee;
+  --ok: #2f8f5b;
+  --warn: #b07d1f;
+  --danger: #c0503f;
   --radius: 12px;
 }
 
-:root[data-theme="light"] {
-  --bg: #f4f6fc;
-  --bg-soft: #ffffff;
-  --bg-card: #ffffff;
-  --border: #d9e0f0;
-  --text: #171d2e;
-  --text-dim: #5a6789;
-  --accent: #2f5fe0;
-  --accent-soft: #e6ecff;
+/* 表单控件跟随浅色主题（否则浏览器会画出深色系统控件，与页面打架）。 */
+:root {
+  color-scheme: light;
 }
 
 * {
@@ -68,19 +76,164 @@ a:hover {
   text-decoration: underline;
 }
 
-/* ── 骨架 ─────────────────────────────────────────────────────────────── */
+/* ── 骨架（变更 002：顶部导航 → 左侧边栏）───────────────────────────────
+ *
+ * 两套外壳（见 `src/app/(auth)/layout.tsx` 与 `src/app/(app)/layout.tsx`）：
+ *
+ * | 外壳 | 用什么类 | 长什么样 |
+ * |---|---|---|
+ * | 登录 | `.auth-shell` | 全屏居中一张卡片，**没有**侧边栏 |
+ * | 主界面 | `.app-shell` | 左固定侧边栏 + 右内容区 |
+ *
+ * ⚠️ 为什么是**两套布局**而不是「一套 + 按 pathname 隐藏侧边栏」：后者会让登录页的
+ * HTML 里也存在侧边栏节点（渲染出来再藏），首屏会闪一下。路由组在构建期就分开了
+ * （见变更单 002 §3.2.1）。
+ */
 
-.topbar {
+.app-shell {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+}
+
+.sidenav {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 12px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-soft);
+  overflow-y: auto;
+}
+
+.sidenav-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.sidenav-brand:hover {
+  text-decoration: none;
+}
+
+.sidenav-group {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  padding: 10px 8px 4px;
+}
+
+.sidenav-link {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 10px 20px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-soft);
-  position: sticky;
-  top: 0;
-  z-index: 10;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.sidenav-link:hover {
+  background: var(--accent-soft);
+  text-decoration: none;
+}
+
+/* 当前页：底色 + 左侧色条（不只靠颜色，还有位置，色弱下也能分辨） */
+.sidenav-link.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.sidenav-foot {
+  margin-top: auto;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.shell-main {
+  min-width: 0; /* 网格子项默认 min-width:auto，不加这条宽表格会把侧边栏挤扁 */
+  padding: 20px;
+}
+
+/* 窄屏：侧边栏从左侧栏变成顶部条（本次不做完整响应式重构，只保证可用） */
+@media (max-width: 860px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidenav {
+    position: static;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidenav-foot {
+    margin-top: 8px;
+  }
+}
+
+/* 登录外壳：全屏居中，无侧边栏 */
+.auth-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+}
+
+/* ── 探活横幅（变更 002）─────────────────────────────────────────────
+ *
+ * 挂在**两个 layout 的顶部**（不是页面正文里）：页面内容再长也不会把它滚出视野，
+ * 而「后端没连上」正是那种「必须先看见」的信息。
+ */
+.health-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 9%, var(--bg-card));
+  font-size: 13px;
+}
+
+.health-banner.warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg-card));
+}
+
+.health-banner-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.health-banner pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  color: var(--text-dim);
 }
 
 .brand {
@@ -108,21 +261,7 @@ a:hover {
   font-size: 13px;
 }
 
-.topnav {
-  display: flex;
-  gap: 16px;
-  font-size: 14px;
-}
-
-.shell {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 20px;
-}
-
 .footer {
-  max-width: 1080px;
-  margin: 0 auto;
   padding: 0 20px 32px;
   color: var(--text-dim);
   font-size: 12px;
@@ -160,6 +299,14 @@ a:hover {
   font-size: 12.5px;
 }
 
+/* ── 表格 ───────────────────────────────────────────────────────────────
+ *
+ * ⚠️ **变更 002 修的那个 bug 就在这里**：管理台原先写的是 `className="table"`，
+ * 而本文件只定义过 `table.data` —— `.table` 这条规则**根本不存在**，于是那张表
+ * 没有任何边框/内边距/表头区分，长文本自由换行，看起来「格式混在一起」。
+ * 修法是**复用它本来就该用的 `table.data`**（不新造一套样式）。
+ */
+
 table.data {
   width: 100%;
   border-collapse: collapse;
@@ -169,14 +316,52 @@ table.data {
 table.data th,
 table.data td {
   border-bottom: 1px solid var(--border);
-  padding: 6px 8px;
+  padding: 8px 10px;
   text-align: left;
+  vertical-align: middle;
+  /* ⚠️ 默认 `nowrap`：表格里换行才是「格式混在一起」的主因。
+     需要换行的列（如说明文字）显式加 `.cell-wrap`。 */
   white-space: nowrap;
 }
 
 table.data th {
   color: var(--text-dim);
   font-weight: 500;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+}
+
+table.data tbody tr:hover td {
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+/**
+ * 长文本单元格：单行省略号。
+ *
+ * ⚠️ **必须同时给 `title` 属性**（悬浮显示全文）—— 只截断不给全文，等于把信息藏起来。
+ * 截断的判据写在页面里：`title={value}` 与文本同源（见 `admin/page.tsx`）。
+ */
+.cell-ellipsis {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-wrap {
+  white-space: normal;
+}
+
+/* 操作列：按钮 + 下拉必须在一行里，换行会让「停用」和「改角色」看起来是两件事 */
+.cell-actions {
+  white-space: nowrap;
+}
+
+.cell-actions .row {
+  flex-wrap: nowrap;
+  gap: 6px;
 }
 
 .scroll-x {

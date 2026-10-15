@@ -27,7 +27,9 @@ import { test } from "node:test";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_SOURCE = readFileSync(path.resolve(HERE, "../src/components/useChatStream.ts"), "utf8");
-const PAGE_SOURCE = readFileSync(path.resolve(HERE, "../src/app/page.tsx"), "utf8");
+// ⚠️ 变更 002 把页面移进了路由组 `(app)`（URL 不变，仍是 `/`）——
+// 这里的路径必须跟着走，否则本文件会在 import 期就 ENOENT（整组用例直接不跑）。
+const PAGE_SOURCE = readFileSync(path.resolve(HERE, "../src/app/(app)/page.tsx"), "utf8");
 
 /** 取 `useEffect(...)` 到它的依赖数组之间的那段（拼在一起便于断言）。 */
 function effectBody(source: string, marker: string): string {

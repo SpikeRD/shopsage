@@ -308,98 +308,109 @@ function AdminConsole({ session }: { session: Session }) {
           </div>
         </div>
 
-        <table className="table" style={{ marginTop: 10 }}>
-          <thead>
-            <tr>
-              <th>标识</th>
-              <th>角色</th>
-              <th>主体</th>
-              <th>入口</th>
-              <th>状态</th>
-              <th>最近登录</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {accounts.map((account) => (
-              <tr key={account.accountId}>
-                <td className="mono">{account.identifier}</td>
-                <td>
-                  {account.role}
-                  {account.isAdmin ? <span className="badge accent" style={{ marginLeft: 6 }}>admin</span> : null}
-                </td>
-                <td className="mono small">
-                  {account.subjectType}#{account.subjectId}
-                </td>
-                <td className="small">
-                  {entryLabel(
-                    account.entry === "admin"
-                      ? "admin"
-                      : account.entry === "internal"
-                        ? "internal"
-                        : "customer",
-                  )}
-                </td>
-                <td>
-                  <span className={`badge ${account.status === "active" ? "ok" : "danger"}`}>
-                    {account.status}
-                  </span>
-                </td>
-                <td className="small muted">{account.lastLoginAt ?? "（从未）"}</td>
-                <td>
-                  <div className="row">
-                    <button
-                      className="btn ghost tiny"
-                      type="button"
-                      onClick={() =>
-                        void run(
-                          () =>
-                            patchAccount(session.token, account.accountId, {
-                              status: account.status === "active" ? "disabled" : "active",
-                            }),
-                          account.status === "active"
-                            ? `已停用 ${account.identifier}（他的在途令牌立刻失效）。`
-                            : `已启用 ${account.identifier}。`,
-                        )
-                      }
-                    >
-                      {account.status === "active" ? "停用" : "启用"}
-                    </button>
-                    <select
-                      className="input"
-                      style={{ maxWidth: 170 }}
-                      aria-label={`改 ${account.identifier} 的角色`}
-                      value={account.role}
-                      onChange={(event) =>
-                        void run(
-                          () =>
-                            patchAccount(session.token, account.accountId, { role: event.target.value }),
-                          `已把 ${account.identifier} 的角色改为 ${event.target.value}（在途令牌已失效）。`,
-                        )
-                      }
-                    >
-                      {KNOWN_ROLES.map((role) => (
-                        <option key={role} value={role}>
-                          {role}
-                        </option>
-                      ))}
-                    </select>
-                    <button className="btn ghost tiny" type="button" onClick={() => resetPassword(account)}>
-                      重置口令
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-            {accounts.length === 0 ? (
+        {/* ⚠️ 变更 002 修的 bug 就在这里：原先是 `className="table"`，而 `globals.css`
+            里**只定义过 `table.data`** —— `.table` 这条规则根本不存在，于是这张表
+            没有任何边框/内边距/表头区分，长文本自由换行，看起来「格式混在一起」。
+            现在改用它本来就该用的 `table.data`，外面套 `scroll-x` 让窄屏能横向滚动。 */}
+        <div className="scroll-x" style={{ marginTop: 10 }}>
+          <table className="data">
+            <thead>
               <tr>
-                <td colSpan={7} className="muted small">
-                  {loading ? "加载中…" : "没有符合条件的账号。"}
-                </td>
+                <th>标识</th>
+                <th>角色</th>
+                <th>主体</th>
+                <th>入口</th>
+                <th>状态</th>
+                <th>最近登录</th>
+                <th>操作</th>
               </tr>
-            ) : null}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {accounts.map((account) => (
+                <tr key={account.accountId}>
+                  {/* 长文本单行省略号 + `title` 悬浮全文：只截断不给全文等于把信息藏起来 */}
+                  <td className="mono cell-ellipsis" title={account.identifier}>
+                    {account.identifier}
+                  </td>
+                  <td>
+                    {account.role}
+                    {account.isAdmin ? <span className="badge accent" style={{ marginLeft: 6 }}>admin</span> : null}
+                  </td>
+                  <td className="mono small">
+                    {account.subjectType}#{account.subjectId}
+                  </td>
+                  <td className="small">
+                    {entryLabel(
+                      account.entry === "admin"
+                        ? "admin"
+                        : account.entry === "internal"
+                          ? "internal"
+                          : "customer",
+                    )}
+                  </td>
+                  <td>
+                    <span className={`badge ${account.status === "active" ? "ok" : "danger"}`}>
+                      {account.status}
+                    </span>
+                  </td>
+                  <td className="small muted cell-ellipsis" title={account.lastLoginAt ?? "（从未登录）"}>
+                    {account.lastLoginAt ?? "（从未）"}
+                  </td>
+                  <td className="cell-actions">
+                    <div className="row">
+                      <button
+                        className="btn ghost tiny"
+                        type="button"
+                        onClick={() =>
+                          void run(
+                            () =>
+                              patchAccount(session.token, account.accountId, {
+                                status: account.status === "active" ? "disabled" : "active",
+                              }),
+                            account.status === "active"
+                              ? `已停用 ${account.identifier}（他的在途令牌立刻失效）。`
+                              : `已启用 ${account.identifier}。`,
+                          )
+                        }
+                      >
+                        {account.status === "active" ? "停用" : "启用"}
+                      </button>
+                      <select
+                        className="input"
+                        style={{ maxWidth: 170 }}
+                        aria-label={`改 ${account.identifier} 的角色`}
+                        value={account.role}
+                        onChange={(event) =>
+                          void run(
+                            () =>
+                              patchAccount(session.token, account.accountId, { role: event.target.value }),
+                            `已把 ${account.identifier} 的角色改为 ${event.target.value}（在途令牌已失效）。`,
+                          )
+                        }
+                      >
+                        {KNOWN_ROLES.map((role) => (
+                          <option key={role} value={role}>
+                            {role}
+                          </option>
+                        ))}
+                      </select>
+                      <button className="btn ghost tiny" type="button" onClick={() => resetPassword(account)}>
+                        重置口令
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {accounts.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="muted small">
+                    {loading ? "加载中…" : "没有符合条件的账号。"}
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
         <ul className="hint-list">
           <li>「停用 / 改角色 / 重置口令」都会**立刻作废该账号所有在途令牌**（后端 `token_version` 机制）。</li>
           <li>不能停用或降级最后一个启用的管理员 —— 那会把系统锁死（后端拒绝，界面会显示原因）。</li>

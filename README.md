@@ -44,6 +44,20 @@
 | 10–15 rag / observability / queue / cache / eval / mcp | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/rag/`、`app/observability/`、`app/queue/`、`app/cache/`、`app/eval/`、`app/mcp/` | 见各步 runbook 的状态表；第 15 步口径：全量 **1613 passed, 50 skipped, 13 deselected, 6 errors** |
 | 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py`、`scripts/check_web_cors.py` | `cd web; npm test`（**119 passed**）；`npm run build`（**✓ 4.3s**）；`node tests/run-live.mjs`（**10 passed**） |
 | 17 **变更 001：账号登录 + 管理台** | ✅ 完成（**真登录**：账号+口令、刷新续期、三档入口、管理员开账号） | `app/security/accounts.py`、`app/api/auth.py`、`app/api/admin.py`、`web/src/app/admin/`、`web/src/lib/session.ts` | `uv run pytest -q tests/security tests/api`；`uv run python -m scripts.seed`；`cd web; npm test`；全量 **1745 passed, 50 skipped** |
+| 18 **变更 002：前端改版** | ✅ 完成（**浅色护眼** + 登录/主界面分离 + **左侧边栏**按权限分流 + **自动探活** + 管理台表格修复） | `web/src/app/(auth)/`、`web/src/app/(app)/`、`web/src/components/SideNav.tsx`、`HealthBanner.tsx`、`web/src/lib/health.ts` | `cd web; npm test`（**150 passed**）；`npm run build`；`npm run typecheck`；`uv run python -m scripts.evidence_accounts`；`uv run python -m scripts.evidence_paths` |
+
+> 📌 **变更 002（前端改版）的用法**：
+> ① 后端照旧 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
+> ② 前端 `cd web; npm run dev` → <http://127.0.0.1:3000>；
+> ③ 打开 `/login` 用账号+口令登录，登录后落在**左侧边栏**外壳里：
+> 侧边栏按你的权限显示入口（客户只看得到「对客问答」，员工多一个「对内查询」，管理员三个都有），
+> 底部固定显示**个人信息 + 权限状态**（权限点来自 `GET /api/auth/me`，失败时回退本地并**明确标注是回退值**）。
+> ④ **每次打开或刷新页面都会自动探活一次**（`GET /health`）；后端没连上时页面顶部出现异常横幅，
+> 含后端地址与分诊步骤，另有「重新探活」按钮。
+> ⚠️ **登录页不再有「开发模式粘贴令牌」**（变更 002 按「只管登录账户」删掉了）。
+> 排障要手粘令牌时，改在 DevTools 里执行：
+> `localStorage.setItem("shopsage.token.customer", "<令牌>")`（key 见 `web/src/lib/auth.ts::tokenKey`）。
+> 变更说明、决策记录与实测证据见 [`docs/changes/002-light-ui-sidebar-and-autoprobe.md`](docs/changes/002-light-ui-sidebar-and-autoprobe.md)。
 
 > 📌 **变更 001（账号登录 + 管理台）的用法**：
 > ① 起依赖栈与后端；② 灌演示账号 `uv run python -m scripts.seed`（口令写在 `scripts/seed.py`
@@ -89,6 +103,8 @@ uv run python -m scripts.db_check --check     # 验收断言：缺表/行数不�
 uv run python -m scripts.load_knowledge_base  # 灌知识库语料（跑完全量回归后必须重灌，见 16 runbook §10.1 坑 6）
 uv run python -m scripts.dev_token --account admin   # 签一个能粘进 Web 登录页的演示令牌（按账号签，变更 001）
 uv run python -m scripts.dev_token --role admin      # 也可以按角色取「第一个启用账号」来签
+uv run python -m scripts.evidence_accounts           # 变更 002 取证：账号与口令确实在库里（Argon2id，非明文）
+uv run python -m scripts.evidence_paths              # 变更 002 取证：三条主路径回归（需后端在跑）
 ```
 
 前端（都在 `web/` 下执行；需要 Node ≥ 22，本机实测 v24.16.0）：
@@ -96,8 +112,10 @@ uv run python -m scripts.dev_token --role admin      # 也可以按角色取「�
 ```bash
 npm install --ignore-scripts   # ⚠️ 必须带 --ignore-scripts（见 16 runbook §10.1 坑 1）
 npm run dev                    # 开发模式 → http://127.0.0.1:3000
-npm test                       # 离线用例（119 条，不连后端）
+npm test                       # 离线用例（150 条，不连后端；变更 002 起 +31）
 npm run typecheck              # 类型检查
 npm run build                  # 构建通过（验收第 1 条）
 node tests/run-live.mjs        # 真链路用例（10 条，需要后端在跑）
+npx tsx scripts/probe-evidence.ts      # 变更 002 取证：探活判据（改 NEXT_PUBLIC_API_BASE 可对比断连/正常）
+npx tsx scripts/sidebar-evidence.ts    # 变更 002 取证：三角色的侧边栏入口分流（需后端在跑 + TOK_* 环境变量）
 ```

@@ -1,8 +1,5 @@
 import type { Metadata } from "next";
-import Script from "next/script";
-import Link from "next/link";
 import "./globals.css";
-import { TopNav } from "@/components/TopNav";
 
 export const metadata: Metadata = {
   title: "ShopSage · 智能助手",
@@ -10,44 +7,33 @@ export const metadata: Metadata = {
 };
 
 /**
- * 根布局。
+ * 根布局（变更 002 起**只剩 HTML 骨架**）。
  *
- * 两个刻意的做法：
+ * ## 变更 002 从这里删掉了什么，为什么
  *
- * 1. **不用 `next/font/google`**：它会去 `fonts.googleapis.com` 拉字体，
- *    而本项目的构建/演示环境**不保证外网可达**（本机实测：构建期拉不到会让
- *    `next build` 直接失败）。字体在这里不是设计需求，是风险 ——
- *    用系统字体栈换掉（见 `globals.css` 的 `--font-sans`）。
- * 2. **`<html lang="zh-CN">`**：界面是中文的，标错语言会让浏览器
- *    （以及屏幕阅读器）用错的分词与朗读规则。
- * 3. **导航是一个客户端组件**（`<TopNav />`，变更 001 / T17）：
- *    登录态在 `localStorage`，而本布局是**服务端组件** —— 在这里直接读会渲染出
- *    「未登录」快照并与客户端的水合结果打架。导航要按角色显示不同入口，
- *    所以那部分必须交给客户端组件（见其模块注释）。
+ * | 删掉的 | 原来为什么有 | 为什么可以删 |
+ * |---|---|---|
+ * | `<Script id="shopsage-theme">`（`beforeInteractive`） | 把 `localStorage` 里的主题偏好在首帧前写进 `<html data-theme>`，否则会闪一下浅色 | 主题现在**只有一套浅色**（见 `globals.css` 的模块注释）：没有偏好可读，也就没有闪烁问题 |
+ * | `<header className="topbar">` + `<TopNav/>` | 顶部导航 | 入口改由**左侧边栏**承担（`(app)/layout.tsx` 的 `<SideNav/>`）；登录页根本不该有导航 |
+ *
+ * ## 为什么两套外壳不在这里
+ *
+ * 登录页与主界面要长得完全不同（前者无侧边栏、居中一张卡片）。如果在这个根布局里
+ * 按 `pathname` 判断「要不要画侧边栏」，登录页的 HTML 里会**先有侧边栏节点再藏掉** ——
+ * 首屏会闪。所以外壳交给两个**路由组**（`(auth)` / `(app)`）在构建期分开，
+ * 本文件只负责 `<html lang="zh-CN">` 与全局样式。
+ *
+ * ⚠️ `<html lang="zh-CN">` 保持不变：界面是中文的，标错语言会让浏览器
+ * （以及屏幕阅读器）用错的分词与朗读规则。
+ *
+ * ⚠️ 仍然**不用 `next/font/google`**：它会去 `fonts.googleapis.com` 拉字体，
+ * 而本项目的构建/演示环境**不保证外网可达**（实测：构建期拉不到会让 `next build`
+ * 直接失败）。字体用系统字体栈（`globals.css` 的 `--font-sans`）。
  */
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="zh-CN">
-      <body>
-        <Script id="shopsage-theme" strategy="beforeInteractive">
-          {`try{var t=localStorage.getItem("shopsage.theme");if(t==="light"||t==="dark"){document.documentElement.dataset.theme=t;}}catch(e){}`}
-        </Script>
-        <header className="topbar">
-          <Link className="brand" href="/">
-            <span className="brand-dot" aria-hidden="true" />
-            ShopSage
-            <span className="brand-sub">智能助手</span>
-          </Link>
-          <TopNav />
-        </header>
-        <main className="shell">{children}</main>
-        <footer className="footer">
-          <span>
-            演示层：所有权限判断在后端（对客走行级过滤、对内走 RBAC、管理台走 admin 权限点），
-            前端只负责展示与分流。
-          </span>
-        </footer>
-      </body>
+      <body>{children}</body>
     </html>
   );
 }

@@ -360,13 +360,16 @@ uv run python -m scripts.check_web_cors
 
 ### 2.0 先看这里：变更 001 起「怎么登录」变了（**最常踩的一条**）
 
-| | 变更 001 之前 | 变更 001 之后 |
-|---|---|---|
-| 登录方式 | **粘贴令牌**（`scripts/dev_token.py` 现场签） | **账号 + 口令**（`POST /api/auth/login`） |
-| 口令从哪来 | —— | `uv run python -m scripts.seed` 灌的演示账号；口令在 `scripts/seed.py` 的 `DEMO_ACCOUNTS` 里（**刻意不打印到终端**） |
-| 进哪个界面 | 前端按角色**猜** | **服务端返回 `entry`** |
-| 30 分钟后 | 重新签、重新粘 | **自动续期**（`web/src/lib/session.ts`） |
-| 粘贴令牌 | 唯一方式 | `/login` 的「开发模式」折叠区（**保留**：排障与真链路用例还用它） |
+| | 变更 001 之前 | 变更 001 之后 | **变更 002 之后** |
+|---|---|---|---|
+| 登录方式 | **粘贴令牌**（`scripts/dev_token.py` 现场签） | **账号 + 口令**（`POST /api/auth/login`） | 同左（未变） |
+| 口令从哪来 | —— | `uv run python -m scripts.seed` 灌的演示账号；口令在 `scripts/seed.py` 的 `DEMO_ACCOUNTS` 里（**刻意不打印到终端**） | 同左 |
+| 进哪个界面 | 前端按角色**猜** | **服务端返回 `entry`** | 同左 |
+| 30 分钟后 | 重新签、重新粘 | **自动续期**（`web/src/lib/session.ts`） | 同左 |
+| 粘贴令牌 | 唯一方式 | `/login` 的「开发模式」折叠区（**保留**：排障与真链路用例还用它） | ⚠️ **界面已删除** —— 改用下面的 DevTools 方式（见「变更 002 的排障入口」） |
+| 页面外壳 | 顶部导航 | 顶部导航（按角色显示入口） | **左侧边栏**（按权限显示入口 + 底部个人信息/权限状态） |
+| 主题 | 深色（`data-theme` 是死代码） | 同左 | **单一浅色护眼** |
+| 探活 | 登录页一个**手动按钮** | 同左 | **每次打开/刷新自动探活**；失败顶部横幅 |
 
 ```powershell
 # 最短路径（三个演示账号，口令见 scripts/seed.py::DEMO_ACCOUNTS）
@@ -376,6 +379,24 @@ uv run python -m scripts.seed                 # 灌账号（幂等；连跑三�
 #   13800000002    → /           （对客）
 #   employee       → /internal   （对内）
 ```
+
+#### 变更 002 的排障入口：手粘令牌（原「开发模式」已删）
+
+变更 002 按「登录页只管登录账户」把粘贴令牌的**界面**删了，但**存储层与 `dev_token` 都没动**。
+排障时要手粘一个令牌，用 DevTools 直接写 `localStorage`：
+
+```javascript
+// ① 先签一个（在仓库根）
+//    uv run python -m scripts.dev_token --account admin
+// ② 浏览器打开 http://127.0.0.1:3000，F12 → Console，粘贴：
+localStorage.setItem("shopsage.token.admin", "<上面签出来的令牌>");
+// ③ 刷新页面即生效（侧边栏底部会显示身份与权限状态）
+//    key 的形状见 web/src/lib/auth.ts::tokenKey：shopsage.token.{customer|internal|admin}
+//    ⚠️ 这种方式没有刷新令牌：30 分钟后要重新粘（与变更 001 的开发模式一致）
+```
+
+> 为什么用 `localStorage` 而不是改 URL：令牌放查询串会进 access log、浏览器历史与 Referer，
+> 与 `app/api/schemas.py` 里 `WS_TOKEN_PREFIX` 走子协议而非查询串是同一条理由。
 
 ⚠️ **三条最容易误判的**（都写进了 `/login` 的提示语里）：
 

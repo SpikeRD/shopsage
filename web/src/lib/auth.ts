@@ -96,6 +96,45 @@ export function entryPath(entry: Entry): string {
   return "/";
 }
 
+/** 路径 → 入口（`entryPath` 的反函数；认不出来按对客处理）。 */
+export function entryForPath(pathname: string): Entry {
+  const path = String(pathname ?? "").split("?")[0].replace(/\/+$/, "") || "/";
+  if (path === "/admin") return "admin";
+  if (path === "/internal") return "internal";
+  return "customer";
+}
+
+/** 全部入口（顺序即侧边栏的显示顺序）。 */
+export const ENTRIES: readonly Entry[] = ["customer", "internal", "admin"] as const;
+
+/**
+ * 给定**已登录入口的角色**，返回该显示哪些入口（变更 002 / 侧边栏用）。
+ *
+ * ## 为什么入参是「多个角色」而不是「一个角色」
+ *
+ * 变更 001 的存储层是**三把钥匙互不覆盖**（`shopsage.token.customer` / `.internal` / `.admin`）：
+ * 同一个浏览器里可以「用客户身份开着对客页、同时用管理员身份开着管理台」。
+ * 如果侧边栏只读某一个入口的角色，就会出现两个都错的局面：
+ *
+ * * 只读 `customer` → 管理员登录后侧边栏显示「去登录」（**回归**，旧 `TopNav` 不会这样）；
+ * * 只读「最后登录的是谁」→ 与 `lib/session.ts` 的模块注释直接冲突。
+ *
+ * 所以判据是「**任一已登录入口**的能力」，与旧 `TopNav` 的规则一致
+ * （`TopNav.tsx:54-56` 的 `roles.some(...)`）。
+ *
+ * ⚠️ 与 `lib/auth.ts` 的模块注释同源：这只决定**显示哪些链接**，不是安全边界。
+ * 客户把地址栏敲成 `/admin` 一样能打开 —— 那一页的每个请求都会被后端拒。
+ */
+export function visibleEntriesFor(roles: readonly string[]): Entry[] {
+  const canInternal = roles.some((role) => canUseInternal(role));
+  const canAdmin = roles.some((role) => canUseAdmin(role));
+  return ENTRIES.filter((entry) => {
+    if (entry === "customer") return true; // 对客入口对任何身份都显示（它是兜底入口）
+    if (entry === "internal") return canInternal;
+    return canAdmin;
+  });
+}
+
 /** 入口的中文名（标语与导航共用，避免各处写三遍字符串）。 */
 export function entryLabel(entry: Entry): string {
   if (entry === "admin") return "管理台";
