@@ -45,8 +45,29 @@ QUESTIONS = [
 async def main() -> int:
     token = create_access_token(7, role="internal_employee")
     async with httpx.AsyncClient(base_url=API_BASE, timeout=180) as client:
-        health = await client.get("/health")
-        print(f"后端 {API_BASE} → HTTP {health.status_code} status={health.json().get('status')}")
+        # ⚠️ 探活要**自己判**「后端在不在」，不能直接 `health.json()`：
+        #    后端没起时（或地址写错、被反代挡掉）拿到的是空响应/HTML 错误页，
+        #    `.json()` 会抛 `JSONDecodeError: Expecting value: line 1 column 1 (char 0)` ——
+        #    那个报错**完全不指向真正的原因**（实测踩到：以为脚本坏了，其实是没起后端）。
+        #    这里把它翻成一句能照做的话，并给一个非 0 退出码，便于脚本化调用。
+        try:
+            health = await client.get("/health")
+            status = health.json().get("status")
+        except (httpx.HTTPError, ValueError) as exc:
+            print(
+                f"❌ 连不上后端 {API_BASE}（{type(exc).__name__}: {exc}）。\n"
+                "   本脚本**对着真正在跑的后端**跑（它依赖 lifespan 装配出的图，见文件头说明）。\n"
+                "   先起后端，再重跑：\n"
+                f"     uv run uvicorn app.main:app --host 127.0.0.1 --port {API_BASE.rsplit(':', 1)[-1]}\n"
+                "   地址不对时用环境变量覆盖：$env:SHOPSAGE_API_BASE = 'http://127.0.0.1:8000'",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"后端 {API_BASE} → HTTP {health.status_code} status={status}")
+
+        # 逐句的「出不出图」是**模型输出决定的**（analysis 节点要求严格 JSON，偶尔给不出来），
+        # 所以同一句话重跑可能不同 —— 结尾汇总出图率，别把单次结果当成回归失败。
+        chart_ok = 0
         for question in QUESTIONS:
             response = await client.post(
                 "/api/chat",
@@ -59,6 +80,7 @@ async def main() -> int:
             print(f"  HTTP={response.status_code} flow_state={body.get('flow_state')} route={body.get('route')}")
             print(f"  回答：{(body.get('answer') or '')[:140]}")
             if spec:
+                chart_ok += 1
                 print(
                     f"  ✅ chart_spec：type={spec['type']} points={spec['meta']['points']} "
                     f"series={[item['name'] for item in spec['series']]} x={spec['x']['field']}"
@@ -66,6 +88,13 @@ async def main() -> int:
                 print("  data[0]=" + json.dumps(spec["data"][0], ensure_ascii=False))
             else:
                 print(f"  ❌ 没有 chart_spec；refusals={body.get('refusals')}")
+
+        print(f"\n=== 出图 {chart_ok}/{len(QUESTIONS)} 句 ===")
+        print(
+            "⚠️ 这条链路**非确定性**：analysis 节点要求 LLM 严格输出 JSON，"
+            "偶尔给不出来就会没图（同一句话重跑结果可能不同）。\n"
+            "   判据看的是「失败原因能不能解释」，不是「必须 5/5」。"
+        )
     return 0
 
 
