@@ -19,18 +19,29 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-import litellm
-from tenacity import AsyncRetrying, RetryCallState, retry_if_exception, stop_after_attempt
+# ⚠️⚠️ 顺序是**语义的一部分，不要重排**：必须在 `import litellm` 之前摆好 HF 缓存环境。
+#
+# 为什么：`huggingface_hub` 的缓存路径（HF_HOME / HF_HUB_CACHE）在**模块导入时**就被读成
+# 常量固化了，之后再改环境变量**不生效**。而 `import litellm` 会连带导入
+# `litellm.llms.huggingface.*`，于是 HF 常量在那一行就定死了 ——
+# 实测把兜底放在函数里（懒加载处）是**无效**的，仍会去写 `~/.cache` 并抛
+# `PermissionError`。`app/llm/hf_cache.py` 本身只 import os/pathlib，所以能安全地最先执行。
+from app.llm.hf_cache import prepare_hf_cache
 
-from app.config import get_settings
-from app.llm.errors import (
+prepare_hf_cache()
+
+import litellm  # noqa: E402 - 必须在 prepare_hf_cache() 之后（见上方说明）
+from tenacity import AsyncRetrying, RetryCallState, retry_if_exception, stop_after_attempt  # noqa: E402
+
+from app.config import get_settings  # noqa: E402
+from app.llm.errors import (  # noqa: E402
     LLMError,
     PermanentLLMError,
     RetryableLLMError,
     is_permanent,
     is_retryable,
 )
-from app.observability.instrument import embed_span, llm_span, record_llm_call
+from app.observability.instrument import embed_span, llm_span, record_llm_call  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

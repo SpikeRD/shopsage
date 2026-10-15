@@ -41,3 +41,8 @@ Thumbs.db
 .appdata/
 # uv 的缓存也常被指到工作区（前几步的 runbook 都这么写）
 .uv-cache/
+# HuggingFace 模型缓存（本地 embedding 后端用它）。
+# 默认写在 ~/.cache/huggingface —— 受限环境下**仓库外不可写**，必须用
+#   $env:HF_HOME="$PWD\.hf-cache"
+# 指到工作区；见 docs/环境迁移验收.md §1.2。
+.hf-cache/

@@ -33,6 +33,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+# ⚠️ 只 import `app.llm.hf_cache`（一个**零依赖**的小模块），**不要** import `app.llm` 包门面：
+#    本模块刻意保持「纯 CPU 逻辑、可离线单测」的性质，把整条 LLM 栈（litellm 等）拉进来
+#    会让 rerank 的单测也跟着变重。hf_cache 自身只 import os/pathlib，没有反向依赖。
+from app.llm.hf_cache import prepare_hf_cache
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,6 +97,11 @@ class CrossEncoderReranker:
         with _MODEL_LOCK:
             if self._model is not None:
                 return self._model
+            # ⚠️ 与 app/llm/client.py::_load_local_model 同一条纪律：必须在
+            #    import sentence_transformers **之前**摆好 HF 缓存环境（HF 的常量在
+            #    模块导入时就固化了）。本地 embedding 与本地 rerank 是**两处**独立的加载点，
+            #    只修一处的话，另一处仍会去写 ~/.cache 而抛 PermissionError。
+            prepare_hf_cache()
             try:
                 from sentence_transformers import CrossEncoder
             except ImportError as exc:  # pragma: no cover - 依赖已装时不可达

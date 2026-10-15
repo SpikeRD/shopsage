@@ -14,6 +14,7 @@
 | [docs/modules/](docs/modules/README.md) | 每个模块的开发 + 测试文档（8 段模板，文件名按建议开发顺序编号），含建议开发顺序与 problem-solving 映射 | 开发每个模块前/后，边做边查 |
 | [docs/runbook/4.uv-pytest-basics.md](docs/runbook/4.uv-pytest-basics.md) | **uv / pytest 基础命令手册**：uv 管环境依赖（`sync`/`run`/`add`/锁文件）、pytest 选用例与读输出（`-k`/`-m`/退出码/fixture）、本项目 `db` 标记与实测口径、故障速查 | 第一次拿到仓库时读；命令报错（`exit code 5`、缓存权限）时查 |
 | [docs/runbook/](docs/runbook/) | 实操手册目录（编号与 `docs/modules/` 的第 N 步对齐，如 `1.config-guide.md`、`2.infra-runbook.md`、`3.db-runbook.md`） | 要「怎么做、怎么确认做对了」时读 |
+| [docs/环境迁移验收.md](docs/环境迁移验收.md) | **环境迁移验收清单**：换机器后按步验收（工具链 / uv 缓存 / 依赖栈 / 数据库 / 后端 / 跨源 / 前端 / 测试套件 / 知识库），含逐步实测证据、P0 问题与可直接执行的修复命令 | **迁移到新机器后第一份要跑的文档** |
 
 > 📌 **编号约定**：`docs/modules/` 下的模块文档按 [`docs/modules/README.md`](docs/modules/README.md) 的**建议开发顺序**编号
 > （`1.config.md` … `16.web.md`，README 自身不编号）；`docs/runbook/` 下的手册复用同一套编号，即
