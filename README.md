@@ -16,6 +16,7 @@
 | [docs/runbook/](docs/runbook/) | 实操手册目录（编号与 `docs/modules/` 的第 N 步对齐，如 `1.config-guide.md`、`2.infra-runbook.md`、`3.db-runbook.md`） | 要「怎么做、怎么确认做对了」时读 |
 | [docs/环境迁移验收.md](docs/环境迁移验收.md) | **环境迁移验收清单**：换机器后按步验收（工具链 / uv 缓存 / 依赖栈 / 数据库 / 后端 / 跨源 / 前端 / 测试套件 / 知识库），含逐步实测证据、P0 问题与可直接执行的修复命令 | **迁移到新机器后第一份要跑的文档** |
 | [issues/](issues/README.md) | **问题台账**：实测撞到但当场不修/修不完的问题（现象 / 根因 / **判据** / 处理状态），一条一个文件 | 遇到「这算不算坏了」时先查这里有没有既定判据 |
+| [docs/changes/](docs/changes/README.md) | **需求变更台账**：「原来是什么 → 改成什么 → 为什么 → 怎么做 → 怎么验收」，一条变更一个文件；**先定稿文档，再写代码** | 想加/改功能时，先在这里开一条变更单 |
 
 > 📌 **编号约定**：`docs/modules/` 下的模块文档按 [`docs/modules/README.md`](docs/modules/README.md) 的**建议开发顺序**编号
 > （`1.config.md` … `16.web.md`，README 自身不编号）；`docs/runbook/` 下的手册复用同一套编号，即
@@ -41,7 +42,19 @@
 | 4–8 security / llm / tools / agents / graph | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/security/`、`app/llm/`、`app/tools/`、`app/agents/`、`app/graph/` | `uv run pytest -q -k "graph or agents or tools or llm or security"`；第 8 步口径：`79 passed, 1 skipped`（图）+ 全量 `730 passed` |
 | 9 **api** | ✅ **完成**（**首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答；含 WebSocket 流式、限流、审批通道） | `app/api/`、`app/main.py`、`scripts/api_demo.py` | `uv run pytest -q tests/api`（**138 passed**）；`uv run python -m scripts.api_demo`（七个场景，首帧 **10~13ms**）；全量 **870 passed** |
 | 10–15 rag / observability / queue / cache / eval / mcp | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/rag/`、`app/observability/`、`app/queue/`、`app/cache/`、`app/eval/`、`app/mcp/` | 见各步 runbook 的状态表；第 15 步口径：全量 **1613 passed, 50 skipped, 13 deselected, 6 errors** |
-| 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py`、`scripts/check_web_cors.py` | `cd web; npm test`（**95 passed**）；`npm run build`（**✓ 22.0s**）；`node tests/run-live.mjs`（**10 passed**）；`uv run python -m scripts.check_web_cors`（**五项全 ✅**）；全量 **1628 passed, 50 skipped, 13 deselected, 6 errors** |
+| 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py`、`scripts/check_web_cors.py` | `cd web; npm test`（**119 passed**）；`npm run build`（**✓ 4.3s**）；`node tests/run-live.mjs`（**10 passed**） |
+| 17 **变更 001：账号登录 + 管理台** | ✅ 完成（**真登录**：账号+口令、刷新续期、三档入口、管理员开账号） | `app/security/accounts.py`、`app/api/auth.py`、`app/api/admin.py`、`web/src/app/admin/`、`web/src/lib/session.ts` | `uv run pytest -q tests/security tests/api`；`uv run python -m scripts.seed`；`cd web; npm test`；全量 **1745 passed, 50 skipped** |
+
+> 📌 **变更 001（账号登录 + 管理台）的用法**：
+> ① 起依赖栈与后端；② 灌演示账号 `uv run python -m scripts.seed`（口令写在 `scripts/seed.py`
+> 的 `DEMO_ACCOUNTS` 里，**刻意不打印到终端**）；③ 打开 `/login`，用这三个之一登录：
+> `admin` / `13800000002` / `employee` → 分别落在 `/admin`、`/`、`/internal`。
+> 管理员可在 `/admin` 开账号；停用/改角色/重置口令会**立刻作废该账号所有在途令牌**。
+> 变更说明、决策记录与实测证据见 [`docs/changes/001-account-login-and-admin-console.md`](docs/changes/001-account-login-and-admin-console.md)。
+
+> ⚠️ **变更 001 的升级影响**：旧令牌（没有 `aid`/`ver` 声明）一律被拒，
+> 且 `thread_id` 形状从 `u{user_id}:` 改为 `c{user_id}:` / `e{emp_id}:`
+> （员工与客户不再共用会话桶）—— **升级后需要重新登录，旧会话作废**。
 
 > 📌 第 9 步的启动方式：`uv run uvicorn app.main:app --reload --port 8000`
 > （`/docs` 看 OpenAPI、`/health` 看依赖状态、`WS /api/chat/stream` 走流式；
@@ -50,7 +63,9 @@
 > 📌 第 16 步的启动方式（**两个进程 + 一次自检**）：
 > ① 后端 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
 > ② 前端 `cd web; npm install --ignore-scripts; npm run dev` → <http://127.0.0.1:3000>；
-> ③ 登录令牌：`uv run python -m scripts.dev_token --role internal_employee`（粘贴到 `/login`）。
+> ③ 登录：**直接用账号 + 口令**（变更 001 起有真登录接口了，见上面那条）。
+> 排障时仍可用 `uv run python -m scripts.dev_token --account admin` 签一个令牌，
+> 在 `/login` 的「开发模式」里粘贴（它**没有刷新令牌**，30 分钟后要重来）。
 > ⚠️ 页面报 `Failed to fetch` 时先跑 `uv run python -m scripts.check_web_cors`
 > （**别去重签令牌** —— 没有状态码的 fetch 失败不是令牌问题，是「进程没起」或「跨源被拦」）；
 > ⚠️ **打开页面请用 `http://127.0.0.1:3000`（或 `http://localhost:3000`）**：
@@ -72,7 +87,8 @@ uv run python -m scripts.seed                 # 灌演示数据（幂等：重�
 uv run python -m scripts.db_check             # 现场核查：表、行数、约束统计
 uv run python -m scripts.db_check --check     # 验收断言：缺表/行数不足则退出码 1
 uv run python -m scripts.load_knowledge_base  # 灌知识库语料（跑完全量回归后必须重灌，见 16 runbook §10.1 坑 6）
-uv run python -m scripts.dev_token --role internal_employee   # 签一个能粘进 Web 登录页的演示令牌
+uv run python -m scripts.dev_token --account admin   # 签一个能粘进 Web 登录页的演示令牌（按账号签，变更 001）
+uv run python -m scripts.dev_token --role admin      # 也可以按角色取「第一个启用账号」来签
 ```
 
 前端（都在 `web/` 下执行；需要 Node ≥ 22，本机实测 v24.16.0）：
@@ -80,8 +96,8 @@ uv run python -m scripts.dev_token --role internal_employee   # 签一个能粘�
 ```bash
 npm install --ignore-scripts   # ⚠️ 必须带 --ignore-scripts（见 16 runbook §10.1 坑 1）
 npm run dev                    # 开发模式 → http://127.0.0.1:3000
-npm test                       # 离线用例（65 条，不连后端）
+npm test                       # 离线用例（119 条，不连后端）
 npm run typecheck              # 类型检查
 npm run build                  # 构建通过（验收第 1 条）
-node tests/run-live.mjs        # 真链路用例（9 条，需要后端在跑）
+node tests/run-live.mjs        # 真链路用例（10 条，需要后端在跑）
 ```

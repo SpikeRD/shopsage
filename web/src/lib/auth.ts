@@ -28,8 +28,8 @@ import { SESSION_ID_PATTERN } from "./contracts.ts";
 /** 本仓后端的四个演示角色（与 `app/security/rbac.py` 的 `ROLE_PERMISSIONS` 同源）。 */
 export type Role = "customer" | "customer_service" | "internal_employee" | "manager" | "finance_auditor" | "admin";
 
-/** 登录后要看的界面（`/` 对客、`/internal` 对内）。 */
-export type Entry = "customer" | "internal";
+/** 登录后要看的界面（`/` 对客、`/internal` 对内、`/admin` 管理台）。 */
+export type Entry = "customer" | "internal" | "admin";
 
 /** 权限点（与后端 `app/security/rbac.py` 的常量逐字相同）。 */
 export const PERM_READ_OWN = "read:own";
@@ -71,21 +71,57 @@ export function canUseInternal(role: string): boolean {
   return hasPermission(role, PERM_READ_ALL_ORDERS);
 }
 
-/** 默认入口：内部角色进对内页，其余进对客页。 */
+/** 能否进管理台（判据是「有没有 `admin` 权限点」—— 与后端 `accounts.entry_for_role` 同一判据）。 */
+export function canUseAdmin(role: string): boolean {
+  return hasPermission(role, PERM_ADMIN);
+}
+
+/**
+ * 默认入口。⚠️ **优先级与后端 `accounts.entry_for_role` 必须一致**：
+ * 管理员 → 管理台；能读全站订单 → 对内；否则 → 对客。
+ *
+ * 顺序不能反：管理员也带 `read:all_orders`，先判对内就永远进不了管理台。
+ * 但**真正的入口由服务端在登录响应的 `entry` 字段里给**（`lib/session.ts` 用它），
+ * 这个函数只在「服务端没给 entry」（例如手粘令牌）时兜底。
+ */
 export function defaultEntry(role: string): Entry {
+  if (canUseAdmin(role)) return "admin";
   return canUseInternal(role) ? "internal" : "customer";
+}
+
+/** 入口 → 页面路径（**唯一一处**映射，导航与跳转都用它）。 */
+export function entryPath(entry: Entry): string {
+  if (entry === "admin") return "/admin";
+  if (entry === "internal") return "/internal";
+  return "/";
+}
+
+/** 入口的中文名（标语与导航共用，避免各处写三遍字符串）。 */
+export function entryLabel(entry: Entry): string {
+  if (entry === "admin") return "管理台";
+  if (entry === "internal") return "对内查询";
+  return "对客问答";
 }
 
 // ── 令牌解码（**不验签**，见模块注释）────────────────────────────────────────
 
 export interface TokenClaims {
-  /** `sub` 是字符串形式的 user_id（PyJWT 把 JSON 值原样带过来，所以可能是 number） */
+  /**
+   * 主体标识串（变更 001 起是 `c2` 客户 / `e1` 员工，**不再是裸 user_id**）。
+   *
+   * ⚠️ 前端**不要**把它当数字用：它带类别前缀，而「前缀 + 数字」正是
+   * `thread_id` 的形状。要显示「我是谁」直接用原串。
+   */
   sub: string;
   role: string;
   /** 过期时间（秒级 UNIX 时间戳）；缺失 = 0，视作「已过期」 */
   exp: number;
   /** 令牌类型：`access` / `refresh`（见 `decodeJwtPayload` 的注释：声明的键名是 `typ`） */
   tokenType: string;
+  /** 主体类别（`customer` / `employee`）；旧令牌缺失 = 空串 */
+  subjectType: string;
+  /** 账号主键；旧令牌缺失 = 0 */
+  accountId: number;
 }
 
 /**
@@ -123,11 +159,27 @@ export function decodeJwtPayload(token: string): TokenClaims | null {
     // `typ` 是本仓后端的声明键名；`type` 留给「别处签发、按 OAuth 惯例命名」的令牌
     const typeValue = payload.typ ?? payload.type;
     const tokenType = typeof typeValue === "string" ? typeValue : "";
+    // 变更 001 新增的两个声明（旧令牌没有 → 空串/0，`isAccountToken` 据此判「旧格式」）
+    const subjectType = typeof payload.stype === "string" ? payload.stype : "";
+    const accountId = typeof payload.aid === "number" ? payload.aid : 0;
     if (!sub) return null;
-    return { sub, role, exp, tokenType };
+    return { sub, role, exp, tokenType, subjectType, accountId };
   } catch {
     return null;
   }
+}
+
+/**
+ * 这是不是**变更 001 之后**签发的令牌（带 `aid`/`stype`/`ver`）。
+ *
+ * 为什么需要这个判断：旧令牌（`sub` 是裸数字、没有这些声明）在后端
+ * `deps.principal_with_account` 里**一定被拒**（那是「升级后旧令牌失效」的落点）。
+ * 前端若能提前识别，就能给出「这是旧格式，请重新登录」而不是笼统的 401 ——
+ * 两者的修法完全不同。
+ */
+export function isAccountToken(token: string): boolean {
+  const claims = decodeJwtPayload(token);
+  return Boolean(claims && claims.accountId > 0 && claims.subjectType);
 }
 
 /** 令牌类型的三态：`access` / `refresh` / **`unknown`**（没有任何类型声明）。 */
@@ -281,29 +333,44 @@ export function newSessionId(now: () => number = Date.now): string {
 export interface DemoPreset {
   entry: Entry;
   role: string;
-  userId: number;
+  /** 登录标识（用户名或手机号）—— 变更 001 起登录要它，而不是 user_id */
+  account: string;
   label: string;
   hint: string;
 }
 
 /**
- * 演示用的四个身份（`user_id` 取自 `scripts/seed.py` 的种子数据）。
+ * 演示身份（与 `scripts/seed.py::DEMO_ACCOUNTS` **同源**）。
  *
  * ⚠️ 放在 `lib/` 而不是页面文件里，有两个理由：
  * ① **页面文件不许有额外导出** —— `next build` 会对 `app/**\/page.tsx` 做入口检查，
  *    除白名单（`default` / `metadata` / `dynamic` …）之外的导出都会让构建失败
  *    （实测：`Property 'PRESETS' is incompatible with index signature`）；
  * ② 这张表要能被测试引用（`web/tests/auth.test.ts` 会核对每个 role 都在权限表里）。
+ *
+ * ⚠️ 变更 001 把 `userId` 换成了 `account`：登录用的是**登录标识**，
+ * 而主体 id 由服务端从账号行里取（前端不该猜「哪个 user_id 对应哪个账号」）。
  */
 export const DEMO_PRESETS: DemoPreset[] = [
-  { entry: "customer", role: "customer", userId: 2, label: "客户", hint: "只能查自己的订单（行级过滤）" },
+  {
+    entry: "customer",
+    role: "customer",
+    account: "13800000002",
+    label: "客户",
+    hint: "只能查自己的订单（行级过滤）",
+  },
   {
     entry: "internal",
     role: "internal_employee",
-    userId: 7,
+    account: "employee",
     label: "普通员工",
     hint: "可读全站订单；财务级数据不可见（RBAC）",
   },
-  { entry: "internal", role: "finance_auditor", userId: 3, label: "财务审计", hint: "唯一能读财务级数据的角色" },
-  { entry: "internal", role: "admin", userId: 1, label: "管理员", hint: "全量权限（运维用）" },
+  {
+    entry: "admin",
+    role: "admin",
+    account: "admin",
+    label: "管理员",
+    hint: "全量权限 + 管理台（开账号 / 停用 / 改角色 / 重置口令）",
+  },
 ];

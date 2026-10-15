@@ -1,4 +1,4 @@
-"""`WS /api/chat/stream` 的用例（`9.api.md` §7 的 `test_streaming_first_token_fast`，B2）。
+﻿"""`WS /api/chat/stream` 的用例（`9.api.md` §7 的 `test_streaming_first_token_fast`，B2）。
 
 `9.api.md` §4 第 2 条：「先出『结论骨架』再补细节，首 token < 1s」。
 本文件把这个要求拆成**可断言的四件事**：
@@ -100,7 +100,7 @@ def test_done_frame_reports_flow_state_and_latency(client: TestClient, customer_
     frames = run_stream(client, customer_token, session_id="done-1")
     done = frames_by_event(frames, "done")[0]
     assert done["data"]["flow_state"] == "delivered"
-    assert done["data"]["thread_id"] == "u2:done-1"
+    assert done["data"]["thread_id"] == "c2:done-1"
     assert done["data"]["route"] == "data"
     assert done["data"]["approval"] is None
     assert done["data"]["latency_ms"] > 0
@@ -171,7 +171,7 @@ def test_multiple_turns_on_one_connection(client: TestClient, customer_token: st
         websocket.send_json({"message": "再查一次", "session_id": "multi-stream"})
         second = read_until_done(websocket)
 
-    assert first[-1]["data"]["thread_id"] == second[-1]["data"]["thread_id"] == "u2:multi-stream"
+    assert first[-1]["data"]["thread_id"] == second[-1]["data"]["thread_id"] == "c2:multi-stream"
     assert second[0]["seq"] == first[-1]["seq"] + 1, "seq 在一条连接上持续递增（前端据此发现丢帧）"
 
 

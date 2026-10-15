@@ -208,20 +208,104 @@ def client(app: Any) -> Iterator[TestClient]:
         yield test_client
 
 
+#: 演示账号是否已经在本进程里补齐过（**懒加载一次**，避免每条用例都查一遍库）。
+_ACCOUNTS_READY = False
+
+
+def _ensure_demo_accounts() -> None:
+    """确保演示账号存在（变更 001 / T6 起，令牌必须有对应账号行）。
+
+    ## 为什么测试装置需要这一步
+
+    `app/api/deps.py::require_principal` 现在会查 `accounts`：
+    停用/改密/改角色立即生效这件事，靠的就是「每请求比对 `ver` + 看 status」。
+    于是**没有账号行的令牌一律 401** —— 包括变更前那种
+    `auth.create_access_token(2, role="customer")` 造出来的令牌。
+
+    本函数复用 `scripts/seed.sync_demo_accounts`（**不另写一份账号口径**）：
+    它幂等、且只补演示账号、不动别的行 —— 用例自己造的临时账号不受影响。
+
+    ⚠️ 用模块级标志而不是 session 装置：这些装置在**不需要库**的用例里也会被求值
+    （`customer_token` 是个普通 fixture），开门就查库会让
+    `uv run pytest -q -m "not db"` 也开始依赖数据库。
+    """
+    global _ACCOUNTS_READY
+    if _ACCOUNTS_READY:
+        return
+
+    from scripts.db_check import snapshot
+    from scripts.seed import sync_demo_accounts
+
+    snap = snapshot()
+    if not snap.tables:
+        # 库不可达/没建表：交给 `pytest_collection_modifyitems` 把 db 用例 skip 掉。
+        # 这里**不能抛**，否则纯逻辑用例会跟着红。
+        return
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        sync_demo_accounts(db)
+        db.commit()
+    _ACCOUNTS_READY = True
+
+
+def _account_token(role: str, *, preferred_subject_id: int | None = None, **claims: Any) -> str:
+    """按角色取一个**真实账号**并签发令牌；找不到账号时明确报错（而不是给一条必 401 的令牌）。"""
+    _ensure_demo_accounts()
+    from app.security import accounts as accounts_svc
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        candidates = [
+            view
+            for view in accounts_svc.list_accounts(
+                db, role=role, status=accounts_svc.STATUS_ACTIVE, limit=50
+            )
+        ]
+    if preferred_subject_id is not None:
+        candidates.sort(key=lambda view: 0 if view.subject_id == preferred_subject_id else 1)
+    if not candidates:
+        raise AssertionError(
+            f"测试装置找不到 role={role!r} 的启用账号："
+            "先 `uv run python -m scripts.seed`（本装置也会自动补，但需要库可达）"
+        )
+    chosen = candidates[0]
+    with SessionLocal() as db:
+        record = accounts_svc.get_account(db, chosen.account_id)
+    from app.security.auth import SigningIdentity, create_session_token
+
+    return create_session_token(
+        SigningIdentity(
+            subject_type=record.subject_type,
+            subject_id=record.subject_id,
+            role=record.role,
+            account_id=record.account_id,
+            token_version=record.token_version,
+        ),
+        **claims,
+    )
+
+
 def make_token(user_id: int = 2, role: str = "customer", **claims: Any) -> str:
-    return auth.create_access_token(user_id, role=role, **claims)
+    """签一条**基于真实账号**的令牌（变更 001 / T6 起必须这样）。
+
+    ⚠️ `user_id` 参数保留是为了兼容既有调用点（`make_token(2, "customer")` 到处都是），
+    它现在被解释为「**优先选的客户主体 id**」而不是「令牌里写死的 sub」：
+    令牌的主体由账号行决定，这正是变更 001 要建立的口径。
+    """
+    return _account_token(role, preferred_subject_id=user_id, **claims)
 
 
 @pytest.fixture
 def customer_token() -> str:
-    """客户身份（user_id=2）。**行级过滤的依据就是这个值**，所以用例里要显式写出来。"""
+    """客户身份（优先 user_id=2）。**行级过滤的依据就是这个值**，所以用例里要显式写出来。"""
     return make_token(2, "customer")
 
 
 @pytest.fixture
 def internal_token() -> str:
-    """内部员工身份（user_id=7）：有 `read:all_orders` 权限 → `internal=True`。"""
-    return make_token(7, "internal_employee")
+    """内部员工身份：有 `read:all_orders` 权限 → `internal=True`。"""
+    return _account_token("internal_employee")
 
 
 @pytest.fixture

@@ -102,6 +102,16 @@ DEFAULT_RULES: Final[dict[str, RateLimitRule]] = {
     "health": RateLimitRule(limit=120, window_seconds=60.0),
     # 指标：给 Prometheus 抓取留足（scrape_interval 15s → 4 次/分钟就够）。
     "metrics": RateLimitRule(limit=120, window_seconds=60.0),
+    # ── 变更 001：账号接口 ────────────────────────────────────────────────────
+    # 登录：**全项目最严的一条**。它是唯一能用「猜」换到令牌的入口，
+    # 而不限流就等于给暴力破解无限次尝试。10 次/5 分钟对人足够
+    # （正常人不会 5 分钟内输错 10 次），对脚本则把爆破速率压到没有意义。
+    # ⚠️ 未登录时桶键只能退回**来源 IP**（没有令牌可解析），所以同一出口 NAT 后面的
+    # 多个用户会共用这一额度 —— 这是本决策的已知代价，比「不限流」小得多。
+    "auth.login": RateLimitRule(limit=10, window_seconds=300.0),
+    # 刷新：比登录松（它是正常用户的常规动作，14 天有效期内每天可能刷几次），
+    # 但仍要封顶 —— 否则它就是一个「可无限尝试的凭证校验口」。
+    "auth.refresh": RateLimitRule(limit=60, window_seconds=300.0),
 }
 
 

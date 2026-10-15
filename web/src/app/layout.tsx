@@ -2,10 +2,11 @@ import type { Metadata } from "next";
 import Script from "next/script";
 import Link from "next/link";
 import "./globals.css";
+import { TopNav } from "@/components/TopNav";
 
 export const metadata: Metadata = {
   title: "ShopSage · 智能助手",
-  description: "电商企业智能助手：对客问答 / 对内数据查询（第 16 步 Web 演示层）",
+  description: "电商企业智能助手：对客问答 / 对内数据查询 / 账号管理台",
 };
 
 /**
@@ -19,6 +20,10 @@ export const metadata: Metadata = {
  *    用系统字体栈换掉（见 `globals.css` 的 `--font-sans`）。
  * 2. **`<html lang="zh-CN">`**：界面是中文的，标错语言会让浏览器
  *    （以及屏幕阅读器）用错的分词与朗读规则。
+ * 3. **导航是一个客户端组件**（`<TopNav />`，变更 001 / T17）：
+ *    登录态在 `localStorage`，而本布局是**服务端组件** —— 在这里直接读会渲染出
+ *    「未登录」快照并与客户端的水合结果打架。导航要按角色显示不同入口，
+ *    所以那部分必须交给客户端组件（见其模块注释）。
  */
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
@@ -33,16 +38,13 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
             ShopSage
             <span className="brand-sub">智能助手</span>
           </Link>
-          <nav className="topnav">
-            <Link href="/">对客问答</Link>
-            <Link href="/internal">对内查询</Link>
-            <Link href="/login">登录 / 切角色</Link>
-          </nav>
+          <TopNav />
         </header>
         <main className="shell">{children}</main>
         <footer className="footer">
           <span>
-            演示层：所有权限判断在后端（对客走行级过滤、对内走 RBAC），前端只负责展示与分流。
+            演示层：所有权限判断在后端（对客走行级过滤、对内走 RBAC、管理台走 admin 权限点），
+            前端只负责展示与分流。
           </span>
         </footer>
       </body>

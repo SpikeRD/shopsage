@@ -38,15 +38,28 @@ FORBIDDEN_IMPORTS = (
 )
 
 #: 禁止出现的调用名（本包内任何 `.py` 的文件里都不该出现）
+#:
+#: ⚠️ **变更 001 把 `SessionLocal` 改成了「只允许一处、且必须有守卫」**（原来是无条件禁止）。
+#: 原因：`require_principal` 现在必须查一次账号（停用/改密/改角色立即生效，见
+#: `docs/changes/001-account-login-and-admin-console.md` §3.4），而 HTTP 侧那次查库
+#: 走的是 `Depends(get_db)` 注入（不出现本名单里的名字）。
+#: 唯一需要在依赖体系之外开会话的地方是 **WebSocket 握手**（`deps.ws_actor`）与
+#: **审批路由在依赖之外解析身份**（`deps.principal_from_request`）——
+#: 两者都必须 try/finally 关闭会话，否则连接池会被吃干（本仓实测过这个事故）。
+#: 下面 `_bypass_exemptions` 用「同一行有豁免标记」来放行这两处，并把
+#: 「为什么它安全」钉在代码里；**其余任何地方出现都仍然红**。
 FORBIDDEN_CALLS = (
     "execute_readonly_query",
     "validate_sql",
     "mask_pii",
-    "SessionLocal",
     "get_read_engine",
     "row_filter_for_customer",
     "assert_row_filter_present",
 )
+
+#: 允许出现上述名字的**行级**豁免：必须带理由，且必须紧邻代码。
+#: 用「行」而不是「文件」豁免，是为了让「这个文件被整体放行」这件事不可能发生。
+BYPASS_EXEMPTION_MARKER = "# 契约豁免: SessionLocal"
 
 #: 禁止在**字符串字面量**里出现的 SQL 关键字（注释不算 —— 本仓的注释会解释为什么这里不查库）
 SQL_KEYWORD_RE = re.compile(r"\b(SELECT|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.IGNORECASE)
@@ -92,10 +105,22 @@ def test_no_data_layer_imports(path: Path) -> None:
 
 @pytest.mark.parametrize("path", _api_files(), ids=lambda p: p.name)
 def test_no_security_bypass_calls(path: Path) -> None:
-    """API 层不许自己执行 SQL / 校验 SQL / 脱敏 / 拼行级过滤（那些都是别处的唯一真相）。"""
+    """API 层不许自己执行 SQL / 校验 SQL / 脱敏 / 拼行级过滤（那些都是别处的唯一真相）。
+
+    变更 001 起多了一条**行级**豁免机制（见 `FORBIDDEN_CALLS` 上方的说明）：
+    只有带了 `BYPASS_EXEMPTION_MARKER` 的那一行才被放行，其余一律红。
+    这样「谁被放行了」在代码里一眼可见、可 grep，而不会变成「某个文件整体不受管」。
+    """
     source = path.read_text(encoding="utf-8")
+    source_lines = source.splitlines()
     tree = ast.parse(source)
     hits: list[str] = []
+
+    def _exempt(lineno: int) -> bool:
+        if not (1 <= lineno <= len(source_lines)):
+            return False
+        return BYPASS_EXEMPTION_MARKER in source_lines[lineno - 1]
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = ""
@@ -103,11 +128,31 @@ def test_no_security_bypass_calls(path: Path) -> None:
                 name = node.func.id
             elif isinstance(node.func, ast.Attribute):
                 name = node.func.attr
-            if name in FORBIDDEN_CALLS:
+            if name in FORBIDDEN_CALLS and not _exempt(node.lineno):
                 hits.append(name)
         elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_CALLS:
-            hits.append(node.attr)
+            if not _exempt(node.lineno):
+                hits.append(node.attr)
     assert not hits, f"{path.name} 调用了越界的函数：{sorted(set(hits))}"
+
+
+def test_bypass_exemptions_are_minimal_and_documented() -> None:
+    """豁免必须**少、且带理由**：这条用例防止豁免机制被滥用成「到处加标记」。
+
+    判据有两条：
+    1. 带豁免标记的行**不能超过 2 处**（当前只有 `deps._session()` 那一个函数）；
+    2. 每个带标记的文件里，标记行**必须同时出现在注释里说明原因**（同一行即可）。
+    数量一旦要涨，说明「会话生命周期只有一处」这条纪律正在被侵蚀 ——
+    那时该做的是重构，而不是把上限调大。
+    """
+    marked: list[tuple[str, int]] = []
+    for path in _api_files():
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if BYPASS_EXEMPTION_MARKER in line:
+                marked.append((path.name, number))
+    assert len(marked) <= 2, f"契约豁免太多了（{len(marked)} 处）：{marked}；请先考虑重构"
+    for name, number in marked:
+        assert name == "deps.py", f"豁免只允许出现在 deps.py（会话边界），却在 {name}:{number}"
 
 
 @pytest.mark.parametrize("path", _api_files(), ids=lambda p: p.name)

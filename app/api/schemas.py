@@ -398,6 +398,127 @@ class QueueStatusResponse(BaseModel):
     kinds: list[str] = Field(default_factory=list, description="登记过的任务种类")
 
 
+# ── 账号接口的请求/响应（变更 001）───────────────────────────────────────────
+#
+# 三条贯穿这一节的口径：
+#
+# 1. **请求体里绝不出现调用者的 `role` / `user_id` / `account_id`**：身份只能来自
+#    「凭据校验」或「已验签令牌」。请求体里放一个 `role` 就等于让调用方自报权限
+#    （`ChatRequest` 的 docstring 已经为同一件事给过理由）。管理接口里的 `role` 是
+#    **被操作对象的目标值**，不是调用者的身份 —— 这个区别必须写清楚，否则下一个人
+#    会照着 `/api/chat` 的样子在请求体里加一个 `role`。
+# 2. **响应里绝不出现 `password_hash` / `token_version`**：前者是凭据本身，
+#    后者是「令牌作废计数」（暴露它等于告诉攻击者这个账号最近被改过几次）。
+#    这条与 `app/security/accounts.AccountView` 的字段集**同源**（那边是真相）。
+# 3. `entry` 由服务端算好返回（`accounts.entry_for_role`），前端不复制分流规则 ——
+#    副本必然漂移（`web/src/lib/auth.ts` 自己已经标注「这是副本不是真相」）。
+
+
+class LoginRequest(BaseModel):
+    """`POST /api/auth/login` 的请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    identifier: str = Field(
+        min_length=1,
+        max_length=64,
+        description="登录标识：员工填用户名（`zhangsan`），客户填手机号。大小写不敏感。",
+    )
+    password: str = Field(
+        min_length=1,
+        max_length=200,
+        description="口令。**上限是刻意的**：无限长的口令会让每次 Argon2 计算变成一次 DoS 放大器。",
+    )
+
+
+class TokenResponse(BaseModel):
+    """登录 / 刷新成功后的令牌信封。"""
+
+    access_token: str = Field(description="访问令牌（`Authorization: Bearer <它>`）")
+    refresh_token: str = Field(
+        description="刷新令牌：**不能**直接访问业务接口（会被 401），只能拿去换新的访问令牌"
+    )
+    token_type: str = Field(default="bearer", description="固定 `bearer`（OAuth2 惯例）")
+    expires_in: int = Field(description="访问令牌还有多少秒过期（前端据此提前续期）")
+    refresh_expires_in: int = Field(description="刷新令牌还有多少秒过期")
+    account_id: int = Field(description="账号主键（审计/排障用；**不是**业务主体 id）")
+    subject: str = Field(
+        description="主体标识串（`c2` 客户 / `e1` 员工）：`thread_id` 的前缀就是它"
+    )
+    subject_type: str = Field(description="`customer` / `employee`")
+    role: str = Field(description="授权角色（来自 `accounts.role`，不是请求体）")
+    entry: str = Field(
+        description="登录后该进哪个界面：`admin` / `internal` / `customer`（**服务端算好的**）"
+    )
+    permissions: list[str] = Field(default_factory=list, description="该角色的权限点（供界面显隐）")
+
+
+class RefreshRequest(BaseModel):
+    """`POST /api/auth/refresh` 的请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    refresh_token: str = Field(min_length=1, description="登录时拿到的刷新令牌")
+
+
+class AccountViewResponse(BaseModel):
+    """账号的对外形态（**没有凭据、没有世代号**，见本节口径 2）。"""
+
+    account_id: int
+    identifier: str
+    role: str
+    status: str = Field(description="`active` / `disabled`")
+    subject_type: str
+    subject_id: int
+    entry: str = Field(description="该角色对应的入口（服务端算的）")
+    is_admin: bool = Field(description="是否持有 `admin` 权限点（**按权限点判，不按角色名**）")
+    created_at: str | None = Field(default=None, description="ISO8601 字符串（缺省为 null）")
+    last_login_at: str | None = Field(default=None, description="最近一次成功登录时间")
+
+
+class AccountListResponse(BaseModel):
+    accounts: list[AccountViewResponse]
+    total: int = Field(description="当前筛选条件下的条数")
+
+
+class AccountCreateRequest(BaseModel):
+    """`POST /api/admin/accounts` 的请求体（**管理员开账号**）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    identifier: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=200, description="初始口令（由管理员告知本人）")
+    role: str = Field(max_length=32, description="取值必须是 `rbac.ROLE_PERMISSIONS` 的键")
+    subject_type: str = Field(description="`customer` 或 `employee`")
+    subject_id: int = Field(
+        gt=0, description="对应业务主体的主键（`users.user_id` / `employees.emp_id`）"
+    )
+    status: str = Field(default="active", description="`active` / `disabled`")
+
+
+class AccountUpdateRequest(BaseModel):
+    """`PATCH /api/admin/accounts/{id}` 的请求体：只允许改状态与角色。
+
+    ⚠️ 为什么这里**没有** `password`：改口令是独立的一个动作（`/password` 路径）。
+    两者语义不同 —— 改口令要让本人知道新口令，改角色/停用不需要；而且它们触发的
+    后果也不同（都会自增 `token_version`，但改口令是「夺回账号」类动作）。
+    混在一个请求里会让「我只想停用一下」意外重置别人的口令。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str | None = Field(default=None, description="`active` / `disabled`")
+    role: str | None = Field(default=None, max_length=32)
+
+
+class PasswordResetRequest(BaseModel):
+    """`POST /api/admin/accounts/{id}/password` 的请求体（管理员重置口令）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    new_password: str = Field(min_length=1, max_length=200)
+
+
 __all__ = [
     "FRAME_ANSWER",
     "FRAME_DONE",
@@ -411,6 +532,10 @@ __all__ = [
     "WS_CLOSE_UNAUTHORIZED",
     "WS_SUBPROTOCOL",
     "WS_TOKEN_PREFIX",
+    "AccountCreateRequest",
+    "AccountListResponse",
+    "AccountUpdateRequest",
+    "AccountViewResponse",
     "ApprovalDecision",
     "ApprovalGate",
     "ChatDebug",
@@ -423,8 +548,12 @@ __all__ = [
     "FlowState",
     "Frame",
     "HealthResponse",
+    "LoginRequest",
+    "PasswordResetRequest",
     "QueueStatusResponse",
+    "RefreshRequest",
     "TaskAcceptedResponse",
     "TaskRequest",
     "TaskStatusResponse",
+    "TokenResponse",
 ]

@@ -370,9 +370,21 @@ async def approve(
     """
     from langgraph.types import Command
 
+    # ⚠️ 用 `principal_from_request`（非依赖版本）而不是路由的 `principal` 参数：
+    # 那个参数由 `Depends(require_principal)` 解析，**本身是好的**；但同一个函数里两次
+    # 拿它会让「开一次会话」变成两次（`principal_from_request` 每次开一个会话）。
+    # 这里显式解析一次、复用结果。
+    principal = deps.principal_from_request(request)
     actor = deps.actor_from_principal(
         principal,
-        session_id=deps.restore_session_id(body.thread_id, user_id=principal.user_id),
+        # ⚠️ 用**主体**（subject_type/subject_id）反向解析，而不是 `principal.user_id`：
+        # 员工主体的 `user_id` 是 0，拿它去解析会得到「这个 thread 不属于你」——
+        # 而那是一个**无辜的 422**（员工明明发的就是自己的 thread_id，见变更 001 §3.2）。
+        session_id=deps.restore_session_id(
+            body.thread_id,
+            subject_type=principal.subject_type,
+            subject_id=principal.subject_id,
+        ),
         request_id=str(getattr(request.state, "request_id", "")),
     )
     if actor.thread_id != body.thread_id:

@@ -69,7 +69,13 @@ class GraphState(TypedDict, total=False):
     #: 不是「状态长什么样」的事）。
     messages: list[dict[str, Any]]
     #: 当前请求者的用户 id（对客路径的行级过滤依据）。
+    #: ⚠️ 变更 001 收窄：**员工主体是 `0`**（他在 `users` 表里没有行）。
+    #: 需要「我是谁」的稳定身份时用下面的 `subject_id`，不要用这个字段。
     user_id: int
+    #: 主体类别（`customer` / `employee`）与主体在**自己表里**的主键（变更 001）。
+    #: 两者由 `inject_identity()` 从入口（API 的 `Actor`）带进来，供审计与 checkpoint 用。
+    subject_type: str
+    subject_id: int
     #: 角色名，取值必须是 `rbac.ROLE_PERMISSIONS` 里的键（未登记角色 → 零权限，默认拒绝）。
     role: str
 
@@ -201,7 +207,13 @@ def is_customer_path(state: GraphState) -> bool:
     return role_of(state) == CUSTOMER
 
 
-def inject_identity(user_id: int, role: str) -> dict[str, Any]:
+def inject_identity(
+    user_id: int,
+    role: str,
+    *,
+    subject_type: str | None = None,
+    subject_id: int | None = None,
+) -> dict[str, Any]:
     """把「谁、什么角色、有哪些权限点」算成要写进 state 的那几个键。
 
     这是 `7.agents_module.md` §4 第 4 条的落点：**权限只在 router 注入一次**，
@@ -212,6 +224,19 @@ def inject_identity(user_id: int, role: str) -> dict[str, Any]:
     ⚠️ 权限**从 `rbac.ROLE_PERMISSIONS` 查表得来**，绝不采信模型输出。
     router 的 LLM 只回答「走哪条路」，身份是调用方给的既成事实 ——
     若让模型同时输出角色，就等于让被攻击的目标自己决定权限。
+
+    ## 变更 001：`subject_type` / `subject_id` 是**可选**的增补
+
+    为什么加：`user_id` 现在只是「行级过滤用的客户 id」（员工主体是 `0`），
+    而员工也需要一个**稳定主体身份**供审计与 checkpoint 用。两者正交：
+    员工 `user_id=0`、`subject_id=7`（`employees.emp_id`）。
+
+    为什么是可选、且缺省时行为**逐字不变**：本函数有 5 处既有调用
+    （`app/api/deps.py`、`app/agents/router.py` 两处、`app/queue/agent_runs.py`）
+    与一批图测试（`tests/graph_helpers.customer_state`）。把参数改成必填会让它们
+    全部要改，而它们**本来就没有主体信息**（那些路径只有客户身份）。
+    缺省时 `subject_type` 由角色推出（客户角色 → `customer`，否则 → `employee`）、
+    `subject_id` 回落到 `user_id`，与变更前的语义一致。
     """
     role = str(role or CUSTOMER)
     if role not in ROLE_PERMISSIONS:
@@ -221,11 +246,17 @@ def inject_identity(user_id: int, role: str) -> dict[str, Any]:
         logging.getLogger(__name__).warning(
             "角色 %r 未在 rbac.ROLE_PERMISSIONS 里登记，按零权限处理（默认拒绝）", role
         )
+    is_customer = role == CUSTOMER
+    resolved_type = str(subject_type) if subject_type else ("customer" if is_customer else "employee")
+    resolved_id = int(subject_id) if subject_id is not None else int(user_id)
     return {
         "permissions": permissions_for(role),
-        "is_customer": role == CUSTOMER,
+        "is_customer": is_customer,
         "role": role,
         "user_id": int(user_id),
+        # ── 变更 001 新增（可选；缺省与旧口径一致）────────────────────────────
+        "subject_type": resolved_type,
+        "subject_id": resolved_id,
     }
 
 

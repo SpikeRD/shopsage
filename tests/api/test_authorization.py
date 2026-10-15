@@ -6,7 +6,7 @@
 | 方向 | 用例 | 拦在哪 |
 |---|---|---|
 | 查别人的数据 | `test_customer_cannot_query_another_users_order` | 图里 `data` 节点的行级过滤 + 权限点 |
-| 读别人的会话 | `test_thread_id_from_another_user_is_rejected` | `deps.restore_session_id` 的前缀校验 |
+| 读别人的会话 | `test_thread_id_from_another_user_is_rejected` | `deps.restore_session_id` 的主体校验 |
 | 批准别人的操作 | `test_approve_requires_the_same_user` | 同上（**两个方向共用同一条校验**） |
 | 用别人的身份 | `test_identity_comes_from_the_token_not_the_body` | pydantic `extra="forbid"` |
 
@@ -112,14 +112,14 @@ def test_identity_comes_from_the_token_not_the_body(client: TestClient, patched_
 
 
 def test_thread_id_from_another_user_is_rejected(client: TestClient, patched_query) -> None:
-    """拿 `u9:*` 的 thread_id 去批准：422（前缀校验）。
+    """拿 `c9:*` 的 thread_id 去批准：422（主体校验）。
 
     这条比「查别人的订单」更严重：checkpoint 里装的是**完整对话状态**，
     能读别人的 thread 就等于读到别人上一轮的原话。
     """
     response = client.post(
         "/api/chat/approve",
-        json={"thread_id": "u9:someone-else", "approved": True},
+        json={"thread_id": "c9:someone-else", "approved": True},
         headers=headers_for(make_token(2, "customer")),
     )
     assert response.status_code == 422
@@ -134,7 +134,7 @@ def test_approve_of_a_session_without_pending_operation_is_409(client: TestClien
     """
     response = client.post(
         "/api/chat/approve",
-        json={"thread_id": "u2:no-pending", "approved": True},
+        json={"thread_id": "c2:no-pending", "approved": True},
         headers=headers_for(make_token(2, "customer")),
     )
     assert response.status_code == 409
@@ -176,7 +176,7 @@ def test_sensitive_route_returns_202_with_approval_gate(app_factory) -> None:
     assert body["flow_state"] == "approval_required"
     gate = body["approval"]
     assert gate is not None
-    assert gate["thread_id"] == "u2:hitl-1"
+    assert gate["thread_id"] == "c2:hitl-1"
     assert gate["question"].strip(), "必须给审批人一句能读懂的问题"
     assert gate["resume_with"] == "POST /api/chat/approve"
 
@@ -218,7 +218,7 @@ def test_approve_resumes_the_suspended_turn(app_factory) -> None:
     assert approved.status_code == 200, approved.text
     body = approved.json()
     assert body["flow_state"] != "approval_required"
-    assert body["thread_id"] == "u2:hitl-2"
+    assert body["thread_id"] == "c2:hitl-2"
 
 
 def test_reject_gives_an_honest_sentence(app_factory) -> None:

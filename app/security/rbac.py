@@ -101,27 +101,65 @@ def has_permission(role: str, permission: str) -> bool:
     return permission in permissions_for(role)
 
 
-def require_permission(*permissions: str, role_from: str = "role") -> Callable[[F], F]:
+def require_permission(*permissions: str, identity_from: str = "actor") -> Callable[[F], F]:
     """装饰器：要求调用方角色具备给定权限点（全部满足）。
 
-    `role_from` 指定「从哪个参数/属性取角色」：默认按关键字参数 `role=` 取，
-    取不到则回退到 `self`/第一个参数上的 `role` 属性（兼容 FastAPI 依赖对象与 dataclass 身份对象）。
+    ## 角色从哪里取（**变更 001 重写过，理由必须留住**）
 
-    既可装饰同步函数，也可装饰 `async def`（FastAPI 路由都是 async 的）—— 用一个 wrapper 同时支持
-    两种形态，避免「装饰器只对同步函数生效」这种隐藏坑。
+    1. **显式绑定的身份对象**（`identity_from`，见下）；
+    2. 参数里任意一个**身份对象**（`role` 与 `subject_type` 两个属性都在的对象）；
+    3. 该对象上的 `role` 属性（`args` 里的第一个）；
+    4. 关键字参数 `role=`（**最后**才看它）。
+
+    ## ⚠️ 为什么关键字参数必须排在身份对象后面
+
+    第一版是「先看 `kwargs["role"]`」，而 `app/api/admin.py` 的账号列表有一个
+    **筛选参数**也叫 `role`（`?role=admin`）。FastAPI 把依赖与 Query 参数**都按关键字**
+    传给端点，于是未传筛选时 `kwargs["role"]` 是 `""`/`None`，装饰器就把**筛选条件**
+    当成了调用者身份 —— 报出「角色 缺少权限：admin」，而 `kwargs["actor"].role` 明明是
+    `admin`。症状极具误导性：错误信息里的角色名看着像「令牌没解析出角色」，
+    真相却是「装饰器看错了变量」。
+
+    判据是：**身份对象**（同时带 `role` 与 `subject_type`）比一个叫 `role` 的普通参数
+    可信得多 —— 前者是鉴权依赖的产物，后者可能只是筛选条件、分页名、甚至拼错的字段。
+
+    ## `identity_from`：把角色**显式绑定**到某个参数（推荐写法）
+
+    路由里写 `@require_permission(PERM_ADMIN, identity_from="actor")` 就没有任何歧义了。
+    本仓的路由一律这么写（`app/api/admin.py`），而上面的自动识别是**兜底**：
+    给「忘了写 `identity_from`、又恰好有个同名参数」的情况留一层保护。
+
+    既可装饰同步函数，也可装饰 `async def`（FastAPI 路由都是 async 的）—— 用一个 wrapper
+    同时支持两种形态，避免「装饰器只对同步函数生效」这种隐藏坑。
     """
 
     def decorator(func: F) -> F:
         required = tuple(permissions)
 
+        def _is_identity(value: Any) -> bool:
+            """身份对象：同时带 `role` 与 `subject_type`（`Actor` / `Principal` 都是）。"""
+            return hasattr(value, "role") and hasattr(value, "subject_type")
+
         def _resolve_role(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-            if role_from in kwargs:
-                return str(kwargs[role_from])
-            if args:
-                first = args[0]
-                candidate = getattr(first, role_from, None)
+            # ① 显式绑定的身份参数（默认 `identity_from="actor"` —— 本仓路由的统一写法）
+            bound = kwargs.get(identity_from)
+            if bound is not None:
+                candidate = getattr(bound, "role", None)
                 if candidate is not None:
                     return str(candidate)
+            # ② 任意一个身份对象（`Actor` / `Principal`）
+            for value in list(args) + list(kwargs.values()):
+                if _is_identity(value):
+                    candidate = getattr(value, "role", None)
+                    if candidate is not None:
+                        return str(candidate)
+            # ③ 位置参数上的 `role` 属性，④ 关键字参数 `role=`
+            if args:
+                candidate = getattr(args[0], "role", None)
+                if candidate is not None:
+                    return str(candidate)
+            if kwargs.get("role") is not None:
+                return str(kwargs["role"])
             return ""
 
         def _check(role: str) -> None:
@@ -153,17 +191,22 @@ def require_permission(*permissions: str, role_from: str = "role") -> Callable[[
 
 
 def require_role(*roles: str) -> Callable[[F], F]:
-    """装饰器：要求角色在给定白名单里（`4.security.md` 第 2 节的 `require_role`）。"""
+    """装饰器：要求角色在给定白名单里（`4.security.md` 第 2 节的 `require_role`）。
+
+    角色取值顺序与 `require_permission` **完全一致**（身份对象的 `role` 属性优先，
+    关键字参数兜底）—— 两个装饰器对同一个概念必须用同一套判据，
+    否则「同一个路由换一个装饰器就判错人」这种问题会以最不可预期的方式出现。
+    """
     allowed = frozenset(roles)
 
     def decorator(func: F) -> F:
         def _resolve_role(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-            if "role" in kwargs:
-                return str(kwargs["role"])
             if args:
                 candidate = getattr(args[0], "role", None)
                 if candidate is not None:
                     return str(candidate)
+            if kwargs.get("role") is not None:
+                return str(kwargs["role"])
             return ""
 
         def _check(role: str) -> None:

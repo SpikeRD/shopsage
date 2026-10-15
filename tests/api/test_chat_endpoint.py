@@ -46,7 +46,10 @@ def test_chat_returns_answer(client: TestClient, auth_headers: dict[str, str], p
     assert body["flow_state"] == "delivered"
     assert body["route"] == "data"
     assert body["blocked"] is False
-    assert body["thread_id"] == "u2:orders-1", "thread_id 必须是 u{user_id}:{session_id}（隔离键的形状）"
+    assert body["thread_id"] == "c2:orders-1", (
+        "thread_id 必须是 c{user_id}:{session_id}（变更 001 起前缀分主体：c=客户 / e=员工；"
+        "理由是员工 emp_id=7 与客户 user_id=7 不能落进同一个会话桶）"
+    )
     assert body["session_id"] == "orders-1"
     assert body["request_id"], "响应要带请求 id（与 X-Request-Id 头一致）"
     assert response.headers["X-Request-Id"] == body["request_id"]
@@ -69,14 +72,14 @@ def test_chat_generates_session_id_when_missing(client: TestClient, auth_headers
     """
     body = chat(client, auth_headers).json()
     assert body["session_id"].startswith("s"), f"服务端生成的会话 id 应有可识别前缀：{body['session_id']}"
-    assert body["thread_id"] == f"u2:{body['session_id']}"
+    assert body["thread_id"] == f"c2:{body['session_id']}"
 
 
 def test_same_session_reuses_the_thread(client: TestClient, auth_headers: dict[str, str], patched_query) -> None:
     """两轮用同一个 `session_id`：`thread_id` 相同（checkpoint 复用 → 多轮对话成立）。"""
     first = chat(client, auth_headers, session_id="multi-1").json()
     second = chat(client, auth_headers, session_id="multi-1").json()
-    assert first["thread_id"] == second["thread_id"] == "u2:multi-1"
+    assert first["thread_id"] == second["thread_id"] == "c2:multi-1"
 
 
 def test_different_users_get_different_threads(client: TestClient, patched_query) -> None:
@@ -85,8 +88,8 @@ def test_different_users_get_different_threads(client: TestClient, patched_query
 
     a = chat(client, headers_for(make_token(2, "customer")), session_id="same-name").json()
     b = chat(client, headers_for(make_token(3, "customer")), session_id="same-name").json()
-    assert a["thread_id"] == "u2:same-name"
-    assert b["thread_id"] == "u3:same-name"
+    assert a["thread_id"] == "c2:same-name"
+    assert b["thread_id"] == "c3:same-name"
     assert a["thread_id"] != b["thread_id"]
 
 

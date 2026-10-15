@@ -40,6 +40,8 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.api import config as api_config
 from app.api import deps
+from app.api.admin import router as admin_router
+from app.api.auth import router as auth_router
 from app.api.chat import router as chat_router
 from app.api.errors import install_exception_handlers
 from app.api.health import router as infra_router
@@ -330,6 +332,14 @@ def create_app(
     install_exception_handlers(app)
 
     prefix = api_config.api_prefix(settings)
+    # ⚠️ 注册顺序不影响路由匹配（路径各不相同），但**这个顺序就是文档顺序**：
+    # 先账号（怎么拿到令牌），再业务（用令牌做什么）。
+    #
+    # ⚠️ `auth_router` / `admin_router` **自己带 `/auth` / `/admin` 前缀**
+    # （定义在各自模块的 `APIRouter(prefix=...)` 里），所以这里只叠全局前缀 `prefix`。
+    # 叠两次会得到 `/api/auth/auth/login` —— 而它只会在前端联调时才被发现。
+    app.include_router(auth_router, prefix=prefix)
+    app.include_router(admin_router, prefix=prefix)
     app.include_router(chat_router, prefix=prefix)
     app.include_router(tasks_router, prefix=prefix)
     app.include_router(infra_router)

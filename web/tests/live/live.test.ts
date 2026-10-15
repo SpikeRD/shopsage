@@ -186,7 +186,13 @@ test("真流式：一帧不漏地走完 skeleton→node→answer→done（B2 的
   );
   assert.equal(state.flowState === "delivered" || state.flowState === "blocked", true);
   assert.ok(state.answer.length > 0, "回答不能为空");
-  assert.ok(state.threadId.startsWith("u"), `thread_id 应该由服务端派生（形如 u2:xxx），收到 ${state.threadId}`);
+  // ⚠️ 变更 001 起前缀是**主体类别**：`c{user_id}` 客户 / `e{emp_id}` 员工。
+  // 原来写的是 `startsWith("u")`（那时一个 `u` 对所有身份）——
+  // 而那个形状正是「员工 emp_id=7 与客户 user_id=7 落进同一个会话桶」的根源。
+  assert.ok(
+    state.threadId.startsWith("c"),
+    `thread_id 应当由服务端按主体派生（客户形如 c2:xxx），收到 ${state.threadId}`,
+  );
   assert.ok(state.serverFirstFrameMs !== null && state.serverFirstFrameMs < 1000, `B2：首帧 ${state.serverFirstFrameMs}ms`);
   assert.ok(state.nodes.includes("router"), `节点帧里应当有 router，收到 ${state.nodes.join(",")}`);
 });

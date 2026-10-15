@@ -84,6 +84,11 @@ class GraphStateDoc(TypedDict, total=False):
     # ── 身份（router 写，别人只读）─────────────────────────────────────────────
     permissions: Annotated[frozenset[str], LastValue]
     is_customer: Annotated[bool, LastValue]
+    #: 主体类别与主体 id（变更 001）。`user_id` 只表示「行级过滤用的客户 id」
+    #: （员工是 0），而这两个字段是**稳定主体身份**：审计与「我是谁」都用它。
+    #: 用 `LastValue`（不是追加）：它们是标量身份，任何节点都可以覆盖成更新的真值。
+    subject_type: Annotated[str, LastValue]
+    subject_id: Annotated[int, LastValue]
 
     # ── 分支 ─────────────────────────────────────────────────────────────────
     route: Annotated[str, LastValue]

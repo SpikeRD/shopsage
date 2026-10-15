@@ -1,4 +1,4 @@
-"""限流用例：`9.api.md` §7 的 `test_rate_limit`（超过阈值 → 429，D1 纵深）。
+﻿"""限流用例：`9.api.md` §7 的 `test_rate_limit`（超过阈值 → 429，D1 纵深）。
 
 本文件覆盖「滑动窗口」的四个可断言性质 + 两个容易做错的地方：
 
@@ -102,7 +102,7 @@ def test_quota_is_per_endpoint(client: TestClient, customer_token: str, patched_
 
     # approve 走另一个 scope：即使 chat 已经超限，它仍然按自己的额度判定
     response = client.post(
-        "/api/chat/approve", json={"thread_id": "u2:none", "approved": True}, headers=headers
+        "/api/chat/approve", json={"thread_id": "c2:none", "approved": True}, headers=headers
     )
     assert response.status_code != 429, "approve 有自己的额度桶，不该被 chat 的 429 牵连"
 

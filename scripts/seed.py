@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import random
 import sys
 from decimal import Decimal
@@ -33,6 +34,7 @@ from app.db.models import (
     ORDER_STATUSES,
     PAYMENT_METHODS,
     REFUND_STATUSES,
+    Account,
     Employee,
     Order,
     OrderItem,
@@ -110,8 +112,15 @@ def seed(seed_value: int = DEFAULT_SEED, *, truncate: bool = True) -> dict[str, 
         assert len(orders) == len({o.order_id for o in orders})
         assert len(refunds) and len(movements) and len(tickets)
 
+        # 账号（变更 001）：必须在业务主体建好之后 —— `create_account` 会校验
+        # `subject_id` 在 `users` / `employees` 里真的存在（`accounts` 没有外键，
+        # 补偿点只有应用层那一条，见 `app/security/accounts._assert_subject_exists`）。
+        account_rows = _seed_accounts(db) if _accounts_seed_enabled() else []
+
         db.commit()
-        return _count_rows(db)
+        counts = _count_rows(db)
+        counts["accounts"] = len(account_rows)
+        return counts
 
 
 def _truncate_business_tables(db: Session) -> None:
@@ -359,6 +368,128 @@ def _count_rows(db: Session) -> dict[str, int]:
     return counts
 
 
+# ── 演示账号（变更 001 / T12）────────────────────────────────────────────────
+#
+# 为什么需要：变更 001 之前「登录」是 `scripts/dev_token.py` 现场签发令牌，
+# 系统里根本没有账号这个概念。改成真登录之后，**第一次搭环境时必须有账号能登进去**，
+# 否则你面对的是一个「有个登录页、但没有任何凭据」的系统，而唯一的出路是先去
+# 写一段脚本手动建管理员 —— 那正是「演示启动成本高」的经典形态。
+#
+# ## 三条口径
+#
+# 1. **口令写在这里，但只是演示口令**：本脚本的 docstring 已经写着「只允许在开发/演示库上跑」。
+#    真实部署（`ENV=prod`）请用 `ACCOUNT_SEED_ENABLED=false` 关掉，或者建完号立刻改口令。
+# 2. **口令不打印**：`main()` 只打印「已灌 N 个演示账号」与标识/角色，**不打印口令**。
+#    理由与 `app/security/accounts.reset_password` 的 docstring 同源：口令一旦落到
+#    终端输出/日志/截图里，它就等价于泄露了。要口令就去看本文件（它是源码，不是运行日志）。
+# 3. **先删后建，保证幂等**：账号指向 `users.user_id` / `employees.emp_id`，而业务表是
+#    `TRUNCATE ... RESTART IDENTITY` 重建的 —— id 会被复用。若不先清账号，
+#    第二次执行必然撞 `uq_accounts_subject_type_subject_id`（表现为「种子脚本第二次跑就炸」）。
+#    刻意**只删账号、不动业务表**（`_truncate_business_tables` 也不动账号表）：两者的
+#    生命周期分开管，谁都不许顺手清对方。
+
+#: 演示账号：(标识, 口令, 角色, 主体类别, 主体 id)。客户 2 / 3 与员工 1 / 2 是种子数据里必然存在的。
+DEMO_ACCOUNTS: tuple[tuple[str, str, str, str, int], ...] = (
+    # 管理员：员工表里 role='admin' 的那一行（变更单决策 9 = A：不引入第三种身份）
+    ("admin", "admin-demo-pass", "admin", "employee", 1),
+    # 演示客户：`api_demo.py` / live 用例一直用 user_id=2，这里对齐它
+    ("13800000002", "customer-demo-pass", "customer", "customer", 2),
+    # 第二个客户：**限流场景需要两个不同 user_id** 才能演示「各有一份额度」
+    # （桶键里带 user_id，见 `app/api/ratelimit.py`）。少一个这条演示就退化成自说自话。
+    ("13800000003", "customer-demo-pass", "customer", "customer", 3),
+    # 演示内部员工：客户服务部主管，能进对内入口（可读全站订单）
+    ("employee", "employee-demo-pass", "internal_employee", "employee", 2),
+)
+
+#: 环境变量：是否灌演示账号（默认开 —— 本脚本本来就只在 dev 跑；prod 部署时显式关掉）
+ACCOUNT_SEED_ENV = "ACCOUNT_SEED_ENABLED"
+
+
+def _accounts_seed_enabled() -> bool:
+    """读 `.env` / 环境变量里的开关。默认 `true`（见 `ACCOUNT_SEED_ENV` 的注释）。"""
+    value = str(os.getenv(ACCOUNT_SEED_ENV, "true") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _seed_accounts(db: Session) -> list[Account]:
+    """清掉旧账号再灌演示账号。**调用方负责 commit。**
+
+    ⚠️ 全量 `delete(Account)` 而不是「只删演示那几个标识」：业务表已经被 TRUNCATE 过，
+    旧的 `subject_id` 指向的客户/员工已经不存在了 —— 留着它们就是**孤儿账号**
+    （能登录、但按一个不存在的 user_id 过滤，永远查不到东西，而报错只会说「你没有订单」）。
+    这也是 `create_account` 会在应用层校验主体存在的原因（`accounts.subject_id` 没有外键）。
+    """
+    db.execute(delete(Account))
+    db.flush()
+    return sync_demo_accounts(db)
+
+
+def sync_demo_accounts(db: Session) -> list[Account]:
+    """确保 `DEMO_ACCOUNTS` 里的账号**都存在且口令/角色正确**（幂等，不删别的账号）。
+
+    为什么需要「幂等补齐」这个模式，而不是只有全量重建（`_seed_accounts`）：
+
+    - `scripts/seed.py` 会 `TRUNCATE ... RESTART IDENTITY` 业务表，`subject_id` 全部重来，
+      所以它必须先清空账号再重建（否则旧账号指向不存在的客户）；
+    - **测试装置**（`tests/api/conftest.py`）则需要「补一个演示账号，但别动库里其它东西」——
+      它跑在一次全量测试的中间，把账号表清空会影响其它用例（尤其是那些临时账号）。
+
+    两者共用同一份 `DEMO_ACCOUNTS` 口径，所以「演示账号是什么」只有一处真相。
+    口令**每次都重设**（不判断「已存在就跳过」）：跑过一轮「改口令」的用例之后，
+    演示账号的口令可能已经被改掉，而下一个用例仍期望它可用 —— 那会变成顺序依赖。
+    """
+    from app.security.accounts import (
+        AccountError,
+        create_account,
+        get_account_by_identifier,
+        reset_password,
+        update_account,
+    )
+
+    rows: list[Account] = []
+    for identifier, password, role, subject_type, subject_id in DEMO_ACCOUNTS:
+        existing = get_account_by_identifier(db, identifier)
+        if existing is None:
+            try:
+                view = create_account(
+                    db,
+                    identifier=identifier,
+                    password=password,
+                    role=role,
+                    subject_type=subject_type,
+                    subject_id=subject_id,
+                )
+            except AccountError:
+                # 该主体已经被别的账号占了（例如某个用例刚造了一个临时账号）→ 跳过这一条。
+                # 这是**补齐**语义：目标是「演示账号可用」，不是「账号表里只有这几行」。
+                continue
+            view_id = view.account_id
+        else:
+            view_id = existing.account_id
+
+        row = db.get(Account, view_id)
+        if row is not None:
+            # 口令可能被别的用例改过 → 重设（同时会自增 token_version，那正是我们想要的：
+            # 任何在途令牌都不该在「刚灌完种子」之后还能用）
+            reset_password(db, view_id, password)
+            update_account(
+                db,
+                view_id,
+                # 这里借 0 当操作者：自我保护的判据是「是不是最后一个管理员」，
+                # 而它只在**会减少**管理员时才触发。演示账号的补齐不该被那条规则挡住，
+                # 所以显式传一个不等于任何账号的 actor（0）—— 见 update_account 的 docstring。
+                actor_account_id=0,
+                role=role,
+                status="active",
+            )
+            db.flush()
+            rows.append(db.get(Account, view_id))
+    db.flush()
+    return [row for row in rows if row is not None]
+
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="灌入电商演示种子数据（幂等）")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"随机种子（默认 {DEFAULT_SEED}）")
@@ -378,10 +509,24 @@ def main(argv: list[str] | None = None) -> int:
     counts = seed(args.seed, truncate=not args.no_truncate)
     print(f"种子数据已灌入（seed={args.seed}, truncate={not args.no_truncate}）：")
     for table, n in counts.items():
+        # ⚠️ 账号表**不是业务表**（它在 `db_check.INFRA_TABLES` 里），`MIN_COUNTS` 查不到它。
+        # 第一版直接 `MIN_COUNTS[table]`，于是加了账号种子之后本脚本以
+        # `KeyError: 'accounts'` 结束 —— 而现象看起来像「种子脚本坏了」。
+        if table not in MIN_COUNTS:
+            print(f"  (基础设施) {table:<18}{n:>6}")
+            continue
         flag = "" if n >= MIN_COUNTS[table] else f"  <-- 低于最小演示量 {MIN_COUNTS[table]}"
         print(f"  {table:<18}{n:>6}{flag}")
 
-    below = {t: n for t, n in counts.items() if n < MIN_COUNTS[t]}
+    if counts.get("accounts"):
+        # ⚠️ **不打印口令**（见 `_seed_accounts` 上方那段注释）：口令一旦落到终端输出，
+        # 就等价于泄露了（它会进日志、截图、聊天记录）。要看口令请直接读本文件的
+        # `DEMO_ACCOUNTS`——它是源码，不是运行日志。
+        print("\n演示账号（口令见 scripts/seed.py 的 DEMO_ACCOUNTS，刻意不在此打印）：")
+        for identifier, _password, role, subject_type, subject_id in DEMO_ACCOUNTS:
+            print(f"  {identifier:<16} role={role:<18} {subject_type}#{subject_id}")
+
+    below = {t: n for t, n in counts.items() if t in MIN_COUNTS and n < MIN_COUNTS[t]}
     if below:
         print(f"\n[WARN] 有表低于最小演示量: {below}")
         return 1

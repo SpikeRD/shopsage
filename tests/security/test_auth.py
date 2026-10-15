@@ -38,9 +38,16 @@ def test_create_and_parse_access_token():
 
 
 def test_token_contains_exp_iat_sub():
-    """`sub` / `iat` / `exp` 必填：不给「永不过期」留口子。"""
+    """`sub` / `iat` / `exp` 必填：不给「永不过期」留口子。
+
+    ⚠️ 变更 001 起 `sub` 是**主体标识串**（`c1` / `e7`），不再是裸 user_id。
+    裸数字会让员工 `emp_id=7` 与客户 `user_id=7` 派生同一个会话桶（见 `auth` 模块 docstring ①），
+    所以这条用例的期望值随契约一起改，并新增 `stype` / `sid` 的断言。
+    """
     payload = _decode_unverified(auth.create_access_token(1))
-    assert payload["sub"] == "1"
+    assert payload["sub"] == "c1"
+    assert payload["stype"] == "customer"
+    assert payload["sid"] == 1
     assert "iat" in payload and "exp" in payload
     assert payload["exp"] > payload["iat"]
 
@@ -152,6 +159,122 @@ def test_algorithm_allowlist_is_explicit():
     assert auth.ALLOWED_ALGORITHMS == ("HS256",)
 
 
+# ── ②b 主体标识与会话桶隔离（变更 001）───────────────────────────────────────
+
+
+def test_subject_roundtrip():
+    for subject_type, subject_id in (("customer", 7), ("employee", 7), ("employee", 1234)):
+        assert auth.parse_subject(auth.subject_for(subject_type, subject_id)) == (
+            subject_type,
+            subject_id,
+        )
+
+
+def test_customer_and_employee_subjects_never_collide():
+    """**这是变更 001 的核心安全断言之一。**
+
+    员工 `emp_id=7` 与客户 `user_id=7` 是**两个不同的人**。若主体标识只用裸数字，
+    `thread_id` 会派生同一个值 —— 那不是越权读一行数据，而是「读到别人上一轮的原话」。
+    """
+    assert auth.subject_for("customer", 7) == "c7"
+    assert auth.subject_for("employee", 7) == "e7"
+    assert auth.subject_for("customer", 7) != auth.subject_for("employee", 7)
+
+
+def test_employee_token_carries_account_and_subject_but_no_customer_row():
+    """员工令牌：`user_id` 必须是 `0`（他在 `users` 表里没有行），主体信息走 `subject_id`。"""
+    identity = auth.SigningIdentity(
+        subject_type="employee", subject_id=7, role="admin", account_id=3, token_version=5
+    )
+    token = auth.create_session_token(identity)
+    payload = _decode_unverified(token)
+    assert payload["sub"] == "e7"
+    assert payload["aid"] == 3
+    assert payload["ver"] == 5
+
+    principal = auth.parse_token(token)
+    assert principal.user_id == 0, "员工不该被安上一个客户 user_id（那会污染行级过滤语义）"
+    assert principal.subject_id == 7
+    assert principal.subject_type == "employee"
+    assert principal.subject == "e7"
+    assert principal.account_id == 3
+    assert principal.token_version == 5
+    assert principal.is_customer is False
+
+
+def test_customer_token_keeps_real_user_id_for_row_filtering():
+    """客户令牌：`user_id` 就是真实客户 id（对客行级过滤 `WHERE user_id = :me` 靠它）。"""
+    token = auth.create_access_token(42, role="customer")
+    principal = auth.parse_token(token)
+    assert principal.user_id == 42
+    assert principal.subject_id == 42
+    assert principal.is_customer is True
+
+
+def test_legacy_numeric_sub_is_read_as_customer():
+    """旧形态（裸数字 `sub`）按客户解释，且 `token_version` 落成哨兵 `-1`。
+
+    ⚠️ 兼容窗口是**有意的**（见 `auth.classify_subject` 的 docstring）：
+    `parse_token` 被限流中间件等**不查库**的路径复用，收紧它会一起打断它们。
+    「拒绝旧令牌」由鉴权依赖负责 —— 它查账号表，而旧令牌没有 `ver`。
+    """
+    legacy = jwt.encode(
+        {"sub": "9", "role": "customer", "typ": "access", "iat": 1, "exp": 9999999999},
+        auth._secret(),
+        algorithm="HS256",
+    )
+    principal = auth.parse_token(legacy)
+    assert principal.subject_type == "customer"
+    assert principal.subject_id == 9
+    assert principal.user_id == 9
+    assert principal.token_version == -1, "旧令牌必须能与非零世代号区分开"
+
+
+def test_current_tokens_use_sentinel_minus_one_only_for_legacy():
+    """新令牌的 `ver` 是真实世代号（`0` 也合法），不能被误当成「旧令牌」。"""
+    identity = auth.SigningIdentity(subject_type="customer", subject_id=1, account_id=1, token_version=0)
+    assert auth.parse_token(auth.create_session_token(identity)).token_version == 0
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        # sub 推出 customer，stype 却写 employee
+        {"sub": "c7", "stype": "employee", "sid": 7},
+        # sub 推出 id=7，sid 却写 8
+        {"sub": "c7", "stype": "customer", "sid": 8},
+    ],
+)
+def test_contradictory_subject_claims_are_rejected(forged):
+    """`sub` 与它的分解声明不一致 → **拒绝**，不挑一个信。
+
+    为什么不能「以某个为准」：两个来源不一致意味着令牌被手工拼过（或签发侧有 bug），
+    而「该信哪个」正是攻击者想要的那个问题。
+    """
+    token = jwt.encode(
+        {**forged, "typ": "access", "iat": 1, "exp": 9999999999},
+        auth._secret(),
+        algorithm="HS256",
+    )
+    with pytest.raises(auth.AuthError):
+        auth.parse_token(token)
+
+
+@pytest.mark.parametrize("subject_type", ["staff", "admin", "", "Customer", "C"])
+def test_unknown_subject_types_are_rejected(subject_type):
+    """未知主体类别默认拒绝：多一个类别就多一处要审的授权分支。"""
+    with pytest.raises(auth.AuthError):
+        auth.subject_for(subject_type, 1)
+
+
+@pytest.mark.parametrize("claim", ["sub", "role", "exp", "stype", "sid", "aid", "ver"])
+def test_extra_claims_cannot_override_any_reserved_claim(claim):
+    """保留声明的名单必须覆盖变更 001 新增的四个 —— 漏掉任意一个就是一条提权路径。"""
+    identity = auth.SigningIdentity(subject_type="employee", subject_id=1, role="admin")
+    with pytest.raises(ValueError):
+        auth.create_session_token(identity, extra_claims={claim: "forged"})
+
+
 # ── ③ 密钥来源与生产 fail-fast ──────────────────────────────────────────────
 
 
@@ -219,3 +342,53 @@ def test_verify_password_survives_malformed_stored_value(stored):
 def test_hash_password_does_not_store_plaintext():
     stored = auth.hash_password("plaintext-password")
     assert "plaintext-password" not in stored
+
+
+# ── ④b Argon2id 与旧值迁移（变更 001）────────────────────────────────────────
+
+
+def test_new_passwords_use_argon2id():
+    """新口令必须是 Argon2id，且**参数写死在代码里**（不随库版本漂移）。"""
+    stored = auth.hash_password("s3cret-pw")
+    assert stored.startswith(f"{auth.PASSWORD_SCHEME}$argon2id$")
+    assert f"m={auth.ARGON2_MEMORY_COST},t={auth.ARGON2_TIME_COST},p={auth.ARGON2_PARALLELISM}" in stored
+
+
+def test_stored_format_has_exactly_one_scheme_separator():
+    """存储值里 **只能有一个方案分隔符**：`argon2$argon2id$...`。
+
+    ⚠️ 第一版拼成 `argon2$$argon2id$...`（双 `$`）。它能被本模块认出来（按第一个 `$` 剥离），
+    但自描述格式的全部价值是**外部工具也读得懂** —— 双分隔符会让任何外部校验判为坏值。
+    """
+    stored = auth.hash_password("s3cret-pw")
+    assert not stored.startswith("argon2$$")
+    assert stored.split("$")[1].startswith("argon2id")
+
+
+def test_legacy_sha256_hash_still_verifies_and_is_flagged_for_upgrade():
+    """存量旧口令：**仍可登录**，但被标记为「该升级」。
+
+    这条是「不要求全体重置口令」这句承诺的落点 —— 旧的 `sha256$...</hash>` 值
+    在用户下次登录时由调用方（登录流程）原地重写成 Argon2id。
+    """
+    legacy = auth.hash_password("s3cret-pw", scheme=auth.LEGACY_PASSWORD_SCHEME)
+    assert legacy.startswith(f"{auth.LEGACY_PASSWORD_SCHEME}$")
+    assert auth.verify_password("s3cret-pw", legacy) is True
+    assert auth.verify_password("wrong", legacy) is False
+    assert auth.needs_rehash(legacy) is True
+
+
+def test_fresh_argon2_hash_does_not_need_rehash():
+    assert auth.needs_rehash(auth.hash_password("s3cret-pw")) is False
+
+
+@pytest.mark.parametrize("stored", ["", "garbage", "md5$aa$bb", "argon2$not-a-hash"])
+def test_needs_rehash_treats_broken_values_as_rewritable(stored):
+    """认不出来的存储值一律返回「该重写」：趁「刚验证过明文口令」这个唯一时机修好它。"""
+    assert auth.needs_rehash(stored) is True
+
+
+def test_legacy_scheme_rejects_unknown_scheme_name():
+    """`hash_password` 不接受未登记的方案名（否则会静默产出没人能验的值）。"""
+    with pytest.raises(ValueError):
+        auth.hash_password("x", scheme="md5")

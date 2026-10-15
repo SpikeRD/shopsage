@@ -29,7 +29,7 @@ import sys
 
 import httpx
 
-from app.security.auth import create_access_token
+from scripts import demo_accounts
 
 API_BASE = os.environ.get("SHOPSAGE_API_BASE", "http://127.0.0.1:8000")
 
@@ -43,7 +43,20 @@ QUESTIONS = [
 
 
 async def main() -> int:
-    token = create_access_token(7, role="internal_employee")
+    # 令牌按**真实账号**签发（变更 001 / T14）：真登录上线后鉴权会查 `accounts` 表，
+    # 而变更前那种「直接 create_access_token(7, role=...)」签出的是**客户主体**的令牌，
+    # 既会被鉴权拒（没有账号行），主体类别也是错的（`c7` 而不是 `e*`）。
+    try:
+        issued = demo_accounts.issue_for_role("internal_employee")
+    except demo_accounts.DemoAccountError as exc:
+        print(
+            f"[FAIL] 取内部员工令牌失败：{exc}\n"
+            "       先灌演示账号：uv run python -m scripts.seed",
+            file=sys.stderr,
+        )
+        return 1
+    token = issued.token
+    print(f"身份：账号={issued.identifier} 主体={issued.subject} 角色={issued.role} 入口={issued.entry}")
     async with httpx.AsyncClient(base_url=API_BASE, timeout=180) as client:
         # ⚠️ 探活要**自己判**「后端在不在」，不能直接 `health.json()`：
         #    后端没起时（或地址写错、被反代挡掉）拿到的是空响应/HTML 错误页，

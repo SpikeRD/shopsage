@@ -358,23 +358,66 @@ uv run python -m scripts.check_web_cors
 
 ## 2. 三个入口：我该敲哪条命令
 
+### 2.0 先看这里：变更 001 起「怎么登录」变了（**最常踩的一条**）
+
+| | 变更 001 之前 | 变更 001 之后 |
+|---|---|---|
+| 登录方式 | **粘贴令牌**（`scripts/dev_token.py` 现场签） | **账号 + 口令**（`POST /api/auth/login`） |
+| 口令从哪来 | —— | `uv run python -m scripts.seed` 灌的演示账号；口令在 `scripts/seed.py` 的 `DEMO_ACCOUNTS` 里（**刻意不打印到终端**） |
+| 进哪个界面 | 前端按角色**猜** | **服务端返回 `entry`** |
+| 30 分钟后 | 重新签、重新粘 | **自动续期**（`web/src/lib/session.ts`） |
+| 粘贴令牌 | 唯一方式 | `/login` 的「开发模式」折叠区（**保留**：排障与真链路用例还用它） |
+
+```powershell
+# 最短路径（三个演示账号，口令见 scripts/seed.py::DEMO_ACCOUNTS）
+uv run python -m scripts.seed                 # 灌账号（幂等；连跑三次结果一致）
+# 打开 http://127.0.0.1:3000/login
+#   admin          → /admin      （管理台：开账号 / 停用启用 / 改角色 / 重置口令）
+#   13800000002    → /           （对客）
+#   employee       → /internal   （对内）
+```
+
+⚠️ **三条最容易误判的**（都写进了 `/login` 的提示语里）：
+
+1. **「账号不存在」与「口令错误」返回同一句话** —— 那是**防枚举**，不是提示没写清楚。
+   别去后端找「为什么不说清是哪个错了」。
+2. **登录被 429** 是**限流**（`auth.login` 是 10 次/5 分钟，全项目最严的一条）。
+   它是防暴力破解的，等一会儿即可 —— 别去查令牌或后端。
+3. **旧格式令牌一定被拒**：变更 001 之前签的令牌（没有 `aid`/`ver`）在
+   `/login` 的开发模式里会被**提前标红**（「旧格式（会被拒）」），
+   而不是让你拿着它去发消息、再收到一个不明所以的 401。
+
 ### 2.1 一张表看清
 
 | 目标 | 命令 | 期望 |
 |---|---|---|
-| 看页面 | `npm run dev` → 浏览器开 `http://127.0.0.1:3000` | 顶栏 + 「对客问答」/「对内查询」/「登录 / 切角色」 |
-| 看真链路的**自动证据** | `node tests/run-live.mjs` | 9 passed（会自动签令牌；前端没起时它会起） |
-| 看**离线**证据 | `npm test` | 65 passed（不连任何后端） |
+| 看页面 | `npm run dev` → 浏览器开 `http://127.0.0.1:3000` | 顶栏按登录态显示「对客问答 / 对内查询 / 管理台 / 登录」 |
+| 看真链路的**自动证据** | `node tests/run-live.mjs` | 10 passed（会自动签令牌；前端没起时它会起） |
+| 看**离线**证据 | `npm test` | **119 passed**（不连任何后端） |
 
-### 2.2 两个「入口」是什么，以及为什么不是两套前端
+> ⚠️ **变更 001 实测：`node tests/run-live.mjs` 在本机会挂住不退出。**
+> 它用 `spawn(..., stdio: ["ignore","pipe","pipe"])` 跑 `uv run python -m scripts.dev_token --json`，
+> 而受限环境下子进程管道不可用时，它的 `capture()` **既不 error 也不 close** ⇒ 永久挂住
+> （该文件注释记的是「会 EPERM 直接失败」，那是另一个变体）。
+> **绕法（不改任何文件）**：直接用 `node --test tests/live/live.test.ts`，
+> 令牌从环境变量传（`live.test.ts` 本来就支持这条路）：
+>
+> ```powershell
+> $env:SHOPSAGE_TOKEN_CUSTOMER = (uv run python -m scripts.dev_token --account 13800000002 --json | ConvertFrom-Json).token
+> $env:SHOPSAGE_TOKEN_INTERNAL = (uv run python -m scripts.dev_token --account employee --json | ConvertFrom-Json).token
+> $env:SHOPSAGE_TOKEN_EXPIRED  = (uv run python -m scripts.dev_token --account 13800000002 --ttl -5 --json | ConvertFrom-Json).token
+> node --test --test-isolation=none tests/live/live.test.ts
+> ```
 
-`16.web.md` §4 第 1 条要的是「两个入口靠角色切换，而非两套前端」。本步的落法是：
+### 2.2 三个「入口」是什么，以及为什么不是三套前端
 
-* **同一个构建产物**里的两条路由（`/` 与 `/internal`）；
-* 分流依据是**令牌里的 `role`**（`src/lib/auth.ts::canUseInternal`，判据与后端
-  `Actor.internal` 一致：能不能读全站订单）；
-* 两把钥匙分开放（`shopsage.token.customer` / `shopsage.token.internal`），
-  所以**同一个浏览器可以同时扮演客户与员工** —— 这正是验收第 3 条要能演示的东西。
+`16.web.md` §4 第 1 条要的是「入口靠角色切换，而非多套前端」。本步的落法是：
+
+* **同一个构建产物**里的三条路由（`/`、`/internal`、`/admin`，变更 001 加了第三条）；
+* 分流依据是**服务端返回的 `entry`**（`accounts.entry_for_role`，判据是权限点）；
+  前端 `defaultEntry()` 只在「手粘令牌、服务端没给 entry」时兜底；
+* 三把钥匙分开放（`shopsage.token.customer` / `.internal` / `.admin`），
+  所以**同一个浏览器可以同时扮演客户与管理员** —— 登录管理台**不会**把对客页踢下线。
 
 ### 2.3 为什么对客走 WS、对内走 HTTP（**契约决定的，不是偏好**）
 
@@ -536,32 +579,56 @@ spec 里三件事前端**不许自作主张**：
 
 ## 4. 身份：令牌从哪来，怎么进前端
 
-### 4.1 签一个令牌（本仓没有登录接口）
+### 4.0 变更 001 起：**优先用账号登录**（这一节其余部分是排障用的备选路径）
 
 ```powershell
 # ── 执行位置：仓库根 ──
-uv run python -m scripts.dev_token --role internal_employee --user-id 7
-# 实测输出：
+uv run python -m scripts.seed        # 灌演示账号（幂等）
+# 然后浏览器打开 http://127.0.0.1:3000/login，填 admin / admin-demo-pass
+# （口令见 scripts/seed.py::DEMO_ACCOUNTS —— 刻意不打印到终端）
+
+# 同一件事的命令行版本（脚本/自动化用）：
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/auth/login `
+  -ContentType 'application/json' -Body '{"identifier":"admin","password":"admin-demo-pass"}'
+```
+
+登录响应里 `entry` 是**服务端算好的入口**（`admin` / `internal` / `customer`）——
+前端拿它跳转，不自己推。三个入口各存一把钥匙，互不覆盖（`web/src/lib/session.ts`）。
+
+### 4.1 备选：签一个令牌（**变更 001 之后按账号签，需要先 seed**）
+
+```powershell
+# ── 执行位置：仓库根 ──
+uv run python -m scripts.dev_token --account employee
+# 实测输出（变更 001 之后）：
+#   账号      = employee（account_id=…）
 #   角色      = internal_employee（权限点：read:own, read:all_orders, write:ticket, write:refund）
-#   user_id   = 7（行级过滤的依据：只能查自己的数据）
-#   类型/有效期 = access / 1800s
-#   自检      = parse_token → user_id=7 role=internal_employee type=access
+#   主体      = e2（thread_id 前缀按它派生：c=客户 / e=员工）
+#   入口      = internal
+#   类型/有效期 = access / 1800s（世代号 ver=…）
+#   自检      = parse_token → subject=e2 role=internal_employee type=access ver=…
 #
-#   令牌（粘到 http://localhost:3000/login）：
+#   令牌（粘到 http://localhost:3000/login 的「开发模式」）：
 #   eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9….
 
-# ⚠️ 令牌 payload 的**真实形状**（用 --json 的 parsed 字段或前端徽章核对；别凭记忆写解析代码）：
-#   {"sub": "7", "role": "internal_employee", "typ": "access", "iat": 1791896230, "exp": 1791898030, "jti": "f6f09…"}
-#                                 ↑ 类型声明的键名是 **typ**（不是 `type`）—— 见 §10.1 坑 13
+# 按角色取「第一个启用账号」来签（老命令 `--role x --user-id 7` 仍能跑，user-id 被忽略）
+uv run python -m scripts.dev_token --role internal_employee
+
+# ⚠️ 令牌 payload 的**真实形状**（变更 001 起；别凭记忆写解析代码）：
+#   {"sub": "e2", "stype": "employee", "sid": 2, "aid": <account_id>, "ver": <世代号>,
+#    "role": "internal_employee", "typ": "access", "iat": …, "exp": …, "jti": "…"}
+#          ↑ 主体标识串（c=客户 / e=员工）      ↑ 类型声明的键名是 **typ**（不是 `type`，见 §10.1 坑 13）
+#   ⚠️ 变更 001 之前是 {"sub": "7", ...} —— 那种**旧格式一定被后端拒**（缺 aid/ver），
+#      而 `/login` 的开发模式会提前把它标红（「旧格式（会被拒）」）。
 
 # 机器可读（给真链路启动器用）
-uv run python -m scripts.dev_token --json --role customer --user-id 2
+uv run python -m scripts.dev_token --account 13800000002 --json
 
 # 故意签一个刷新令牌：用来试「401 分支」与「前端提示令牌类型不对」
 uv run python -m scripts.dev_token --kind refresh
 
 # 故意签一个已过期的：用来试 4401（WebSocket 关闭码）
-uv run python -m scripts.dev_token --ttl -5
+uv run python -m scripts.dev_token --account 13800000002 --ttl -5
 ```
 
 > ⏱ **默认只活 30 分钟**（`DEFAULT_TTL_SECONDS`）。「签一次、想半天、回来再试」是很常见的顺序，

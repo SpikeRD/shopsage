@@ -108,7 +108,8 @@ def test_identity_fields_in_body_are_rejected(client: TestClient, auth_headers: 
 
 
 def test_session_id_cannot_forge_another_user_thread(client: TestClient, auth_headers: dict[str, str], patched_query) -> None:
-    """`session_id="1:foo"` 会被拒：`thread_id` 的形状是 `u{user_id}:{session_id}`，
+    """`session_id="1:foo"` 会被拒：`thread_id` 的形状是 `c{user_id}:{session_id}`
+    （变更 001 起前缀分主体类别：`c`=客户 / `e`=员工），
     允许 `:` 就等于允许客户端造出「看起来属于别人」的会话键。
 
     拦在**两层**（都是 `schemas.SESSION_ID_PATTERN` 的同一份正则）：
@@ -198,4 +199,4 @@ def test_websocket_uses_the_token_identity_not_the_body(client: TestClient, patc
         frames = read_until_done(websocket)
         done = frames[-1]
         # thread_id 的形状就能证明用的是谁的身份：u2:... 而不是 u7:...
-        assert done["data"]["thread_id"] == "u2:s-identity"
+        assert done["data"]["thread_id"] == "c2:s-identity"

@@ -176,10 +176,21 @@ async def test_nodes_return_partial_state_not_the_whole_state() -> None:
     out = await router_node(state, llm=FakeLLM({"route": "data", "certainty": 0.9}))
 
     # 输入字段一个都不该被节点改写：agent 只写自己的产物
-    # （`user_id` / `role` 是 router 的例外：它们是身份注入的一部分，属于路由节点的职责）
+    # （`user_id` / `role` / `subject_*` 是 router 的例外：它们属于**身份注入**的职责，
+    #  见 `app/agents/state.inject_identity`；变更 001 新增了 `subject_type`/`subject_id`）
     assert "messages" not in out
     assert set(out) <= STATE_KEYS
-    expected = {"route", "route_confidence", "route_reason", "permissions", "is_customer", "role", "user_id"}
+    expected = {
+        "route",
+        "route_confidence",
+        "route_reason",
+        "permissions",
+        "is_customer",
+        "role",
+        "user_id",
+        "subject_type",
+        "subject_id",
+    }
     assert set(out) == expected, f"router 的返回键变了：{sorted(set(out) ^ expected)}"
 
 

@@ -197,3 +197,221 @@ export async function getHealth(
       : [],
   };
 }
+
+// ── 账号接口（变更 001 / T15）────────────────────────────────────────────────
+//
+// ⚠️ **请求体里绝不出现 `role` / `user_id`**：身份只来自「凭据校验」或已验签令牌。
+// 后端的 `LoginRequest` 是 `extra="forbid"`，多写一个 `role` 就是 422
+// （那不是「宽松校验」，是刻意把「自报权限」这条路堵死在契约层）。
+
+/** `POST /api/auth/login` 的响应（= 后端 `TokenResponse`）。 */
+export interface TokenPayload {
+  accessToken: string;
+  refreshToken: string;
+  tokenType: string;
+  expiresIn: number;
+  refreshExpiresIn: number;
+  accountId: number;
+  /** 主体标识串（`c2` / `e1`）：`thread_id` 的前缀就是它 */
+  subject: string;
+  subjectType: string;
+  role: string;
+  /** 该进哪个界面 —— **服务端算好的**，前端不复制这条规则 */
+  entry: string;
+  permissions: string[];
+}
+
+function parseTokenPayload(value: unknown): TokenPayload {
+  const raw = value as Record<string, unknown>;
+  const accessToken = String(raw?.access_token ?? "");
+  // ⚠️ `ContractError` 要两个参数（message + 原始值）：第二个参数是排障时最有用的那一半
+  // ——「契约不符」的现场必须能看见后端实际回了什么，否则只能靠猜。
+  if (!accessToken) throw new ContractError("登录响应缺少 access_token", value);
+  return {
+    accessToken,
+    refreshToken: String(raw?.refresh_token ?? ""),
+    tokenType: String(raw?.token_type ?? "bearer"),
+    expiresIn: Number(raw?.expires_in ?? 0),
+    refreshExpiresIn: Number(raw?.refresh_expires_in ?? 0),
+    accountId: Number(raw?.account_id ?? 0),
+    subject: String(raw?.subject ?? ""),
+    subjectType: String(raw?.subject_type ?? ""),
+    role: String(raw?.role ?? ""),
+    entry: String(raw?.entry ?? ""),
+    permissions: Array.isArray(raw?.permissions) ? raw.permissions.map((item) => String(item)) : [],
+  };
+}
+
+async function postAnonymous<T>(
+  path: string,
+  body: Record<string, unknown>,
+  parse: (value: unknown) => T,
+  options: { fetchImpl?: typeof fetch } = {},
+): Promise<T> {
+  const doFetch = options.fetchImpl ?? fetch;
+  const response = await doFetch(apiUrl(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw await toApiError(response);
+  return parse(await response.json());
+}
+
+/** `POST /api/auth/login`：账号 + 口令换令牌。失败一律 401 且**文案不区分**两种原因。 */
+export function postLogin(
+  identifier: string,
+  password: string,
+  options: { fetchImpl?: typeof fetch } = {},
+): Promise<TokenPayload> {
+  return postAnonymous("/api/auth/login", { identifier, password }, parseTokenPayload, options);
+}
+
+/** `POST /api/auth/refresh`：刷新令牌换一对新令牌。 */
+export function postRefresh(
+  refreshToken: string,
+  options: { fetchImpl?: typeof fetch } = {},
+): Promise<TokenPayload> {
+  return postAnonymous("/api/auth/refresh", { refresh_token: refreshToken }, parseTokenPayload, options);
+}
+
+/** `GET /api/auth/me`：这令牌还能不能用（前端启动时自检）。 */
+export async function getMe(
+  token: string,
+  options: { fetchImpl?: typeof fetch } = {},
+): Promise<Record<string, unknown>> {
+  const doFetch = options.fetchImpl ?? fetch;
+  const response = await doFetch(apiUrl("/api/auth/me"), {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as Record<string, unknown>;
+}
+
+/** 管理后台的一个账号（= 后端 `AccountViewResponse`，**没有凭据字段**）。 */
+export interface AccountSummary {
+  accountId: number;
+  identifier: string;
+  role: string;
+  status: string;
+  subjectType: string;
+  subjectId: number;
+  entry: string;
+  isAdmin: boolean;
+  createdAt: string | null;
+  lastLoginAt: string | null;
+}
+
+function parseAccount(value: unknown): AccountSummary {
+  const raw = value as Record<string, unknown>;
+  return {
+    accountId: Number(raw?.account_id ?? 0),
+    identifier: String(raw?.identifier ?? ""),
+    role: String(raw?.role ?? ""),
+    status: String(raw?.status ?? ""),
+    subjectType: String(raw?.subject_type ?? ""),
+    subjectId: Number(raw?.subject_id ?? 0),
+    entry: String(raw?.entry ?? ""),
+    isAdmin: Boolean(raw?.is_admin),
+    createdAt: raw?.created_at ? String(raw.created_at) : null,
+    lastLoginAt: raw?.last_login_at ? String(raw.last_login_at) : null,
+  };
+}
+
+async function adminJson<T>(
+  path: string,
+  token: string,
+  init: { method: string; body?: Record<string, unknown>; parse: (value: unknown) => T },
+): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    method: init.method,
+    headers: authHeaders(token),
+    body: init.body ? JSON.stringify(init.body) : undefined,
+  });
+  if (!response.ok) throw await toApiError(response);
+  return init.parse(await response.json());
+}
+
+/** `GET /api/admin/accounts`（要 `admin` 权限；非管理员会被后端按 404 拒）。 */
+export async function getAccounts(
+  token: string,
+  filters: { role?: string; status?: string; subjectType?: string } = {},
+): Promise<AccountSummary[]> {
+  const query = new URLSearchParams();
+  if (filters.role) query.set("role", filters.role);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.subjectType) query.set("subject_type", filters.subjectType);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await fetch(apiUrl(`/api/admin/accounts${suffix}`), {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) throw await toApiError(response);
+  const payload = (await response.json()) as { accounts?: unknown[] };
+  return Array.isArray(payload.accounts) ? payload.accounts.map(parseAccount) : [];
+}
+
+export interface CreateAccountInput {
+  identifier: string;
+  password: string;
+  role: string;
+  subjectType: string;
+  subjectId: number;
+  status?: string;
+}
+
+/** `POST /api/admin/accounts`：管理员开账号（201）。 */
+export function postAccount(token: string, input: CreateAccountInput): Promise<AccountSummary> {
+  return adminJson("/api/admin/accounts", token, {
+    method: "POST",
+    body: {
+      identifier: input.identifier,
+      password: input.password,
+      role: input.role,
+      subject_type: input.subjectType,
+      subject_id: input.subjectId,
+      status: input.status ?? "active",
+    },
+    parse: parseAccount,
+  });
+}
+
+/** `PATCH /api/admin/accounts/{id}`：改状态 / 改角色。 */
+export function patchAccount(
+  token: string,
+  accountId: number,
+  changes: { status?: string; role?: string },
+): Promise<AccountSummary> {
+  const body: Record<string, unknown> = {};
+  if (changes.status) body.status = changes.status;
+  if (changes.role) body.role = changes.role;
+  return adminJson(`/api/admin/accounts/${accountId}`, token, {
+    method: "PATCH",
+    body,
+    parse: parseAccount,
+  });
+}
+
+/** `POST /api/admin/accounts/{id}/password`：重置口令（**响应里没有新口令**）。 */
+export function postPasswordReset(
+  token: string,
+  accountId: number,
+  newPassword: string,
+): Promise<AccountSummary> {
+  return adminJson(`/api/admin/accounts/${accountId}/password`, token, {
+    method: "POST",
+    body: { new_password: newPassword },
+    parse: parseAccount,
+  });
+}
+
+/** 角色清单（与后端 `rbac.ROLE_PERMISSIONS` 的键同源；界面用它渲染下拉框）。 */
+export const KNOWN_ROLES = [
+  "customer",
+  "customer_service",
+  "internal_employee",
+  "manager",
+  "finance_auditor",
+  "admin",
+] as const;
+
+export type KnownRole = (typeof KNOWN_ROLES)[number];

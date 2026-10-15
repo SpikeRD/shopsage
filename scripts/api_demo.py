@@ -46,6 +46,7 @@ from app.api import (  # noqa: E402
 )
 from app.graph import GraphRuntime, ensure_compatible_event_loop  # noqa: E402
 from app.security import auth  # noqa: E402
+from scripts import demo_accounts  # noqa: E402
 from tests.api.conftest import DATA_REPLIES, _context, ws_subprotocols  # noqa: E402
 from tests.graph_helpers import AgentFakeLLM, fake_query_result  # noqa: E402
 
@@ -97,10 +98,51 @@ def install_fake_query(real_model: bool) -> None:
 
 
 def _tokens() -> dict[str, str]:
-    return {
-        "customer": auth.create_access_token(2, role="customer"),
-        "internal": auth.create_access_token(7, role="internal_employee"),
-    }
+    """从**真实账号**取演示令牌（变更 001 / T14）。
+
+    ⚠️ 为什么不再 `auth.create_access_token(2, role=...)` 直接签（那是变更前的写法）：
+
+    1. 那种令牌是**客户主体**（`sub="c2"`），拿它当内部员工用会让 `thread_id` 按客户派生；
+    2. 真登录上线后鉴权依赖会查 `accounts` 表比对 `ver`/`status`，
+       而没有账号行的令牌**一定被拒**（`ver=-1`）。
+
+    于是本演示脚本与真实登录走**同一套签发语义**：先查账号，再按账号签。
+    找不到账号时给一句能照做的提示，而不是抛一个看不懂的栈。
+    """
+    try:
+        return {
+            "customer": demo_accounts.issue_for_role("customer").token,
+            "internal": demo_accounts.issue_for_role("internal_employee").token,
+        }
+    except demo_accounts.DemoAccountError as exc:
+        print(
+            f"[FAIL] 取演示令牌失败：{exc}\n"
+            "       本脚本现在按**真实账号**签发令牌（变更 001 起）。\n"
+            "       先灌演示账号：uv run python -m scripts.seed",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+
+
+def _customer_token_at(user_id: int, **kwargs: Any) -> str:
+    """取「某个具体客户」的令牌（限流场景要两个不同 user_id）。
+
+    ⚠️ 按 `subject_id` 找，而不是按角色取第一个 —— 取第一个会让两次调用拿到**同一个人**，
+    于是「另一个用户有自己那一份额度」这条演示就变成自说自话（桶键里带 user_id）。
+    """
+    from app.db.session import SessionLocal
+    from app.security import accounts as accounts_svc
+
+    with SessionLocal() as db:
+        for view in accounts_svc.list_accounts(
+            db, role="customer", status=accounts_svc.STATUS_ACTIVE, limit=50
+        ):
+            if view.subject_type == accounts_svc.SUBJECT_CUSTOMER and view.subject_id == user_id:
+                return demo_accounts.issue_for_identifier(view.identifier, **kwargs).token
+    raise SystemExit(
+        f"[FAIL] 找不到 user_id={user_id} 的启用客户账号："
+        "先灌演示账号（uv run python -m scripts.seed，它建了客户 2 与 3）"
+    )
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -133,13 +175,17 @@ def scenario_auth(client: TestClient, tokens: dict[str, str]) -> None:
     _line("场景 2：鉴权（401 / 422 / 请求 id 透传）")
     cases: list[tuple[str, Any, dict[str, str]]] = [
         ("无令牌", {"message": "我的订单到哪了"}, {}),
-        ("过期令牌", {"message": "我的订单到哪了"}, _headers(auth.create_access_token(2, ttl_seconds=-5))),
+        ("过期令牌", {"message": "我的订单到哪了"}, _headers(_customer_token_at(2, ttl_seconds=-5))),
         (
             "篡改签名",
             {"message": "我的订单到哪了"},
             _headers(tokens["customer"][:-3] + "aaa"),
         ),
-        ("刷新令牌当访问令牌", {"message": "我的订单到哪了"}, _headers(auth.create_refresh_token(2))),
+        (
+            "刷新令牌当访问令牌",
+            {"message": "我的订单到哪了"},
+            _headers(demo_accounts.issue_for_role("customer", kind=auth.TOKEN_TYPE_REFRESH).token),
+        ),
         ("请求体里塞 user_id", {"message": "我的订单到哪了", "user_id": 999}, _headers(tokens["customer"])),
     ]
     for label, payload, headers in cases:
@@ -163,7 +209,7 @@ def scenario_chat(client: TestClient, tokens: dict[str, str]) -> None:
     body = response.json()
     print(f"POST /api/chat -> {response.status_code}（{elapsed:.0f}ms）")
     print(f"  flow_state = {body['flow_state']} | route = {body['route']} | blocked = {body['blocked']}")
-    print(f"  thread_id  = {body['thread_id']}（形状 u{{user_id}}:{{session_id}}）")
+    print(f"  thread_id  = {body['thread_id']}（形状 c{{user_id}}:{{session_id}} / e{{emp_id}}:... —— 前缀分主体类别）")
     print(f"  answer     = {body['answer']}")
     print(f"  X-RateLimit-Limit={response.headers.get('X-RateLimit-Limit')} "
           f"Remaining={response.headers.get('X-RateLimit-Remaining')}")
@@ -231,7 +277,7 @@ def scenario_ratelimit(client: TestClient, tokens: dict[str, str]) -> None:
     other = client.post(
         "/api/chat",
         json={"message": "我的订单到哪了", "session_id": "demo-rl-other"},
-        headers=_headers(auth.create_access_token(3, role="customer")),
+        headers=_headers(_customer_token_at(3)),
     )
     print(f"  另一个用户（user_id=3）-> {other.status_code}（自己那一份额度）")
 

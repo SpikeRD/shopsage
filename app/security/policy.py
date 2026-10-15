@@ -99,7 +99,28 @@ ROLE_MAX_SENSITIVITY: Final[dict[str, int]] = {
     "internal_employee": SENSITIVITY_MASKED,  # 普通员工：脱敏后的手机号/地址/邮箱
     "manager": SENSITIVITY_INTERNAL,  # 主管：可见真实姓名（手机号/地址仍脱敏）
     "finance_auditor": SENSITIVITY_FINANCIAL,  # 财务审计：可见金额、支付方式，PII 仍脱敏
+    # 管理员（变更 001 补）：**与财务审计同级**，不是「无限」。
+    #
+    # ⚠️ 这一行补的是一个**已经存在的 bug**：变更 001 之前 `admin` 不在这张表里，
+    # 而本表的口径是「表里没有的角色 = -1，什么都看不到」（默认拒绝）——
+    # 也就是说 `visible_sensitivity_ceiling("admin")` 返回 -1，
+    # **管理员看不到任何字段**。它一直没暴露只是因为此前没有代码调用这个函数
+    # （管理后台一展示账号明细就会踩到）。
+    #
+    # 为什么是「财务级」而不是更高：本表的等级语义最高到 3（财务级），**不要**为了
+    # 「管理员应该看得更多」而新造一级 —— 等级越高，走 `masking` 出口的字段就越少。
+    # 管理员真正需要的是**动作权限**（`PERM_ADMIN`），不是「看到所有人的手机号明文」。
+    # 敏感等级管「眼睛能看多清楚」，权限点管「能做什么」，两者正交（见本文件上方注释）。
+    "admin": SENSITIVITY_FINANCIAL,
 }
+
+#: **绝不允许出现在 SQL 白名单里的表**（变更 001）。
+#:
+#: 为什么单列一份而不是「反正 `ALLOWED_TABLES` 里没有它」：那是一句**没有守卫的承诺** ——
+#: 下一个人为了「让管理后台查账号方便一点」把它加进白名单时，不会有任何东西拦住他，
+#: 而后果是 Text-to-SQL 能读到 `password_hash`（凭据本身）。
+#: `tests/security/test_sql_whitelist.py` 直接断言这里的每张表都不在 `ALLOWED_TABLES` 里。
+NEVER_IN_SQL_WHITELIST: Final[frozenset[str]] = frozenset({"accounts"})
 
 # 对客路径强制注入行级过滤时用的列名（D1 唯一真相在 `app/db/queries.py`，
 # 这里只提供「注入什么列名」这一个常量，避免两处各写一个字符串字面量）
@@ -114,6 +135,7 @@ __all__ = [
     "CUSTOMER_ROLE",
     "FORBIDDEN_FUNCTIONS",
     "MAX_ROWS",
+    "NEVER_IN_SQL_WHITELIST",
     "PROTECTED_COLUMNS",
     "ROLE_MAX_SENSITIVITY",
     "ROW_FILTER_COLUMN",

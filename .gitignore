@@ -18,6 +18,10 @@ env/
 .pytest_cache/
 # 受限环境（沙箱）下 pytest 可能在此建临时目录且无法清理，见 docs/config-guide.md §3.2
 pytest-cache-files-*/
+# pytest 的 `tmp_path` 工厂：临时目录基线默认建在**工作区根**（`pytest-of-<user>/`）。
+# 受限环境下它同样清不掉，于是每次跑全量回归都会冒出来一个未跟踪目录
+# （变更 001 开发时实测：跑完 `uv run pytest -q` 后 `git status` 多出 `pytest-of-spikerd/`）。
+pytest-of-*/
 # 手工把 TEMP 指到工作区时用的目录（见 docs/runbook/7.agents-runbook.md §11）
 .pytest-tmp/
 .mypy_cache/

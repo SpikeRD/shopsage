@@ -126,14 +126,49 @@ tickets         (ticket_id, user_id, type, status, assignee_id, created_at)   --
 employees       (emp_id, name, role, dept, level)                             -- 内部员工
 ```
 
+**身份基础设施表**（变更 001；**不是**业务表，见 `app/db/models.INFRA_MODELS`）：
+
+```sql
+accounts        (account_id, identifier, password_hash, role, status,
+                 subject_type, subject_id, token_version,
+                 created_at, updated_at, last_login_at)
+```
+
+三条口径（详见 [`docs/changes/001-account-login-and-admin-console.md`](changes/001-account-login-and-admin-console.md)）：
+
+1. **「凭据 → 身份」只有这一处真相**：客户与员工共用一套登录路径，
+   靠 `(subject_type, subject_id)` 指向 `users.user_id` 或 `employees.emp_id`。
+   `subject_id` **没有外键**（PostgreSQL 不支持「指向两张表之一」），
+   校验由应用层负责 —— 这是本设计唯一的硬伤，换来的是不引入第三种身份类别。
+2. **`accounts.role` 是授权真相**，`employees.role` 是组织属性（同名字段，权威性不同）。
+   鉴权路径只读 `accounts.role`。
+3. **`token_version` 是「立即失效」的落点**：停用/改密/改角色时 +1，
+   该账号所有在途令牌（access 与 refresh）在下一次请求时立刻失效。
+   `accounts` **绝不在 SQL 白名单里**（`policy.NEVER_IN_SQL_WHITELIST`），
+   `password_hash` 不能被 Text-to-SQL 读到。
+
 ---
 
 ## 6. 安全设计
 
-1. **区分权限**：区分「对客路径=行级过滤（row-level filtering）」与「对内路径=基于角色的分级权限（RBAC）」。
+1. **区分权限**：区分「对客路径=行级过滤（row-level filtering）」与「对内路径=基于角色的分级权限（RBAC）」，
+   第三档「管理台=要求 `admin` 权限点」。三档入口**由服务端算好**（`accounts.entry_for_role`）
+   随登录响应返回，前端不复制这条规则。
 2. **读写路径分离**：「读路径」（NL→SQL 只读白名单）与「写路径」（工单/退款走预定义、审计的 service API，不经 LLM 动态生成 SQL）分离。SQL 执行前校验——禁止 `DROP/DELETE`、禁止无 `WHERE` 的全表扫描、限制返回行数。
 3. **敏感字段脱敏**：手机号 `138****1234`、地址只显示区级、员工分级权限。
 4. **Prompt 注入防护**：Guardrail Agent 识别"忽略之前的指令"等注入，双向校验输入输出。
+5. **账号与令牌**（变更 001）：
+   - **口令散列用 Argon2id**（`m=65536, t=3, p=4`），参数写死在代码里而不是用库的默认值；
+     旧的 `sha256$` 值仍可验，并在**登录成功那一刻原地升级**（那是唯一能拿到明文口令的时机）。
+   - **登录失败不可区分**：「账号不存在」与「口令错误」返回同一状态码与同一句文案，
+     且未知账号路径也付一次等价耗时的散列验证 —— 否则响应耗时就是一个免费的账号枚举接口。
+   - **令牌是「主体 + 世代号」而不是裸 user_id**：`sub` 是 `c{user_id}` / `e{emp_id}`，
+     所以员工 `emp_id=7` 与客户 `user_id=7` **不会**落进同一个会话桶。
+   - **停用/改密/改角色立即生效**：每个受保护请求比一次 `token_version`（一次主键点查），
+     **刻意不做进程内缓存** —— 缓存会把「立即生效」退回「延迟生效」。
+     代价是鉴权路径不再纯内存计算，这是显式取舍（变更 001 §3.4）。
+   - **升级影响**：变更 001 之前的令牌（没有 `aid`/`ver`）一律被拒，且 `thread_id` 形状
+     从 `u{user_id}:` 变成 `c{...}:`/`e{...}:` —— **升级后需要重新登录、旧会话作废**。
 
 ---
 

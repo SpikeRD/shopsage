@@ -33,13 +33,20 @@ MIN_COUNTS: dict[str, int] = {
 #: **业务表**（架构第 5 节的 Schema）：种子数据与「8 张业务表」这条口径都按它算。
 BUSINESS_TABLES: tuple[str, ...] = tuple(MIN_COUNTS)
 
-#: 第 12 步（queue）与第 13 步（cache）的**基础设施表**：它们必须存在（迁移跑过），
-#: 但**不属于业务数据** —— 「库里没有死信」「缓存是空的」都是健康的形态，不是缺数据。
+#: 第 12 步（queue）与第 13 步（cache）的基础设施表、以及变更 001 的账号表：
+#: 它们必须存在（迁移跑过），但**不属于业务数据** ——
+#: 「库里没有死信」「缓存是空的」「账号行数不参与演示量口径」都是健康的形态，不是缺数据。
 #:
-#: 为什么单独一份而不是塞进 `MIN_COUNTS`：`MIN_COUNTS` 的长度被三处当成
-#: 「业务表数量」的判据（本脚本、`tests/test_db_migrations.py`、`tests/conftest.py` 的
-#: 种子装置）。混进队列表与缓存表会让「业务表数量对不对」这条检查失去意义。
-INFRA_TABLES: tuple[str, ...] = ("queue_dead_letters", "cache_semantic_entries", "cache_corpus_versions")
+#: ⚠️ `accounts` 属于**身份基础设施**而不是业务表，所以它进这里而不是 `MIN_COUNTS`：
+#: `MIN_COUNTS` 的长度被三处当成「业务表数量」的判据（本脚本、
+#: `tests/test_db_migrations.py`、`tests/conftest.py` 的种子装置）。
+#: 混进账号表会让「业务表数量对不对」这条检查失去意义。
+INFRA_TABLES: tuple[str, ...] = (
+    "queue_dead_letters",
+    "cache_semantic_entries",
+    "cache_corpus_versions",
+    "accounts",
+)
 
 #: 迁移必须建出来的全部表（业务 + 基础设施）
 REQUIRED_TABLES: tuple[str, ...] = BUSINESS_TABLES + INFRA_TABLES
