@@ -57,7 +57,9 @@ from app.api.metrics import status_class  # noqa: E402 - 见上（刻意放在 l
 LIMITED_SCOPES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("POST", "/api/chat"),
-        ("POST", "/api/chat/approve"),
+        # ⚠️ 变更 003 删除了 `("POST", "/api/chat/approve")`：那条路已整体移除
+        # （对客闸门不再注册，接口恒 409）。三处登记（本常量 / scope / DEFAULT_RULES）
+        # 必须同时增删，`tests/api/test_api_contracts.py` 的双向断言钉住这件事。
         # 第 12 步：提交长任务。**必须在这里登记**，否则 `POST /api/tasks` 会
         # 完全不限流 —— 而 `scope.SCOPE_BY_ROUTE` 里有没有它、`ratelimit.DEFAULT_RULES`
         # 有没有额度，都不会因此报错（症状是「额度配了但不生效」，见 runbook §10.1）。
@@ -73,6 +75,11 @@ LIMITED_SCOPES: Final[frozenset[tuple[str, str]]] = frozenset(
         # 登录是唯一能用「猜」换到令牌的入口，漏登记等于给暴力破解无限次尝试。
         ("POST", "/api/auth/login"),
         ("POST", "/api/auth/refresh"),
+        # ── 变更 003：退款申请与审批 ─────────────────────────────────────────────
+        # 两条都是**写路径**（申请会在库里多一行并占用额度；审批会改资金状态），
+        # 都必须限流。路径刻意不带参数（理由见 `scope.SCOPE_BY_ROUTE` 的注释）。
+        ("POST", "/api/refunds"),
+        ("POST", "/api/refunds/decision"),
     }
 )
 

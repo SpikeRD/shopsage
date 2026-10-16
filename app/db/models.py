@@ -184,6 +184,25 @@ class Refund(Base):
     # 唯一性由下面的**复合唯一约束**保证（见 app/tools/refund.py 为什么必须带 user_id）。
     idempotency_key: Mapped[str | None] = mapped_column(String(64))
 
+    # ── 审批留痕（变更 003）─────────────────────────────────────────────────
+    # 四列都是 nullable：历史行（本次迁移之前建的单）**没有**审批记录，
+    # 给它们一个默认值等于伪造「有人批过」。NULL 的语义就是「还没人批 / 不知道谁批的」。
+    #
+    # ⚠️ `decided_by` 存的是 `employees.emp_id`（主体 id），**不是** `accounts.account_id`：
+    # 与 `tickets.assignee_id` / `stock_movements.operator_id` 同一口径（追到「哪个人」）。
+    # `ON DELETE SET NULL` 而不是 CASCADE：员工离职删行**不该把审批记录一起删掉**
+    # —— 那会让一笔资金动作的审批人凭空消失（审计上等于没发生过）。
+    decided_by: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("employees.emp_id", ondelete="SET NULL"), nullable=True
+    )
+    decided_at: Mapped[dt.datetime | None] = mapped_column(TimestampTZ, nullable=True)
+    #: 审批意见（**与 `reason` 分开**：`reason` 是客户填的申请理由，
+    #: 用审批意见覆盖它会让原始诉求消失，两者都要留）。
+    decision_note: Mapped[str | None] = mapped_column(String(255))
+    #: 审批时的角色（**快照**）。角色是可以事后被改的，审计要看的是「他当时是什么角色」，
+    #: 而不是「他现在是什么角色」——否则一次改角色会让历史审批记录的解释跟着变。
+    approver_role: Mapped[str | None] = mapped_column(String(32))
+
     order: Mapped[Order] = relationship(back_populates="refunds")
     user: Mapped[User] = relationship(back_populates="refunds")
 
@@ -192,6 +211,9 @@ class Refund(Base):
         CheckConstraint("amount > 0", name="amount_positive"),
         Index("ix_refunds_user_id_created_at", "user_id", "created_at"),
         Index("ix_refunds_order_id", "order_id"),
+        # 变更 003：员工审批台的默认查询是「按状态筛 + 按时间倒序」，
+        # 这条复合索引正好覆盖它（与 ix_orders_status_created_at 同一手法）。
+        Index("ix_refunds_status_created_at", "status", "created_at"),
         UniqueConstraint("user_id", "idempotency_key", name="uq_refunds_user_id_idempotency_key"),
     )
 

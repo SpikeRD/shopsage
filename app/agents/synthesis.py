@@ -52,10 +52,15 @@ _CUSTOMER_SYSTEM: Final[str] = build_system_prompt(
     "你是电商平台的**客服助手**，正在直接回复客户。\n\n"
     "口吻与篇幅（硬要求）：\n"
     f"1. 口语、礼貌、直接给结论，**总长度不超过 {CUSTOMER_MAX_CHARS} 字**；\n"
-    "2. 不复述内部术语：不提权限、审计 id、SQL、表名、行数上限、模型名；\n"
+    "2. 不复述内部术语：不提权限、审计 id、SQL、表名、行数上限、模型名、英文字段名；\n"
     "3. 只讲这个客户自己的事：材料里出现别人的信息时一律不提；\n"
     "4. 材料里没有的信息，直说「我这边看不到」，**不许推测**；\n"
     "5. 不要罗列数据表的原始行，改写成客户能看懂的一两句话。\n\n"
+    "退款相关（材料里出现「已受理的退款申请」时必须遵守）：\n"
+    "6. 那是一笔**已经提交、等待审核**的申请 —— 明确说「已提交，等待审核」，"
+    "**不许**说「已经退给您了」「钱已到账」（钱还没动）；\n"
+    "7. 要给出退款单号与金额，让客户能拿去核对；\n"
+    "8. 材料说「没有提交任何退款」时，**不要**说「已为您提交」，只问清是哪一笔订单。\n\n"
     "格式：先给结论，需要时可以给 1~3 条短要点；用 `[1]` 这样的编号引用知识库出处。",
     output_schema='{"answer": "给客户的回答", "cited": [引用的出处编号，整数数组，可为空]}',
 )
@@ -155,6 +160,42 @@ def _material_block(
         lines.append("本次**没有拿到**的材料（回答时如实说明，不许编造替代内容）：")
         for reason in refusals:
             lines.append(f"- {reason}")
+
+    # ── 退款申请的结果（变更 003）─────────────────────────────────────────────
+    # ⚠️ 用**中文标签**，绝不用 `refund_id` / `refunds` 这类英文字段名：
+    # `guardrail.INTERNAL_TERMS` 把它们列为对客禁词（那是「实现细节不许出网」的口径），
+    # 模型一旦把字段名照抄进回答，输出侧护栏会**拦下整句回答** ——
+    # 表现是「退款明明成功了，客户看到的却是一句拦截话术」。
+    # 所以这里给的是「退款单号：12」这种形态，模型照抄也不会撞词表。
+    refund = state.get("refund") or {}
+    if refund:
+        lines.append("")
+        status = str(refund.get("status") or "")
+        if status == "submitted":
+            lines.append(
+                "本次**已经受理**的退款申请（这是已发生的事实，必须如实告知客户）："
+            )
+            lines.append(f"- 退款单号：{refund.get('refund_id')}")
+            lines.append(f"- 订单号：{refund.get('order_id')}")
+            lines.append(f"- 退款金额：{refund.get('amount')} 元")
+            lines.append(
+                "- 当前处理状态：已提交，**等待平台审核**（还没到账，不要说「已经退给您了」）"
+            )
+            if str(refund.get("remaining_after") or "") not in ("", "0.00"):
+                lines.append(f"- 该订单剩余可退额度：{refund.get('remaining_after')} 元")
+        elif status == "needs_order_id":
+            candidates = "、".join(str(item) for item in (refund.get("candidates") or []))
+            lines.append("")
+            lines.append(
+                "客户有多笔可退订单，**本次没有提交任何退款**（需要他先确认是哪一笔）："
+            )
+            lines.append(f"- 可退订单号：{candidates}")
+            lines.append(f"- 处理要求：{refund.get('hint')}")
+        else:
+            # `refused` 或任何将来新增的取值：把 hint 原样交给模型转述。
+            lines.append("")
+            lines.append("退款申请没有提交成功，原因如下（如实告知客户，不要粉饰）：")
+            lines.append(f"- {refund.get('hint') or '未能提交退款申请'}")
 
     if include_internal_details:
         if state.get("sql"):

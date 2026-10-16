@@ -99,6 +99,7 @@ def test_node_names_are_unique_and_stable() -> None:
         NODE_GUARDRAIL_INPUT,
         NODE_GUARDRAIL_OUTPUT,
         NODE_RAG,
+        NODE_REFUND_REQUEST,
         NODE_ROUTER,
         NODE_SYNTHESIS,
         ROUTE_NODES,
@@ -110,6 +111,10 @@ def test_node_names_are_unique_and_stable() -> None:
         NODE_DATA,
         NODE_RAG,
         NODE_ANALYSIS,
+        # ⚠️ 变更 003 新增：本仓第一个真正的**写节点**（对客退款申请）。
+        # 漏登记它的症状是「图里有个节点，但名字表里没有」—— 那会让
+        # `draw_mermaid()` 与「边表断言」少看一个节点，而图照跑，所以必须钉住。
+        NODE_REFUND_REQUEST,
         NODE_SYNTHESIS,
         NODE_GUARDRAIL_OUTPUT,
         NODE_GATE,

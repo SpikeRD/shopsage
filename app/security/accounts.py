@@ -58,6 +58,7 @@ from app.security.rbac import (
     PERM_ADMIN,
     PERM_READ_ALL_ORDERS,
     ROLE_PERMISSIONS,
+    can_enter_internal,
     has_permission,
 )
 
@@ -243,10 +244,20 @@ class AccountView:
 
 
 def entry_for_role(role: str) -> str:
-    """角色 → 入口。判据是**能力**（权限点），不是角色名（见模块常量区的注释）。"""
+    """角色 → 入口。判据是**能力**（权限点），不是角色名（见模块常量区的注释）。
+
+    变更 003 把「能不能进对内」的判据从「有 `read:all_orders`」放宽为
+    `rbac.can_enter_internal`（＝能读全站订单 **或** 能审批退款）——
+    因为 `customer_service` 有了 `approve:refund` 却没有 `read:all_orders`，
+    不改这一行它就会被送进对客入口、看不到自己的退款审批台。
+
+    ⚠️ 放宽的**只是入口**：客服进对内之后，能查什么仍由 RBAC 逐接口判定，
+    他查不到全站订单（`read:all_orders` 不在他的权限集里）。判据的复用点见
+    `rbac.can_enter_internal` 的 docstring（那里写了为什么两条判据不能合并）。
+    """
     if has_permission(role, PERM_ADMIN):
         return ENTRY_ADMIN
-    if has_permission(role, PERM_READ_ALL_ORDERS):
+    if can_enter_internal(role):
         return ENTRY_INTERNAL
     return ENTRY_CUSTOMER
 

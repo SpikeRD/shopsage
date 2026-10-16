@@ -38,6 +38,18 @@ export const PERM_READ_FINANCE = "read:finance";
 export const PERM_WRITE_REFUND = "write:refund";
 export const PERM_WRITE_TICKET = "write:ticket";
 export const PERM_ADMIN = "admin";
+/**
+ * 变更 003 新增的两个权限点。
+ *
+ * ⚠️ **别把它们与 `write:refund` 混起来**：
+ *   * `request:refund` = 「**申请**退款」（客户自助，只能建 `requested`，等员工审批）；
+ *   * `approve:refund` = 「**审批**退款」（员工，`requested → approved/rejected`）；
+ *   * `write:refund` = 「**代客户发起**退款」（员工侧的更强动作，语义与变更前一致）。
+ * 客户持有第一个、**永远不持有后两个** —— 这就是需求 2
+ * 「客户不能自己审批退款」在前端的判据来源。
+ */
+export const PERM_REQUEST_REFUND = "request:refund";
+export const PERM_APPROVE_REFUND = "approve:refund";
 
 /**
  * 角色 → 权限点。
@@ -47,17 +59,37 @@ export const PERM_ADMIN = "admin";
  * 而不用为一次渲染去问后端。**任何真正的授权判断都不许用它**。
  */
 export const ROLE_PERMISSIONS: Record<string, readonly string[]> = {
-  customer: [PERM_READ_OWN, PERM_WRITE_TICKET],
-  customer_service: [PERM_READ_OWN, PERM_WRITE_TICKET, PERM_WRITE_REFUND],
-  internal_employee: [PERM_READ_OWN, PERM_READ_ALL_ORDERS, PERM_WRITE_TICKET, PERM_WRITE_REFUND],
-  manager: [PERM_READ_OWN, PERM_READ_ALL_ORDERS, PERM_WRITE_TICKET, PERM_WRITE_REFUND],
-  finance_auditor: [PERM_READ_OWN, PERM_READ_ALL_ORDERS, PERM_READ_FINANCE, PERM_WRITE_TICKET],
+  customer: [PERM_READ_OWN, PERM_WRITE_TICKET, PERM_REQUEST_REFUND],
+  customer_service: [PERM_READ_OWN, PERM_WRITE_TICKET, PERM_WRITE_REFUND, PERM_APPROVE_REFUND],
+  internal_employee: [
+    PERM_READ_OWN,
+    PERM_READ_ALL_ORDERS,
+    PERM_WRITE_TICKET,
+    PERM_WRITE_REFUND,
+    PERM_APPROVE_REFUND,
+  ],
+  manager: [
+    PERM_READ_OWN,
+    PERM_READ_ALL_ORDERS,
+    PERM_WRITE_TICKET,
+    PERM_WRITE_REFUND,
+    PERM_APPROVE_REFUND,
+  ],
+  finance_auditor: [
+    PERM_READ_OWN,
+    PERM_READ_ALL_ORDERS,
+    PERM_READ_FINANCE,
+    PERM_WRITE_TICKET,
+    PERM_APPROVE_REFUND,
+  ],
   admin: [
     PERM_READ_OWN,
     PERM_READ_ALL_ORDERS,
     PERM_READ_FINANCE,
     PERM_WRITE_REFUND,
     PERM_WRITE_TICKET,
+    PERM_REQUEST_REFUND,
+    PERM_APPROVE_REFUND,
     PERM_ADMIN,
   ],
 };
@@ -66,9 +98,33 @@ export function hasPermission(role: string, permission: string): boolean {
   return (ROLE_PERMISSIONS[role] ?? []).includes(permission);
 }
 
-/** 能否进对内入口（判据是「能不能读全站订单」，与后端 `Actor.internal` 同一判据）。 */
+/**
+ * 能否**查全站订单**（判据是 `read:all_orders`，与后端 `Actor.internal` 同一判据）。
+ *
+ * ⚠️ 变更 003：它**只管查询能力**，不再兼任「能不能进对内入口」。
+ * 两者必须分开 —— 见 `canUseInternalEntry` 的注释。
+ */
 export function canUseInternal(role: string): boolean {
   return hasPermission(role, PERM_READ_ALL_ORDERS);
+}
+
+/**
+ * 能否进**对内入口**（判据是「能查全站订单 **或** 能审批退款」）。
+ *
+ * ## 为什么它与 `canUseInternal` 是两个函数（变更 003 决策 15）
+ *
+ * 变更 003 给 `customer_service` 加了 `approve:refund`（一线审批退款），
+ * 而它**没有** `read:all_orders`。若入口判据仍是「能查全站订单」，
+ * 客服登录后会被送进对客入口、**看不到自己的退款审批台**（需求 3 对客服不可用）。
+ *
+ * 与后端 `rbac.can_enter_internal` 逐字对应（那是真相）。
+ *
+ * ⚠️ **绝不能用它去决定「对内页的查询框能不能用」**：客服会看到一个**可用的**
+ * 查询框，而他每次提交都会被后端按 RBAC 拒（`read:all_orders` 才是查询的授权依据）。
+ * 入口/菜单显隐用本函数，「能不能查全站」一律用 `canUseInternal`。
+ */
+export function canUseInternalEntry(role: string): boolean {
+  return canUseInternal(role) || hasPermission(role, PERM_APPROVE_REFUND);
 }
 
 /** 能否进管理台（判据是「有没有 `admin` 权限点」—— 与后端 `accounts.entry_for_role` 同一判据）。 */
@@ -77,16 +133,34 @@ export function canUseAdmin(role: string): boolean {
 }
 
 /**
+ * 能否**申请退款**（客户侧：需求 2 的手动申请按钮）。
+ * 与后端 `request:refund` 同源。
+ */
+export function canRequestRefund(role: string): boolean {
+  return hasPermission(role, PERM_REQUEST_REFUND);
+}
+
+/**
+ * 能否**审批退款**（员工侧：需求 3 的退款台）。
+ * 与后端 `approve:refund` 同源。
+ */
+export function canApproveRefund(role: string): boolean {
+  return hasPermission(role, PERM_APPROVE_REFUND);
+}
+
+/**
  * 默认入口。⚠️ **优先级与后端 `accounts.entry_for_role` 必须一致**：
- * 管理员 → 管理台；能读全站订单 → 对内；否则 → 对客。
+ * 管理员 → 管理台；能进对内 → 对内；否则 → 对客。
  *
  * 顺序不能反：管理员也带 `read:all_orders`，先判对内就永远进不了管理台。
  * 但**真正的入口由服务端在登录响应的 `entry` 字段里给**（`lib/session.ts` 用它），
  * 这个函数只在「服务端没给 entry」（例如手粘令牌）时兜底。
+ *
+ * ⚠️ 变更 003：判据从 `canUseInternal` 换成 `canUseInternalEntry`（客服也要能进对内）。
  */
 export function defaultEntry(role: string): Entry {
   if (canUseAdmin(role)) return "admin";
-  return canUseInternal(role) ? "internal" : "customer";
+  return canUseInternalEntry(role) ? "internal" : "customer";
 }
 
 /** 入口 → 页面路径（**唯一一处**映射，导航与跳转都用它）。 */
@@ -108,7 +182,7 @@ export function entryForPath(pathname: string): Entry {
 export const ENTRIES: readonly Entry[] = ["customer", "internal", "admin"] as const;
 
 /**
- * 给定**已登录入口的角色**，返回该显示哪些入口（变更 002 / 侧边栏用）。
+ * 给定**已登录入口的角色**，返回该显示哪些入口（变更 002 / 侧边栏用；变更 003 放宽判据）。
  *
  * ## 为什么入参是「多个角色」而不是「一个角色」
  *
@@ -124,15 +198,70 @@ export const ENTRIES: readonly Entry[] = ["customer", "internal", "admin"] as co
  *
  * ⚠️ 与 `lib/auth.ts` 的模块注释同源：这只决定**显示哪些链接**，不是安全边界。
  * 客户把地址栏敲成 `/admin` 一样能打开 —— 那一页的每个请求都会被后端拒。
+ *
+ * ⚠️ 变更 003 起「对内」用的是 `canUseInternalEntry`（含审批能力）：
+ * 否则客服能看到对内入口的链接却进不去他自己的审批台。
+ * ⚠️ 但「对客」永远显示：它是兜底入口，也是未登录时的唯一去处。
  */
 export function visibleEntriesFor(roles: readonly string[]): Entry[] {
-  const canInternal = roles.some((role) => canUseInternal(role));
+  const canInternal = roles.some((role) => canUseInternalEntry(role));
   const canAdmin = roles.some((role) => canUseAdmin(role));
   return ENTRIES.filter((entry) => {
     if (entry === "customer") return true; // 对客入口对任何身份都显示（它是兜底入口）
     if (entry === "internal") return canInternal;
     return canAdmin;
   });
+}
+
+/**
+ * 侧边栏在**每个入口之下**再显示哪些子页（变更 003 / 决策 6）。
+ *
+ * | 入口 | 子页 | 谁能看到 |
+ * |---|---|---|
+ * | 对客 | 对客问答（`/`）、我的订单（`/orders`） | 所有能进对客入口的人 |
+ * | 对内 | 数据查询（`/internal`）、退款审批（`/internal/refunds`） | 能**审批退款**的人 |
+ * | 管理台 | 账号管理（`/admin`） | 管理员 |
+ *
+ * ## 两条纪律
+ *
+ * 1. **仍然只是显隐**，不是安全边界：`/internal/refunds` 的每个请求都会被后端
+ *    按 `approve:refund` 校验，越权按 404 返回。
+ * 2. **「能进对内」与「能看审批子页」是两个判据**：客服能进对内（`canUseInternalEntry`），
+ *    但看得到审批子页靠的是 `canApproveRefund`；而 `internal_employee` 两者都满足。
+ *    把它们合成一个判据，就会有人以为「能进对内 = 能审批」。
+ */
+export interface SubPage {
+  /** 路径（与 `entryPath` 的返回值同源风格：绝对路径） */
+  path: string;
+  label: string;
+  hint: string;
+}
+
+export function subPagesFor(entry: Entry, roles: readonly string[]): SubPage[] {
+  if (entry === "customer") {
+    return [
+      { path: "/", label: "对客问答", hint: "聊天 + 流式 + 溯源" },
+      {
+        path: "/orders",
+        label: "我的订单",
+        hint: "查订单 / 明细 / 退款进度，并可直接申请退款",
+      },
+    ];
+  }
+  if (entry === "internal") {
+    const pages: SubPage[] = [
+      { path: "/internal", label: "数据查询", hint: "报表 / 图表 / SQL 回显" },
+    ];
+    if (roles.some((role) => canApproveRefund(role))) {
+      pages.push({
+        path: "/internal/refunds",
+        label: "退款审批",
+        hint: "查询退款单 / 通过 / 驳回",
+      });
+    }
+    return pages;
+  }
+  return [{ path: "/admin", label: "账号管理", hint: "开账号 / 停用 / 改角色" }];
 }
 
 /** 入口的中文名（标语与导航共用，避免各处写三遍字符串）。 */

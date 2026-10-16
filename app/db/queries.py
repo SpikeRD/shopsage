@@ -16,8 +16,9 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from decimal import Decimal
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.models import Order, OrderItem, Refund, Ticket, User
@@ -68,11 +69,17 @@ def assert_row_filtered(stmt: Select, *, expect_limit: bool = True) -> str:
 def get_orders_for_customer(
     user_id: int, *, limit: int = DEFAULT_LIMIT, session: Session | None = None
 ) -> Sequence[Order]:
-    """某客户的订单列表（按时间倒序，带明细）。`user_id` 就是行级过滤条件。"""
+    """某客户的订单列表（按时间倒序，带明细）。`user_id` 就是行级过滤条件。
+
+    ⚠️ 变更 003 起**连商品一起预加载**（`.selectinload(Order.items).selectinload(OrderItem.product)`）：
+    客户订单页要显示商品名，而逐个 `item.product` 会变成 N+1（一页 50 单 × 若干明细）。
+    `selectinload` 是**第二条查询**（IN 一批 id），不是 N 条 —— 这是本函数唯一一处
+    「为了展示而多加载一点」的地方，理由写在客户订单页的需求里。
+    """
     stmt = (
         select(Order)
         .where(Order.user_id == user_id)
-        .options(selectinload(Order.items))
+        .options(selectinload(Order.items).selectinload(OrderItem.product))
         .order_by(Order.created_at.desc(), Order.order_id.desc())
         .limit(_clamp_limit(limit))
     )
@@ -110,6 +117,39 @@ def get_refunds_for_customer(
         return db.execute(stmt).scalars().all()
 
 
+def get_consumed_refund_by_order(
+    user_id: int, *, session: Session | None = None
+) -> dict[int, Decimal]:
+    """某客户**每笔订单已被占用的退款额度**（`{order_id: 金额}`，变更 003）。
+
+    用途：客户订单页要显示「这单还能退多少」= 订单金额 − 已占用额度。
+    已占用的口径与 `app/tools/refund.CONSUMING_REFUND_STATUSES` 一致
+    （`requested` / `approved` / `refunded` 计入，`rejected` **不计** ——
+    被驳回的钱可以再退一次）。口径从那边 import，不在这里重写一遍列表。
+
+    ⚠️ 返回的是**聚合值**，不是行：所以它按需 `GROUP BY`，而不是把明细拉回来在
+    Python 里求和 —— 后者在「一个客户几百笔退款」时会把无用的行送过网络。
+    查询同样带 `WHERE user_id = :me`（行级过滤）与 LIMIT 兜底。
+    """
+    from app.tools.refund import CONSUMING_REFUND_STATUSES
+
+    stmt = (
+        select(Refund.order_id, func.sum(Refund.amount))
+        .where(
+            Refund.user_id == user_id,
+            Refund.status.in_(tuple(CONSUMING_REFUND_STATUSES)),
+        )
+        .group_by(Refund.order_id)
+        .limit(_clamp_limit(DEFAULT_LIMIT))
+    )
+    # 这条语句的 WHERE 里带的是 `refunds.user_id`，与对客过滤列同名同表，
+    # 所以 `assert_row_filtered` 的检查对它成立（它要求的正是「WHERE 里出现过滤」）。
+    assert_row_filtered(stmt)
+    with _read_session(session) as db:
+        rows = db.execute(stmt).all()
+    return {int(row[0]): Decimal(row[1] or 0) for row in rows}
+
+
 def get_tickets_for_customer(
     user_id: int, *, limit: int = DEFAULT_LIMIT, session: Session | None = None
 ) -> Sequence[Ticket]:
@@ -142,6 +182,7 @@ __all__ = [
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
     "assert_row_filtered",
+    "get_consumed_refund_by_order",
     "get_customer_profile",
     "get_order_for_customer",
     "get_orders_for_customer",

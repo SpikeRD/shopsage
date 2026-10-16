@@ -103,24 +103,24 @@ class ChatRequest(BaseModel):
     )
 
 
-class ApprovalDecision(BaseModel):
-    """人工审批结果（`POST /api/chat/approve` 的请求体）。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    thread_id: str = Field(min_length=1, max_length=200, description="挂起那一轮的 thread_id（原样回传）")
-    approved: bool = Field(description="是否批准继续（False = 按未执行处理，仍会得到一句如实的话术）")
-    reason: str | None = Field(default=None, max_length=500, description="审批意见（进审计日志）")
-
-
 class ApprovalGate(BaseModel):
-    """敏感操作的审批闸门信息（`flow_state="approval_required"` 时才有）。"""
+    """敏感操作的审批闸门信息（`flow_state="approval_required"` 时才有）。
+
+    ⚠️ **变更 003 之后它在生产路径上不可达**（`GATED_ROLES` 置空，图里不再注册闸门节点）。
+    保留它的理由与保留图侧原语是同一条（决策 D2）：契约不收缩，
+    将来给另一条业务加「对话轮级审批」时前端不用改解析。
+
+    被删除的是**发起审批的那个路由**（`POST /api/chat/approve`）——
+    它挂错了位置：批准人就是发起人（自审批）。真正的审批现在挂在退款单据上
+    （`POST /api/refunds/decision`），那里的 `resume_with` 指向的是它。
+    """
 
     thread_id: str
     question: str
     interrupt_id: str = ""
-    #: 可执行的下一步提示（把「调用哪个接口、带什么」写进响应里，前端不用去翻文档）
-    resume_with: str = "POST /api/chat/approve"
+    #: 可执行的下一步提示。变更 003 指向**单据级**审批入口
+    #: （不再是已删除的 `/api/chat/approve`）。
+    resume_with: str = "POST /api/refunds/decision"
 
 
 class ChatDebug(BaseModel):
@@ -144,7 +144,7 @@ class ChatDebug(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """`POST /api/chat` 与批准通道的统一响应信封。"""
+    """`POST /api/chat` 的统一响应信封（批准通道已随变更 003 移除）。"""
 
     model_config = ConfigDict(extra="allow")
 
@@ -160,6 +160,14 @@ class ChatResponse(BaseModel):
     #: text 模式下的回答类型（`tools/chart.py` 的 spec 会走 chart 帧/字段）
     chart_spec: dict[str, Any] | None = None
     approval: ApprovalGate | None = None
+    #: 变更 003：退款申请的结果（只有 `route=refund` 的那一轮才有）。
+    #:
+    #: 形状由 `app/agents/refund.py::refund_node` 决定，**三种 `status`**：
+    #: `submitted`（已落库，带 refund_id/amount/state）/ `needs_order_id`（**没落库**，
+    #: 带 candidates）/ `refused`（没提交成功，带 hint）。
+    #: 刻意用 `dict` 而不是再定义一套模型：它是**图的产物**（由节点写入 state），
+    #: 建模一次就多一处要与节点同步的真相；而 HTTP 与 WS 两个出口都只是转述它。
+    refund: dict[str, Any] | None = None
     debug: ChatDebug | None = None
 
 
@@ -536,6 +544,140 @@ class PasswordResetRequest(BaseModel):
     )
 
 
+# ── 变更 003：订单查询与退款申请/审批的请求/响应 ─────────────────────────────
+#
+# 三条贯穿这一节的口径：
+#
+# 1. **请求体里不出现 `user_id` / `role`**（与 `ChatRequest` 同一条纪律）：
+#    退款申请归属谁、审批人是谁，只能来自已验签的令牌。请求体里放一个 `user_id`
+#    就是「让调用方自己声明这笔钱退给谁」——那是资金越权最经典的入口。
+# 2. **客户与员工共用一套响应形状**：同一张退款单，客户看自己的、员工看全站的，
+#    字段集合一致（差别只在脱敏与可见行数）。两套形状会让前端写两份解析，
+#    而其中一份必然先腐化。
+# 3. **金额用 `Decimal` 字符串出网**（`str`，不是 float）：`NUMERIC(12,2)` 是精确十进制，
+#    过一遍 JSON float 会把 `0.1+0.2` 那类尾巴带回来。前端按字符串展示即可。
+
+
+class OrderRefundView(BaseModel):
+    """订单页里的一条退款记录（**只读**，用于展示「这单退过什么」）。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    refund_id: int
+    amount: str = Field(description="退款金额（十进制字符串，两位小数）")
+    status: str = Field(description="`requested` / `approved` / `rejected` / `refunded`")
+    reason: str | None = Field(default=None, description="客户填写的申请理由")
+    decision_note: str | None = Field(default=None, description="审批意见（员工填）")
+    created_at: str | None = None
+    decided_at: str | None = None
+
+
+class OrderView(BaseModel):
+    """客户订单页的一行（订单 + 明细 + 该单退款 + 还能退多少）。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    order_id: int
+    status: str
+    total_amount: str = Field(description="订单金额（十进制字符串）")
+    payment_method: str | None = Field(
+        default=None,
+        description="支付方式。**按调用者角色脱敏**：清晰度不足时是 `***`（不是 null）",
+    )
+    created_at: str | None = None
+    items: list[dict[str, Any]] = Field(default_factory=list, description="订单明细（商品名/数量/单价）")
+    refunds: list[OrderRefundView] = Field(default_factory=list, description="该订单的退款记录（倒序）")
+    consumed_amount: str = Field(description="已占用的可退额度（不含 rejected）")
+    remaining_refundable: str = Field(
+        description="**还能退多少** = 订单金额 − 已占用额度。客户申请退款时用它做默认值"
+    )
+    refundable: bool = Field(
+        description="这笔订单此刻能不能发起退款（状态属于可退集合 **且** 剩余额度 > 0）"
+    )
+
+
+class OrderListResponse(BaseModel):
+    orders: list[OrderView]
+    total: int
+    limit: int = Field(description="本次实际生效的行数上限（服务端会夹到 MAX_LIMIT）")
+
+
+class RefundRequestCreate(BaseModel):
+    """`POST /api/refunds` 的请求体（**客户自助申请退款**）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    order_id: int = Field(gt=0, description="要退款的订单号（必须是**本人**的订单）")
+    amount: str | float | int = Field(
+        description=(
+            "退款金额。**默认应当是订单页给的 `remaining_refundable`**，客户可以改小；"
+            "超过剩余可退额度会被拒绝（后端是权威）。"
+        )
+    )
+    reason: str | None = Field(
+        default=None,
+        max_length=255,
+        description="备注/申请理由（可选，单行文本，最长 255 字）",
+    )
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "幂等键（必填）。前端在**打开表单时**生成一次随机键："
+            "同一次提交重复点只落一单；关掉再开是一次新的申请意图。"
+        ),
+    )
+
+
+class RefundViewResponse(BaseModel):
+    """一张退款单的完整对外形态（客户订单页与员工审批台共用）。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    refund_id: int
+    order_id: int
+    user_id: int = Field(
+        description="退款归属的客户 id。**员工可见、客户只能看到自己的**（行级过滤在服务端）"
+    )
+    amount: str
+    status: str
+    reason: str | None = None
+    created_at: str | None = None
+    decided_by: int | None = Field(
+        default=None, description="审批人（`employees.emp_id`）；非员工主体审批时为 null"
+    )
+    decided_at: str | None = None
+    decision_note: str | None = None
+    approver_role: str | None = Field(
+        default=None, description="审批时的角色**快照**（角色事后被改不会影响这条记录）"
+    )
+
+
+class RefundListResponse(BaseModel):
+    refunds: list[RefundViewResponse]
+    total: int
+
+
+class RefundDecisionRequest(BaseModel):
+    """`POST /api/refunds/decision` 的请求体（**员工审批**）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    refund_id: int = Field(
+        gt=0,
+        description=(
+            "要审批的退款单号。**放在请求体里而不是路径里**是刻意的："
+            "`app/api/scope.py` 的限流映射是精确的 `(method, path)` 匹配，"
+            "带路径参数的路径匹配不上任何 scope，会静默退回「不限流」"
+            "（见 `app/api/refunds.py::decide` 的说明）。"
+        ),
+    )
+    decision: Literal["approve", "reject"] = Field(
+        description="`approve` → `approved`；`reject` → `rejected`。只有 `requested` 状态可决策"
+    )
+    note: str | None = Field(default=None, max_length=255, description="审批意见（可选，进审计）")
+
+
 __all__ = [
     "FRAME_ANSWER",
     "FRAME_DONE",
@@ -553,7 +695,6 @@ __all__ = [
     "AccountListResponse",
     "AccountUpdateRequest",
     "AccountViewResponse",
-    "ApprovalDecision",
     "ApprovalGate",
     "ChatDebug",
     "ChatRequest",
@@ -566,9 +707,16 @@ __all__ = [
     "Frame",
     "HealthResponse",
     "LoginRequest",
+    "OrderListResponse",
+    "OrderRefundView",
+    "OrderView",
     "PasswordResetRequest",
     "QueueStatusResponse",
     "RefreshRequest",
+    "RefundDecisionRequest",
+    "RefundListResponse",
+    "RefundRequestCreate",
+    "RefundViewResponse",
     "TaskAcceptedResponse",
     "TaskRequest",
     "TaskStatusResponse",

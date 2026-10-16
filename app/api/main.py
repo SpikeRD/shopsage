@@ -47,7 +47,9 @@ from app.api.errors import install_exception_handlers
 from app.api.health import router as infra_router
 from app.api.metrics import MetricsRegistry
 from app.api.middleware import ApiMiddleware, REQUEST_ID_HEADER
+from app.api.orders import router as orders_router
 from app.api.ratelimit import open_rate_limiter
+from app.api.refunds import router as refunds_router
 from app.api.scope import SCOPE_BY_ROUTE
 from app.api.tasks import router as tasks_router
 from app.graph import GraphRuntime, compile_graph, ensure_compatible_event_loop, open_checkpointer
@@ -358,6 +360,11 @@ def create_app(
     app.include_router(admin_router, prefix=prefix)
     app.include_router(chat_router, prefix=prefix)
     app.include_router(tasks_router, prefix=prefix)
+    # ── 变更 003：订单查询与退款申请/审批 ──────────────────────────────────────
+    # ⚠️ 注册顺序 = 文档顺序（路径各不相同，不影响匹配）：先「读自己的订单」，
+    #    再「申请退款」，最后「员工审批」—— 与业务动作的时间顺序一致。
+    app.include_router(orders_router, prefix=prefix)
+    app.include_router(refunds_router, prefix=prefix)
     app.include_router(infra_router)
 
     @app.get("/", include_in_schema=False)
@@ -370,7 +377,12 @@ def create_app(
             "endpoints": {
                 "chat": f"POST {prefix}/chat",
                 "stream": f"WS {prefix}/chat/stream",
-                "approve": f"POST {prefix}/chat/approve",
+                # ⚠️ 变更 003 **删掉了** `POST {prefix}/chat/approve`（对客闸门整体移除，
+                # 理由见 docs/changes/003）。这里的清单跟着改，免得它继续把已删除的
+                # 能力报成一个可用的入口 —— 那会让人以为是 404 bug。
+                "orders": f"GET {prefix}/orders",
+                "refund_request": f"POST {prefix}/refunds",
+                "refund_review": f"GET {prefix}/refunds",
             },
             "rate_limited": [f"{method} {path}" for method, path in sorted(SCOPE_BY_ROUTE)],
         }

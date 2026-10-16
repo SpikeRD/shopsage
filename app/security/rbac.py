@@ -39,16 +39,40 @@ PERM_READ_FINANCE: Final[str] = "read:finance"
 PERM_WRITE_REFUND: Final[str] = "write:refund"
 PERM_WRITE_TICKET: Final[str] = "write:ticket"
 PERM_ADMIN: Final[str] = "admin"
+# ── 变更 003 新增的两个权限点（对话轮自审批 → 单据审批）────────────────────────
+# 为什么「申请」与「审批」要各自成点，而不是复用 write:refund：
+# `write:refund` 的语义是「**由员工代为发起一笔退款**」（变更前的语义，见
+# `app/tools/refund.py` 的模块 docstring 第 2 条 SoD）。而客户自助申请是**另一个动作**：
+#   ① 它只能建 `requested` 状态（永远要等员工审批），拿不到「批准」这个动作；
+#   ② 它的主体是客户本人，而 `write:refund` 的持有者全是内部角色。
+# 把两者塞进同一个权限点，就等于「客户一旦能申请，就同时能发起」，职责分离当场失效 ——
+# 那正是变更 003 要修的那个 bug（客户自己批准自己的退款）的另一种形态。
+PERM_REQUEST_REFUND: Final[str] = "request:refund"
+PERM_APPROVE_REFUND: Final[str] = "approve:refund"
 
 # 角色 → 权限点集合。**表里没有的角色 = 没有任何权限**（默认拒绝）。
 ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
-    # 客户：只能看自己的东西，且只能走对客路径（不能读全站订单）
-    CUSTOMER_ROLE: frozenset({PERM_READ_OWN, PERM_WRITE_TICKET}),
-    # 客服：能建工单、能代客户发起退款申请，但仍不能读全站订单列表
-    "customer_service": frozenset({PERM_READ_OWN, PERM_WRITE_TICKET, PERM_WRITE_REFUND}),
+    # 客户：只能看自己的东西，且只能走对客路径（不能读全站订单）。
+    # 变更 003：+`request:refund`（**自助申请退款**，只能建 requested）。
+    # ⚠️ 刻意**仍然没有** `write:refund`：那个点代表「代客户发起并可直接落地」，
+    #    客户拿到它就等于绕过了审批。它同样没有 `approve:refund` —— 这正是
+    #    「客户不能自己批准自己的退款」这条需求的代码落点。
+    CUSTOMER_ROLE: frozenset({PERM_READ_OWN, PERM_WRITE_TICKET, PERM_REQUEST_REFUND}),
+    # 客服：能建工单、能代客户发起退款申请，但仍不能读全站订单列表。
+    # 变更 003：+`approve:refund`（一线审批）。注意它**没有** read:all_orders，
+    # 所以「进对内入口」这件事必须靠 approve:refund 也参与判据（见 accounts.entry_for_role）。
+    "customer_service": frozenset(
+        {PERM_READ_OWN, PERM_WRITE_TICKET, PERM_WRITE_REFUND, PERM_APPROVE_REFUND}
+    ),
     # 普通员工：可读全站订单（对内分析路径），财务数据仍然不可见
     "internal_employee": frozenset(
-        {PERM_READ_OWN, PERM_READ_ALL_ORDERS, PERM_WRITE_TICKET, PERM_WRITE_REFUND}
+        {
+            PERM_READ_OWN,
+            PERM_READ_ALL_ORDERS,
+            PERM_WRITE_TICKET,
+            PERM_WRITE_REFUND,
+            PERM_APPROVE_REFUND,
+        }
     ),
     "manager": frozenset(
         {
@@ -56,11 +80,20 @@ ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
             PERM_READ_ALL_ORDERS,
             PERM_WRITE_TICKET,
             PERM_WRITE_REFUND,
+            PERM_APPROVE_REFUND,
         }
     ),
-    # 财务审计：唯一能读财务级数据的角色
+    # 财务审计：唯一能读财务级数据的角色。
+    # 变更 003：+`approve:refund` —— 它与 read:finance 是绝配（审批要看得懂金额），
+    # 而它**仍然没有** `write:refund`（原始 SoD 设计：只看账、不动账）。
     "finance_auditor": frozenset(
-        {PERM_READ_OWN, PERM_READ_ALL_ORDERS, PERM_READ_FINANCE, PERM_WRITE_TICKET}
+        {
+            PERM_READ_OWN,
+            PERM_READ_ALL_ORDERS,
+            PERM_READ_FINANCE,
+            PERM_WRITE_TICKET,
+            PERM_APPROVE_REFUND,
+        }
     ),
     # 管理员：全量权限（运维用，应尽量少人持有）
     "admin": frozenset(
@@ -70,6 +103,8 @@ ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
             PERM_READ_FINANCE,
             PERM_WRITE_REFUND,
             PERM_WRITE_TICKET,
+            PERM_REQUEST_REFUND,
+            PERM_APPROVE_REFUND,
             PERM_ADMIN,
         }
     ),
@@ -99,6 +134,31 @@ def permissions_for(role: str) -> frozenset[str]:
 
 def has_permission(role: str, permission: str) -> bool:
     return permission in permissions_for(role)
+
+
+def can_enter_internal(role: str) -> bool:
+    """这个角色能不能进**对内入口**（登录分流与侧边栏共用的判据，变更 003）。
+
+    ## 为什么它不等于 `has_permission(role, PERM_READ_ALL_ORDERS)`
+
+    变更 003 给 `customer_service` 加了 `approve:refund`（一线审批退款），
+    而它**没有** `read:all_orders` —— 若入口判据仍是「能读全站订单」，
+    客服登录后会被送进对客入口，**根本看不到自己的审批台**（需求 3 对客服不可用）。
+
+    所以入口判据收敛成「**能读全站订单 _或_ 能审批退款**」。
+
+    ## ⚠️ 它管的是「能不能进那个界面」，不是「能不能查全站数据」
+
+    两者必须分开，否则会造出一个更难查的问题：
+    前端若用本函数去决定「对内页的查询框能不能用」，客服会看到一个**可用的**查询框，
+    而他每次提交都会被后端按 RBAC 拒（`read:all_orders` 才是查询的授权依据）。
+    所以：
+      * 入口/菜单显隐 → 用本函数（`can_enter_internal`）；
+      * 「能不能查全站订单」→ 仍然只看 `PERM_READ_ALL_ORDERS`（前端 `canUseInternal`、
+        后端 `deps.Actor.internal`）。
+    两条判据各自只有一处真相，谁都不许替对方做决定。
+    """
+    return has_permission(role, PERM_READ_ALL_ORDERS) or has_permission(role, PERM_APPROVE_REFUND)
 
 
 def require_permission(*permissions: str, identity_from: str = "actor") -> Callable[[F], F]:
@@ -294,15 +354,18 @@ def visible_sensitivity_ceiling(role: str) -> int:
 
 __all__ = [
     "PERM_ADMIN",
+    "PERM_APPROVE_REFUND",
     "PERM_READ_ALL_ORDERS",
     "PERM_READ_FINANCE",
     "PERM_READ_OWN",
+    "PERM_REQUEST_REFUND",
     "PERM_WRITE_REFUND",
     "PERM_WRITE_TICKET",
     "ROLE_PERMISSIONS",
     "CustomerIdentity",
     "PermissionDenied",
     "assert_row_filter_present",
+    "can_enter_internal",
     "has_permission",
     "permissions_for",
     "require_permission",

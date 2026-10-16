@@ -35,6 +35,8 @@ import {
   type Frame,
   parseFlowState,
   parseFrame,
+  parseRefundOutcome,
+  type RefundOutcome,
   WS_CLOSE_BAD_REQUEST,
   WS_CLOSE_RATE_LIMITED,
   WS_CLOSE_UNAUTHORIZED,
@@ -81,6 +83,8 @@ export interface StreamState {
   route: string;
   blocked: boolean;
   approval: PendingApproval | null;
+  /** 变更 003：退款申请的结果（来自 `node` 帧的 `delta.refund`） */
+  refund: RefundOutcome | null;
   debug: ChatDebug | null;
   /** 错误帧或关闭码带来的失败信息 */
   error: { code: string; message: string } | null;
@@ -108,6 +112,7 @@ export function initialState(): StreamState {
     route: "",
     blocked: false,
     approval: null,
+    refund: null,
     debug: null,
     error: null,
     closeCode: null,
@@ -161,6 +166,13 @@ export function reduceStream(state: StreamState, frame: Frame, now: number = Dat
       }
       const delta = (data.delta ?? {}) as Record<string, unknown>;
       if (typeof delta.route === "string" && delta.route) next.route = delta.route;
+      // 变更 003：退款结果随 `refund_request` 节点的增量出网（`FRAME_SAFE_KEYS` 里有它）。
+      // 单独取它的理由：它是一个**有结论的业务事实**（已受理 / 需要确认 / 被拒），
+      // 用户应当在这一轮结束前就看到，而不是等 `done` 帧（那一帧只有流程状态）。
+      if (delta.refund !== undefined) {
+        const outcome = parseRefundOutcome(delta.refund);
+        if (outcome) next.refund = outcome;
+      }
       // ⚠️ 不把 `delta` 里的其他内容塞进状态：它是后端**裁剪过的白名单**
       // （`app/api/chat.py::FRAME_SAFE_KEYS`），前端再抄一份等于又把「哪些字段能出网」的
       // 判断搬到了前端 —— 那正是白名单想避免的。
@@ -214,7 +226,10 @@ function parseApproval(value: unknown): PendingApproval | null {
     threadId,
     question: typeof record.question === "string" ? record.question : "",
     interruptId: typeof record.interrupt_id === "string" ? record.interrupt_id : "",
-    resumeWith: typeof record.resume_with === "string" ? record.resume_with : "POST /api/chat/approve",
+    // ⚠️ 变更 003：默认值改成**单据级**审批入口 —— 旧的 `/api/chat/approve` 已被删除
+    // （它允许发起人批准自己的操作）。契约保留 `approval_required` 这个取值
+    // （决策 D2：图侧原语不删），所以这里要有默认值，但绝不能是已死的接口。
+    resumeWith: typeof record.resume_with === "string" ? record.resume_with : "POST /api/refunds/decision",
     route: typeof record.route === "string" ? record.route : "",
   };
 }
@@ -553,6 +568,8 @@ export interface TurnResult {
   route: string;
   blocked: boolean;
   approval: PendingApproval | null;
+  /** 变更 003：退款申请的结果（`route=refund` 的那一轮才有；由 `node` 帧带出来） */
+  refund: RefundOutcome | null;
   debug: ChatDebug | null;
   degraded: boolean;
   hasChart: boolean;
@@ -571,6 +588,7 @@ export function toTurnResult(state: StreamState): TurnResult {
     route: state.route,
     blocked: state.blocked,
     approval: state.approval,
+    refund: state.refund,
     debug: state.debug,
     degraded: state.degraded,
     hasChart: state.hasChart,

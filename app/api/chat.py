@@ -75,14 +75,18 @@ from app.api.schemas import (
     WS_CLOSE_RATE_LIMITED,
     WS_CLOSE_UNAUTHORIZED,
     WS_SUBPROTOCOL,
-    ApprovalDecision,
     ApprovalGate,
     ChatDebug,
     ChatRequest,
     ChatResponse,
 )
-from app.graph import graph_config, interrupt_policy_for, run_turn
-from app.graph.config import APPROVAL_QUESTION, REJECTED_REASON
+# ⚠️ 变更 003 之后本模块**不再** import：`ApprovalDecision`（请求模型随接口一起删了）、
+# `graph_config`（只有被删除的审批路由需要它去读 checkpoint 快照）、
+# `Command`（resume 的唯一用途就是审批）、`REJECTED_REASON`（拒绝话术随闸门一起下线）。
+# `run_turn` 与 `interrupt_policy_for` **保留**：前者是每一轮问答的驱动，
+# 后者仍然决定「这次跑图挂不挂闸门节点」（现在恒为不挂，但接线不拆 —— 见决策 D2）。
+from app.graph import interrupt_policy_for, run_turn
+from app.graph.config import APPROVAL_QUESTION
 from app.observability.instrument import trace_request_span
 from app.security.auth import AuthError
 
@@ -101,7 +105,12 @@ SKELETONS: Final[dict[str, str]] = {
     "data": "正在查询你的业务数据，结论马上给你…",
     "rag": "正在检索知识库并核对出处…",
     "analysis": "正在汇总数据并做趋势判断…",
+    # ⚠️ 变更 003：`ticket` 与 `refund` 的骨架**必须分开**。
+    # 变更前 ticket 的文案是「这属于需要人工确认的操作，正在准备审批…」——
+    # 那句话对 refund 是**错的**（客户不需要审批任何东西，他只是在提交申请），
+    # 而且会让客户以为「等我自己点一下就好」。refund 的真实等待对象是**平台审核**。
     "ticket": "这属于需要人工确认的操作，正在准备审批…",
+    "refund": "正在为你提交退款申请…",
     "final": "正在整理回答…",
 }
 
@@ -112,6 +121,7 @@ NODE_PROGRESS: Final[dict[str, str]] = {
     "data": "正在查询数据…",
     "rag": "正在检索知识库…",
     "analysis": "正在做数据分析…",
+    "refund_request": "正在提交退款申请…",
     "gate": "等待人工确认…",
     "synthesis": "正在组织回答…",
     "guardrail_output": "正在做输出合规检查…",
@@ -132,6 +142,10 @@ FRAME_SAFE_KEYS: Final[tuple[str, ...]] = (
     "guardrail_stage",
     "refusals",
     "chart_spec",
+    # 变更 003：退款申请的结果要能流式告诉客户（「已受理，单号 12」）。
+    # 它是**已脱敏的业务事实**（单号/金额/状态），不含任何内部字段名，
+    # 加进白名单是安全的；不加的话前端只能等 `done` 帧，用户看不到「提交中 → 已受理」。
+    "refund",
 )
 
 
@@ -197,6 +211,16 @@ def build_response(turn: Any, *, actor: deps.Actor, settings: Any = None) -> Cha
         refusals=[str(item) for item in (state.get("refusals") or [])],
         chart_spec=state.get("chart_spec") or None,
         approval=gate,
+        # 变更 003：退款申请的结果（`route=refund` 的那一轮才有）。
+        #
+        # ⚠️ 这个字段是**端到端取证脚本抓出来的漏项**（实测踩到）：我把它加进了
+        # WS 的 `FRAME_SAFE_KEYS` 与前端契约，却**漏了 HTTP 响应模型** ——
+        # 于是页面走 WS 能看到退款卡片，而走 `POST /api/chat` 的调用方
+        # （以及任何按 OpenAPI 生成的客户端）拿到的是一个**没有 refund 字段**的信封，
+        # 表现为「退款提交成功了但界面什么都没显示」。
+        # 教训：新增一个「节点产出的事实」时，**三个出口都要接**：
+        # state 键 → HTTP 响应模型 → WS 帧白名单。
+        refund=state.get("refund") or None,
         debug=shape_debug(turn, settings=settings, internal=actor.internal),
     )
 
@@ -227,6 +251,15 @@ def safe_delta(update: Any) -> dict[str, Any]:
             out[key] = [str(item) for item in value][:10]
         elif isinstance(value, (str, int, float, bool)) or value is None:
             out[key] = value
+        elif key == "refund" and isinstance(value, dict):
+            # 退款结果是**已经过白名单筛选**的业务事实（见 FRAME_SAFE_KEYS 的注释）：
+            # 它的每个值都是标量（单号/金额/状态），直接出网 —— 走下面的 `str(value)`
+            # 会把一个 dict 变成 `"{'status': 'submitted', ...}"` 这么一坨给前端，
+            # 而前端要的是结构化字段（`refund.refund_id` 这种用法会拿到 undefined）。
+            out[key] = {
+                str(k): (v if isinstance(v, (str, int, float, bool)) or v is None else str(v))
+                for k, v in value.items()
+            }
         else:
             out[key] = str(value)
     return out
@@ -305,19 +338,6 @@ async def chat(
     return response
 
 
-def _accepted(model: ChatResponse, *, request_id: str) -> Any:
-    """用 202 返回同一个信封（`response_model` 描述不了「有时 200 有时 202」）。"""
-    from fastapi.responses import JSONResponse
-
-    from app.api.schemas import REQUEST_ID_HEADER
-
-    return JSONResponse(
-        status_code=status.HTTP_202_ACCEPTED,
-        content=model.model_dump(mode="json"),
-        headers={REQUEST_ID_HEADER: request_id} if request_id else None,
-    )
-
-
 def _graph_for(app: Any, actor: deps.Actor) -> Any:
     """取本次请求要用的图：**按角色决定是否开人工审批闸门**。
 
@@ -346,93 +366,24 @@ def _runtime_with_policy(runtime: Any, actor: deps.Actor) -> Any:
     return dataclasses.replace(runtime, interrupts=policy)
 
 
-# ── HTTP：人工审批 ───────────────────────────────────────────────────────────
-
-
-@router.post(
-    "/chat/approve",
-    response_model=ChatResponse,
-    summary="人工审批：批准/拒绝挂起的那一轮（human-in-the-loop）",
-)
-async def approve(
-    body: ApprovalDecision,
-    request: Request,
-    principal: Any = Depends(deps.require_principal),
-) -> ChatResponse:
-    """把挂起的那一轮**从 checkpoint 接着跑**（`8.graph.md` §5 第四条）。
-
-    四件事的顺序不能换（每一件都有它防的东西）：
-
-    1. **校验 `thread_id` 属于当前用户**：否则任何人都能批准（甚至推进）别人的会话
-       —— 这与「任选 `thread_id` 读别人状态」是同一个洞的另一面；
-    2. **确认这一轮确实在等批准**：拿 `aget_state().next` 看有没有挂起的节点。
-       没有挂起却去 `Command(resume=...)`，LangGraph 的语义是**从头重跑** ——
-       用户会拿到一句莫名其妙的新回答，而上游已经花掉的模型调用再花一遍；
-    3. 用 `Command(resume=<决策>)` 恢复。`resume` 的值就是闸门节点里 `interrupt()` 的返回值 ——
-       本项目传一个 dict（`approved` / `reason` / `approver_user_id` / `approver_role`），
-       让将来的写节点能拿到「谁批的、批了没、为什么」（审计要这四个）；
-    4. 未批准时**保证**有一句如实的话术（在这里补一道，不依赖闸门实现里那行 `refusals`）。
-    """
-    from langgraph.types import Command
-
-    # ⚠️ 用 `principal_from_request`（非依赖版本）而不是路由的 `principal` 参数：
-    # 那个参数由 `Depends(require_principal)` 解析，**本身是好的**；但同一个函数里两次
-    # 拿它会让「开一次会话」变成两次（`principal_from_request` 每次开一个会话）。
-    # 这里显式解析一次、复用结果。
-    principal = deps.principal_from_request(request)
-    actor = deps.actor_from_principal(
-        principal,
-        # ⚠️ 用**主体**（subject_type/subject_id）反向解析，而不是 `principal.user_id`：
-        # 员工主体的 `user_id` 是 0，拿它去解析会得到「这个 thread 不属于你」——
-        # 而那是一个**无辜的 422**（员工明明发的就是自己的 thread_id，见变更 001 §3.2）。
-        session_id=deps.restore_session_id(
-            body.thread_id,
-            subject_type=principal.subject_type,
-            subject_id=principal.subject_id,
-        ),
-        request_id=str(getattr(request.state, "request_id", "")),
-    )
-    if actor.thread_id != body.thread_id:
-        raise ApiError(
-            422,
-            "thread_mismatch",
-            "thread_id 与当前用户派生的会话不一致",
-            detail={"expected": actor.thread_id},
-        )
-
-    graph = _graph_for(request.app, actor)
-    snapshot = await graph.aget_state(graph_config(actor.thread_id))
-    if not tuple(snapshot.next or ()):
-        raise ApiError(
-            409,
-            "nothing_to_approve",
-            "这个会话没有等待批准的敏感操作（可能已被批准、已过期，或它根本不需要批准）",
-            detail={"thread_id": actor.thread_id},
-        )
-
-    turn = await run_turn(
-        graph,
-        Command(
-            resume={
-                "approved": bool(body.approved),
-                "reason": str(body.reason or ""),
-                "approver_user_id": int(principal.user_id),
-                "approver_role": str(principal.role),
-            }
-        ),
-        thread_id=actor.thread_id,
-    )
-    if not body.approved and not turn.answer:
-        turn.state["answer"] = REJECTED_REASON
-        turn.state["blocked"] = True
-    logger.info(
-        "审批完成：thread=%s approved=%s approver=%s flow=%s",
-        actor.thread_id,
-        body.approved,
-        principal.user_id,
-        "blocked" if turn.blocked else "delivered",
-    )
-    return build_response(turn, actor=actor, settings=getattr(request.app.state, "settings", None))
+# ── HTTP：人工审批（**变更 003 删除**）───────────────────────────────────────
+#
+# `POST /api/chat/approve` 与它依赖的 `ApprovalDecision` 请求模型**已随变更 003 移除**。
+#
+# 删除理由（不是「顺手清理」）：`GATED_ROLES` 置空后图里**再也不会注册闸门节点**
+# （`builder.build_graph` 只在 `runtime.interrupts.enabled` 时 `add_node(gate)`），
+# 所以 `Turn.interrupt` 恒为 `None`，该接口在**任何角色、任何请求**下都只能返回
+# 409 `nothing_to_approve`。留着一个永远不会成功的接口，比删掉它危险得多：
+# 前端会继续为它写按钮、文档会继续把它列成可用能力、下一个人会以为「审批还能用」。
+#
+# ⚠️ 被删掉的**不是**「人机审批」这件事，而是它挂错了位置的那个实现：
+# 审批搬到了**退款单据**上（`POST /api/refunds/decision`，要 `approve:refund`），
+# 那里批准的是一笔有 id 的钱，而且批准人只能是员工 —— 客户拿不到那个权限点。
+# 图侧的原语（`InterruptPolicy` / `make_gate` / `NODE_GATE`）按决策 D2 **保留**，
+# 所以将来若要给「另一条业务」加对话轮级审批，重建的只是一个路由，不是一套机制。
+#
+# ⚠️ `build_response` 仍然会填 `approval` 与 `flow_state="approval_required"`：
+# 那是**契约**的一部分（保留原语的配套），只是当前生产路径上不可达。
 
 
 # ── WebSocket：流式问答 ──────────────────────────────────────────────────────

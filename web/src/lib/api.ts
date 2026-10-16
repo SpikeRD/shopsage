@@ -17,7 +17,15 @@ import { apiUrl } from "./config.ts";
 import {
   type ChatResponse,
   ContractError,
+  type Order,
+  type OrderList,
   parseChatResponse,
+  parseOrder,
+  parseOrderList,
+  parseRefund,
+  parseRefundList,
+  type Refund,
+  type RefundList,
 } from "./contracts.ts";
 
 /** 后端错误信封里的 `code` 的已知取值（未知的照样透传，不猜）。 */
@@ -69,14 +77,8 @@ export interface ChatOptions {
   fetchImpl?: typeof fetch;
 }
 
-export interface ApproveOptions {
-  /** **原样回传**挂起那一轮的 `thread_id`（服务端会校验它属不属于这个用户） */
-  threadId: string;
-  approved: boolean;
-  reason?: string;
-  signal?: AbortSignal;
-  fetchImpl?: typeof fetch;
-}
+// ⚠️ 变更 003 同时删除了 `ApproveOptions`（`postApprove` 的入参类型）。
+// 「请求体/查询串里绝不放身份」那条纪律不变 —— 见下面 orders / refunds 的客户端。
 
 function authHeaders(token: string): HeadersInit {
   return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
@@ -156,15 +158,10 @@ export function postChat(token: string, options: ChatOptions): Promise<ChatRespo
   );
 }
 
-/** `POST /api/chat/approve`（人工审批通道）。 */
-export function postApprove(token: string, options: ApproveOptions): Promise<ChatResponse> {
-  const body: Record<string, unknown> = { thread_id: options.threadId, approved: options.approved };
-  if (options.reason) body.reason = options.reason;
-  return postJson("/api/chat/approve", token, body, parseChatResponse, {
-    signal: options.signal,
-    fetchImpl: options.fetchImpl,
-  });
-}
+// ⚠️ **变更 003 删除了 `postApprove`**（`POST /api/chat/approve`）：
+// 那个接口允许**发起人批准自己的**敏感操作（自审批），正是需求 2 要修的问题。
+// 对客闸门整体移除后它在任何角色下都恒 409。审批搬到了**单据级**入口：
+// `postRefundDecision`（要 `approve:refund`，客户永远拿不到那个权限点）。
 
 export interface HealthPayload {
   status: string;
@@ -415,3 +412,124 @@ export const KNOWN_ROLES = [
 ] as const;
 
 export type KnownRole = (typeof KNOWN_ROLES)[number];
+
+// ── 变更 003：订单查询与退款申请/审批 ─────────────────────────────────────────
+//
+// 三条纪律（与后端契约一一对应）：
+//  1. **查询串/请求体里绝不出现 `user_id` / `role` / `decided_by`**：身份只来自令牌，
+//     后端 `extra="forbid"` 会拒掉多余字段（订单归属、审批人都不能被调用方自报）。
+//  2. **金额原样当字符串传**：后端收 `str | float | int`，但前端**只发字符串** ——
+//     避免 `Number` 往返把 `0.1+0.2` 那类二进制尾巴带回去。
+//  3. **错误走同一套解析**（`toApiError`）：前端只按 `code` 分支，不按中文文案。
+
+async function getJson<T>(
+  path: string,
+  token: string,
+  parse: (value: unknown) => T,
+  options: { signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
+): Promise<T> {
+  const doFetch = options.fetchImpl ?? fetch;
+  const response = await doFetch(apiUrl(path), {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: options.signal,
+  });
+  if (!response.ok) throw await toApiError(response);
+  const payload: unknown = await response.json();
+  try {
+    return parse(payload);
+  } catch (exc) {
+    if (exc instanceof ContractError) {
+      throw new ApiError({
+        status: response.status,
+        code: "contract_mismatch",
+        message: `响应不符合契约：${exc.message}`,
+        requestId: response.headers.get("X-Request-Id") ?? "",
+      });
+    }
+    throw exc;
+  }
+}
+
+/** `GET /api/orders`：我的订单列表（行级过滤在后端，前端传不了别人的 user_id）。 */
+export function getOrders(
+  token: string,
+  options: { limit?: number; signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
+): Promise<OrderList> {
+  const query = options.limit ? `?limit=${encodeURIComponent(String(options.limit))}` : "";
+  return getJson(`/api/orders${query}`, token, parseOrderList, options);
+}
+
+/** `GET /api/orders/{order_id}`：单笔订单详情。 */
+export function getOrder(
+  token: string,
+  orderId: number,
+  options: { signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
+): Promise<Order> {
+  return getJson(`/api/orders/${encodeURIComponent(String(orderId))}`, token, parseOrder, options);
+}
+
+export interface RefundRequestInput {
+  orderId: number;
+  /** **字符串**形式（`"58.00"`）。后端收数字也行，但字符串不会引入浮点误差。 */
+  amount: string;
+  reason?: string | null;
+  /** 幂等键：**打开表单时生成一次**，同一次提交重复点只落一单。 */
+  idempotencyKey: string;
+}
+
+/** `POST /api/refunds`：客户提交退款申请（要 `request:refund`；只能产出 `requested`）。 */
+export function postRefundRequest(
+  token: string,
+  input: RefundRequestInput,
+  options: { signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
+): Promise<Refund> {
+  const body: Record<string, unknown> = {
+    order_id: input.orderId,
+    amount: input.amount,
+    idempotency_key: input.idempotencyKey,
+  };
+  // 空备注**不要**发 `reason: null`：语义上「没填」与「填了个 null」不同，
+  // 省掉键更干净（与 `postChat` 的 `session_id` 同一条口径）。
+  if (input.reason) body.reason = input.reason;
+  return postJson("/api/refunds", token, body, parseRefund, options);
+}
+
+export interface RefundQuery {
+  refundId?: number;
+  orderId?: number;
+  userId?: number;
+  /** 状态可多选（后端用重复的 `?status=` 收，与它的 `Query(list[str])` 对应） */
+  statuses?: readonly string[];
+  createdFrom?: string;
+  createdTo?: string;
+  limit?: number;
+}
+
+/** `GET /api/refunds`：员工查询退款单（要 `approve:refund`，客户会被后端按 404 拒）。 */
+export function getRefunds(
+  token: string,
+  query: RefundQuery = {},
+  options: { signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
+): Promise<RefundList> {
+  const params = new URLSearchParams();
+  if (query.refundId) params.set("refund_id", String(query.refundId));
+  if (query.orderId) params.set("order_id", String(query.orderId));
+  if (query.userId) params.set("user_id", String(query.userId));
+  for (const status of query.statuses ?? []) params.append("status", status);
+  if (query.createdFrom) params.set("created_from", query.createdFrom);
+  if (query.createdTo) params.set("created_to", query.createdTo);
+  if (query.limit) params.set("limit", String(query.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return getJson(`/api/refunds${suffix}`, token, parseRefundList, options);
+}
+
+/** `POST /api/refunds/decision`：员工审批（退款单号在**请求体**里，理由见后端注释）。 */
+export function postRefundDecision(
+  token: string,
+  input: { refundId: number; decision: "approve" | "reject"; note?: string | null },
+  options: { signal?: AbortSignal; fetchImpl?: typeof fetch } = {},
+): Promise<Refund> {
+  const body: Record<string, unknown> = { refund_id: input.refundId, decision: input.decision };
+  if (input.note) body.note = input.note;
+  return postJson("/api/refunds/decision", token, body, parseRefund, options);
+}

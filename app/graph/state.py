@@ -106,6 +106,9 @@ class GraphStateDoc(TypedDict, total=False):
     answer: Annotated[str, LastValue]
     citations: Annotated[list[str], LastValue]
     refusals: Annotated[list[str], LastValue]
+    #: 退款申请的结果（变更 003；`refund` 节点写、synthesis 读回去渲染）。
+    #: 语义与形状见 `app/agents/state.GraphState.refund`（字段的真源在那边）。
+    refund: Annotated[dict[str, Any], LastValue]
 
     # ── 护栏（横切）──────────────────────────────────────────────────────────
     blocked: Annotated[bool, LastValue]
@@ -162,8 +165,20 @@ NODE_SYNTHESIS: Final[str] = "synthesis"
 #: 宁可让收尾动作落在已经存在的节点里（它本来就知道这一轮是否通过），
 #: 也不要为了一个动作多一个节点、并把图的可检查性赔进去。
 NODE_GUARDRAIL_OUTPUT: Final[str] = "guardrail_output"
+#: 退款申请节点（**变更 003 新增**）：对客「我要退款」的唯一写路径。
+#:
+#: ⚠️ 它是本仓**第一个真正的写节点**（`ticket` 那条路至今只到 synthesis）。
+#: 写节点进图必须想清三件事，三件都落在 `app/agents/refund.py` 里：
+#:   ① 它只能做**一件事**（申请退款 = 建 `requested`），不能顺手改成别的状态；
+#:   ② **重放幂等**：图会从断点重放，节点可能跑两次，所以幂等键必须确定性派生；
+#:   ③ **失败怎么收场**：业务拒绝（订单不可退、超额）要如实说给客户，
+#:      而库故障要按网络型节点处置（记 refusal 继续），不能把这一轮打成 500。
+NODE_REFUND_REQUEST: Final[str] = "refund_request"
 #: 人工审批闸门（`InterruptPolicy.enabled` 为真时才注册，见 `builder.build_graph`）。
 #: 挂在 router 之后、处理节点之前：敏感操作要**在花任何代价之前**停住。
+#:
+#: ⚠️ 变更 003 之后 `GATED_ROLES` 是空集，所以这条节点在生产路径上**永不注册**。
+#: 保留常量与原语的理由见 `app/graph/config.GATED_ROLES`（决策 D2）。
 NODE_GATE: Final[str] = "gate"
 
 #: `route` → **第一个要跑的**节点名（条件边的 `path_map`）。取值域见 `app.agents.state.ROUTES`。
@@ -184,6 +199,11 @@ ROUTE_NODES: Final[dict[str, str]] = {
     # 现在两者都直达 synthesis —— synthesis 会照着 `refusals` 如实作答，
     # 于是「工单能力还没接上」是一句实话，而不是一个 500。
     "ticket": NODE_SYNTHESIS,
+    # ⚠️ 变更 003：`refund` **不再**直达 synthesis，而是进真正的写节点。
+    # 这是本仓第一条「对客一次对话产生一次数据库写入」的路径。
+    # 它**必须**经过 refund_request，而不是让 synthesis 去描述「我建议你去退款」——
+    # 需求 2 要的是「客户一句话就能申请退款」，而一句话能落库的前提是图里有写节点。
+    "refund": NODE_REFUND_REQUEST,
     "final": NODE_SYNTHESIS,
 }
 
@@ -264,6 +284,7 @@ __all__ = [
     "NODE_GUARDRAIL_INPUT",
     "NODE_GUARDRAIL_OUTPUT",
     "NODE_RAG",
+    "NODE_REFUND_REQUEST",
     "NODE_ROUTER",
     "NODE_SYNTHESIS",
     "ROUTE_NODES",

@@ -29,6 +29,11 @@ TOOLS_DIR = Path(tools_pkg.__file__).parent
 _EXCLUDED = {
     "PermanentToolError",
     "RefundNotAllowed",
+    # 变更 003：新增的异常类与返回值 dataclass。它们与 `RefundNotAllowed` / `RefundRef`
+    # 同一性质（**不是工具函数**），所以加进同一份排除表 —— 而不是给它们造一个
+    # 「假的 caller 参数」去骗过形状检查（那会让一个返回值类型看起来像个可调用工具）。
+    "RefundNotDecidable",
+    "RefundView",
     "RefundRef",
     "RetryableToolError",
     "RetrievedDoc",

@@ -93,7 +93,10 @@ DEFAULT_RULES: Final[dict[str, RateLimitRule]] = {
     # 一条 WS 连接占一个长连接名额，不限流就是最简单的资源耗尽攻击面。
     "chat.stream": RateLimitRule(limit=60, window_seconds=60.0),
     # 批准通道：写操作的手工确认，频次天然很低；给个明确的小额度而不是不限。
-    "chat.approve": RateLimitRule(limit=20, window_seconds=60.0),
+    # ⚠️ 变更 003 起 `chat.approve` 这条额度**已随接口一起删除**（对客闸门整体移除）。
+    # 保留一个没有任何路径指向的额度常量，只会让 `SCOPE_BY_ROUTE/.env.example/
+    # DEFAULT_RULES` 三处的「哪些接口受限流」出现分歧 —— 那正是本模块 docstring
+    # 第一段要防的事。
     # 长任务提交（第 12 步）：**比 chat 更严**。一次提交换来一个后台长任务
     # （几分钟、若干次模型调用），而被滥用的代价落在**队列**上 ——
     # 积压会让所有人的任务一起变慢，不像 chat 那样只影响调用者自己。
@@ -112,6 +115,14 @@ DEFAULT_RULES: Final[dict[str, RateLimitRule]] = {
     # 刷新：比登录松（它是正常用户的常规动作，14 天有效期内每天可能刷几次），
     # 但仍要封顶 —— 否则它就是一个「可无限尝试的凭证校验口」。
     "auth.refresh": RateLimitRule(limit=60, window_seconds=300.0),
+    # ── 变更 003：退款申请与审批 ──────────────────────────────────────────────
+    # 申请：偏紧。一次调用会在库里多一行、并**占用该订单的可退额度**（有限资源）。
+    # 20 次/分钟对人绰绰有余（正常客户一次退款只点一次），对脚本则压得住
+    # 「把某客户所有订单在几秒内全申请一遍」这种灌库行为。
+    "refunds.request": RateLimitRule(limit=20, window_seconds=60.0),
+    # 审批：比申请更松但仍有上限（一线客服批量处理待办是正常动作，
+    # 一个人一分钟点十几个「通过」完全可能；而它封的是脚本化的批量改状态）。
+    "refunds.decide": RateLimitRule(limit=60, window_seconds=60.0),
 }
 
 

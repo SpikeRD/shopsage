@@ -225,3 +225,84 @@ async def test_guardrail_output_blocks_truncated_data_misuse() -> None:
 
     assert out["blocked"] is True
     assert "业务数据：3 行" in llm.last_prompt()
+
+
+# ── 变更 003：判定者拿到的「材料摘要」必须包含退款申请的结果 ──────────────────
+
+
+async def test_guardrail_digest_includes_submitted_refund() -> None:
+    """★退款申请的结果必须进「材料摘要」，否则**每一次 LLM 路径的退款回答都会被误拦**。
+
+    ## 这条用例防的是一个实测踩到的假阳性
+
+    对客退款路径**不查 SQL、不检索知识库**，所以 `rows` 与 `docs` 都是 0。
+    第一版的材料摘要只报「业务数据 0 行 / 知识库 0 条 / 分析结论 无」——
+    而回答里出现了「退款单号 28、订单 12、金额 12346.75 元」。
+    判定者据此判定「回答编造/越权」，把一次**真实的**提交结果拦了下来。
+
+    判定者的推理其实是对的：按它拿到的材料，那些数字确实没有来源。
+    错在我们漏喂了「本次已经受理了一笔退款」这条事实。
+    所以修法是**补事实**，而不是降低审查强度 —— 这条用例把那个事实钉住。
+    """
+    state = state_of("帮我申请一笔退款")
+    state["refund"] = {
+        "status": "submitted",
+        "refund_id": 28,
+        "order_id": 12,
+        "amount": "12346.75",
+        "state": "requested",
+        "remaining_after": "0.00",
+    }
+    state["answer"] = "您的退款申请已提交：退款单号 28，订单 12，金额 12346.75 元，等待审核。"
+    llm = FakeLLM({"allowed": True, "reason": "与已受理的退款一致"})
+
+    out = await guardrail_node(state, stage="output", llm=llm)
+
+    assert out["blocked"] is False, "退款结果是系统写入的真实记录，不该被当成编造拦下"
+    prompt = llm.last_prompt()
+    assert "退款单号 28" in prompt, "材料摘要里没有退款单号：判定者会认为那是编造"
+    assert "12" in prompt and "12346.75" in prompt
+    assert "本次已受理" in prompt, "要明确告诉判定者这是**已发生**的事实，而不是推测"
+
+
+async def test_guardrail_digest_says_when_refund_was_not_submitted() -> None:
+    """`needs_order_id` / `refused` 也要如实进摘要：判定者要能看出「这件事**没**做成」。
+
+    只写「已受理」那一支是不够的：如果摘要只说「有退款结果」而回答声称「已提交」，
+    判定者就无法分辨「真的提交了」与「其实在追问订单号，模型却谎称已提交」。
+    """
+    state = state_of("帮我退款")
+    state["refund"] = {"status": "needs_order_id", "candidates": [1024, 1025], "hint": "问客户"}
+    state["answer"] = "请问您要退哪一笔？"
+    llm = FakeLLM({"allowed": True, "reason": "ok"})
+
+    out = await guardrail_node(state, stage="output", llm=llm)
+
+    assert out["blocked"] is False
+    prompt = llm.last_prompt()
+    assert "尚未提交" in prompt, "没落库时必须说「尚未提交」，否则模型谎称已提交不会被发现"
+    assert "1024" in prompt and "1025" in prompt
+
+
+async def test_guardrail_digest_unchanged_when_no_refund() -> None:
+    """没有退款结果时摘要**不多出**任何一行（不让无关轮次被这条新逻辑影响）。
+
+    ⚠️ 断言对象是 `_materials_digest(state)` 的**产物**，而不是整条 prompt：
+    判定者的 system prompt 里本来就写着「退款」这类业务词（它要解释判定口径），
+    对整条 prompt 断言 `"退款" not in prompt` 会恒假 —— 那是断言写错了，
+    不是代码有问题。
+    """
+    from app.agents.guardrail import _materials_digest
+
+    state = state_of("我的订单到哪了")
+    state["answer"] = "你有一笔订单。"
+
+    digest = _materials_digest(state)
+
+    assert "退款" not in digest, "这一轮没有退款，摘要里不该出现退款相关行"
+    # 四行基线仍在（这条新逻辑没有动到原有内容）
+    assert "业务数据" in digest and "知识库片段" in digest
+
+    # 有退款结果时才多出那一行
+    state["refund"] = {"status": "submitted", "refund_id": 1, "order_id": 2, "amount": "1.00"}
+    assert "退款" in _materials_digest(state)

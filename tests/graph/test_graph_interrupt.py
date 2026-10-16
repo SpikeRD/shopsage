@@ -35,15 +35,18 @@ from app.graph import (
     NODE_GUARDRAIL_OUTPUT,
     NODE_ROUTER,
     NODE_SYNTHESIS,
+    GATED_ROLES,
     GraphRuntime,
     InterruptPolicy,
     REJECTED_REASON,
     SENSITIVE_ROUTES,
     compile_graph,
     graph_config,
+    interrupt_policy_for,
     run_turn,
 )
 from app.graph.routing import after_gate, after_router_gate, should_gate
+from app.security.rbac import ROLE_PERMISSIONS
 from tests.graph_helpers import AgentFakeLLM, build_test_graph, customer_state, fake_query_result
 
 
@@ -61,18 +64,54 @@ def _llm(route: str, answer: str = "已为你登记。") -> AgentFakeLLM:
 
 
 # ── 策略（纯函数，不需要跑图）───────────────────────────────────────────────
+#
+# ⚠️ **变更 003 之后本文件测的是「原语本身」，不再是「生产默认行为」**。
+#
+# 生产默认已经关死（`GATED_ROLES = frozenset()`、`SENSITIVE_ROUTES = ()`），
+# 所以「哪个角色会被闸门拦住」这类断言不再成立 —— 现在**没有任何角色**会被拦。
+# 但闸门这套**机制**（`interrupt()` 真挂起 + `Command(resume=...)` 恢复 +
+# fail-closed 的收尾）按变更 003 的决策 D2 **保留**，所以本文件改为：
+#
+#   * 一条用例钉住「生产默认确实是关的」（防止有人无意中把它打开）；
+#   * 其余用例**显式**传入 `InterruptPolicy(enabled=True, routes=("ticket",))`，
+#     继续验证机制本身可用。
+#
+# 这样做的价值：机制仍有覆盖（将来真需要「另一个人批准才能继续的一轮对话」时，
+# 它是现成且已验证的），而「现在到底拦不拦」这件事也有一处明确的断言。
 
 
-def test_policy_is_off_by_default() -> None:
-    """默认**关闭**：中断会改变 `ainvoke` 的返回形态，默认打开会让所有调用方都得处理它。"""
+def test_policy_is_off_by_default_and_production_has_no_gated_role() -> None:
+    """★变更 003 的核心断言：**生产默认下对客不会被拦在任何闸门上**。
+
+    变更 003 之前这里断言的是 `SENSITIVE_ROUTES == ("ticket",)` ——
+    而那条默认配合 `GATED_ROLES={customer}` 的实际效果是
+    「**客户自己点按钮批准自己的敏感操作**」（`POST /api/chat/approve` 的调用者
+    就是发起人）。那不是人机审批，是自审批，正是需求 2 要修的问题。
+
+    现在两条都清空，并额外断言「任何角色都不会被判定为需要过闸门」——
+    这一条比只断言常量值更强：它直接验证了**行为**（没有任何角色会被拦住）。
+    """
     policy = InterruptPolicy()
     assert policy.enabled is False
     assert policy.requires_approval({"route": "ticket"}) is False
-    assert SENSITIVE_ROUTES == ("ticket",)
+    assert SENSITIVE_ROUTES == (), "变更 003 起生产默认不再有任何敏感 route"
+    assert GATED_ROLES == frozenset(), "变更 003 起没有任何角色需要过对话轮闸门"
+    # 行为级断言：把所有已登记角色挨个问一遍，都不该被拦
+    for role in ROLE_PERMISSIONS:
+        assert interrupt_policy_for(role).enabled is False, (
+            f"角色 {role} 在生产默认下被判定为需要过闸门 —— "
+            "变更 003 已经把审批搬到退款单据上（/api/refunds/decision），"
+            "对话轮闸门不该再对任何角色生效"
+        )
 
 
 def test_policy_flags_only_sensitive_routes_when_enabled() -> None:
-    policy = InterruptPolicy(enabled=True)
+    """**显式**开启闸门时，只有 `routes` 里列出的 route 才停（原语仍然可用）。
+
+    ⚠️ `routes=` 必须显式传：生产默认的 `SENSITIVE_ROUTES` 已是空元组，
+    不传就等于「开了闸门但什么都不拦」，那样这条用例会退化成同义反复。
+    """
+    policy = InterruptPolicy(enabled=True, routes=("ticket",))
     assert policy.requires_approval({"route": "ticket"}) is True
     assert policy.requires_approval({"route": "data"}) is False
     assert policy.requires_approval({}) is False, "没有 route 时不该停（router 还没跑）"
@@ -80,7 +119,7 @@ def test_policy_flags_only_sensitive_routes_when_enabled() -> None:
 
 def test_gate_appears_only_where_the_policy_says_so() -> None:
     """闸门的位置：`router` 之后、处理节点之前（在花任何代价之前停住）。"""
-    runtime = GraphRuntime(interrupts=InterruptPolicy(enabled=True))
+    runtime = GraphRuntime(interrupts=InterruptPolicy(enabled=True, routes=("ticket",)))
     assert after_router_gate(runtime)({"route": "ticket"}) == NODE_GATE
     assert after_router_gate(runtime)({"route": "data"}) == NODE_DATA
     assert should_gate(runtime, {"route": "ticket"}) is True
@@ -100,16 +139,19 @@ async def test_sensitive_route_is_gated_until_someone_approves() -> None:
     对客路径上一句「这件事没办成」远好于「悄悄办成了但没人批」。
 
     ⚠️ 与第 8 步交付时的差别（第 9 步改的）：那时闸门是「记录 + 拒绝」，
-    因为还没有批准通道；现在 `POST /api/chat/approve` 落地了，闸门改成
+    因为还没有批准通道；第 9 步加了 `POST /api/chat/approve`，闸门改成
     **真的 `interrupt()` 挂起** —— 挂起时 checkpoint 停在 `gate`，
-    `Turn.interrupt` 带出「问审批人的那句话」，用户得到的是一句
-    「需要人工确认」而不是「已按未执行处理」（后者是**没人批**的结论，
-    而现在还没人做出决定）。
+    `Turn.interrupt` 带出「问审批人的那句话」。
+
+    ⚠️ 变更 003 再改一处：**那个批准接口已经被删除**（它允许发起人批准自己的操作）。
+    本条用例仍然保留，因为它验的是**图能不能真的停下来** —— 那是框架级能力，
+    与「谁有权批准」是两回事。生产路径上闸门不再注册（`GATED_ROLES` 空集），
+    所以这里显式构造策略。
     """
     fake = _llm("ticket", answer="这项操作已经为你执行。")
     graph = compile_graph(
         InMemorySaver(),
-        GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True)),
+        GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True, routes=("ticket",))),
     )
     turn = await run_turn(graph, customer_state("帮我投诉物流"), thread_id="t-ticket")
 
@@ -124,7 +166,7 @@ async def test_sensitive_route_is_gated_until_someone_approves() -> None:
     assert NODE_SYNTHESIS not in turn.visited, "挂起时不该合成回答（这一轮还没结论）"
     assert "data" not in turn.visited, "闸门之后不该再查库（敏感操作还没被批准）"
 
-    snapshot = await graph.aget_state(graph_config("t-ticket"))
+    snapshot = await aget_state_safe(graph, "t-ticket")
     assert snapshot.next == (NODE_GATE,), "checkpoint 必须停在闸门上（这是可恢复的前提）"
 
 
@@ -152,7 +194,7 @@ async def test_resuming_the_gate_decides_the_outcome(
     fake = _llm("ticket", answer="这项操作已经为你执行。")
     graph = compile_graph(
         InMemorySaver(),
-        GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True)),
+        GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True, routes=("ticket",))),
     )
     thread = f"t-gate-{'yes' if approved else 'no'}"
     await run_turn(graph, customer_state("帮我投诉物流"), thread_id=thread)
@@ -171,6 +213,11 @@ async def test_resuming_the_gate_decides_the_outcome(
     assert turn.answer.strip(), "无论批准与否，用户都要拿到一句话"
 
 
+async def aget_state_safe(graph: Any, thread_id: str) -> Any:
+    """`graph.aget_state(graph_config(...))` 的小包装（本文件多处要用，收成一处）。"""
+    return await graph.aget_state(graph_config(thread_id))
+
+
 async def test_non_sensitive_route_bypasses_the_gate_entirely(monkeypatch: pytest.MonkeyPatch) -> None:
     """闸门开着时，**普通分支连闸门节点都不进**（闸门不是「一律先停一下」）。
 
@@ -186,7 +233,7 @@ async def test_non_sensitive_route_bypasses_the_gate_entirely(monkeypatch: pytes
     fake = _llm("data", answer="你有一笔订单。")
     graph = compile_graph(
         InMemorySaver(),
-        GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True)),
+        GraphRuntime(llm=fake, interrupts=InterruptPolicy(enabled=True, routes=("ticket",))),
     )
     turn = await run_turn(graph, customer_state("我的订单到哪了"), thread_id="t-data-gate")
 

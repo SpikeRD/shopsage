@@ -1,14 +1,24 @@
 """编译 LangGraph 图：`8.graph.md` §4 的拓扑在这里落成代码，并把上面几个模块接起来。
 
-拓扑（`guardrail 横切` + `router 三选一` + `synthesis 收口`）：
+拓扑（`guardrail 横切` + `router 四选一` + `synthesis 收口`）：
 
 ```
 START → guardrail_input ─┬─(blocked)──────────────────────────────────────→ END
                          └─→ router ─┬─ data ─────┐
-                                     ├─ rag ──────┼─→ synthesis → guardrail_output ─┬─→ finish → END
-                                     ├─ analysis ─┘                                 └─(blocked)→ END
+                                     ├─ rag ──────┤
+                                     ├─ refund_request ─┤   ← 变更 003：唯一写节点
+                                     ├─ analysis ─┘
                                      └─ ticket / final ───────────────────────────┘
+                                                    → synthesis → guardrail_output ─┬─→ END
+                                                                                    └─(blocked)→ END
 ```
+
+⚠️ 变更 003 的两处结构变化（都会在上面这张图里体现）：
+1. **新增 `refund_request` 分支**（`route=refund`）：对客「我要退款」第一次有了真写路径。
+   它汇到 synthesis —— 由合成节点把「已受理，单号 N」或「这单不能退，因为…」说给客户。
+2. **`gate` 节点在默认图上不再出现**（`GATED_ROLES` 为空集）：变更 003 之前对客路径会
+   在 `router` 之后插一道闸门，而批准人就是**发起人自己**。现在审批搬到退款单据上
+   （`/api/refunds/decision`，要 `approve:refund`）。原语保留，见决策 D2。
 
 与 `8.graph.md` §4 第 1 条逐一对应：
 
@@ -67,6 +77,7 @@ from app.graph.state import (
     NODE_GUARDRAIL_INPUT,
     NODE_GUARDRAIL_OUTPUT,
     NODE_RAG,
+    NODE_REFUND_REQUEST,
     NODE_ROUTER,
     NODE_SYNTHESIS,
     ROUTE_NODES,
@@ -116,7 +127,7 @@ def build_graph(runtime: GraphRuntime | None = None) -> StateGraph:
         )
     else:
         builder.add_conditional_edges(NODE_ROUTER, route_by_intent, _route_map())
-    for producer in (NODE_RAG, NODE_ANALYSIS):
+    for producer in (NODE_RAG, NODE_ANALYSIS, NODE_REFUND_REQUEST):
         builder.add_edge(producer, NODE_SYNTHESIS)
     # `data` 是个**岔路口**：`route=analysis` 时接着做分析，其余直接进 synthesis；
     # 被兜底标死（`blocked`）时直接结束（理由见 `routing.after_data`）。
@@ -165,15 +176,42 @@ def graph_config(thread_id: str, **extra: Any) -> dict[str, Any]:
 
 
 def _route_map() -> dict[str, str]:
-    """`route_by_intent` 可能返回的**全部**目的地 → 真实节点名。
+    """条件边的**目的地映射**：`{分支函数的返回值: 真实节点名}`。
 
-    ⚠️ 必须包含 `synthesis`：`ROUTE_NODES` 里 `ticket` / `final` 的目标就是它，
-    而 `route_by_intent` 在「route 未知」时也会落到它。LangGraph 对「分支函数返回了
-    映射里没有的键」是直接 `KeyError`（**编译期不报**，跑到那一步才炸）——
-    实测漏掉它的症状是 `KeyError: 'synthesis'`，且只在走 `final` 分支时出现
-    （`你好` 这种最无害的问题反而崩，见 runbook §10.1 坑 4）。
+    ## ⚠️ 这里有一个只有「新增 route」时才会暴露的坑（变更 003 实测踩到）
+
+    `route_by_intent` 返回的是**节点名**（`ROUTE_NODES.get(route)` 的**值**），
+    不是 route 名。所以映射表的**键必须是节点名**：
+
+    ```python
+    # ❌ 错的（变更 003 之前一直是这样，而它「看起来能用」）
+    {**ROUTE_NODES, NODE_SYNTHESIS: NODE_SYNTHESIS}
+    # → {"data": "data", "rag": "rag", "analysis": "data", "ticket": "synthesis",
+    #    "refund": "refund_request", "final": "synthesis", "synthesis": "synthesis"}
+    #    键是 **route 名**，值是节点名。
+    ```
+
+    对 `data` / `rag` / `synthesis` 而言键与值**恰好相同**，所以一直没暴露；
+    而 `route=refund` 的返回值是 `"refund_request"` —— 它不是这张表的键，
+    于是 LangGraph 在 `_branch.py::_finish` 里 `self.ends["refund_request"]` 直接抛
+    `KeyError: 'refund_request'`（**运行期**，不是编译期：
+    编译只检查「映射的**值**是不是已注册节点」，不检查「分支函数会不会返回映射里没有的键」）。
+
+    症状极具误导性：route 判对了（`route=refund` 能看见）、节点也注册了、
+    `graph.get_graph()` 的边表**完全正确**（`router → refund_request` 在），
+    但真跑一轮就 `KeyError`，最终表现为用户拿到一句空回答。
+
+    正确写法是「把分支函数**所有可能的返回值**当作键」，即
+    `set(ROUTE_NODES.values()) | {NODE_SYNTHESIS}` —— 两者都取**节点名**。
+
+    ## 为什么必须包含 `synthesis`
+
+    `ticket` / `final` 的目的地就是 `synthesis`，而 `route_by_intent` 在
+    「route 是野值」时也会兜到它。漏掉它的症状同样是运行期 `KeyError`
+    （历史上 `你好` 这种最无害的问题反而崩，见 runbook §10.1 坑 4）。
     """
-    return {**ROUTE_NODES, NODE_SYNTHESIS: NODE_SYNTHESIS}
+    targets = set(ROUTE_NODES.values()) | {NODE_SYNTHESIS}
+    return {node: node for node in targets}
 
 
 __all__ = [

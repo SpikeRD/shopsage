@@ -19,7 +19,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.security.rbac import PermissionDenied
+from app.security.rbac import PERM_APPROVE_REFUND, PERM_REQUEST_REFUND, PermissionDenied
 from app.tools.audit import audit_records
 from app.tools.errors import PermanentToolError, ToolContractError
 from app.tools.refund import (
@@ -27,7 +27,12 @@ from app.tools.refund import (
     RefundNotAllowed,
     RefundRef,
     create_refund_request,
+    decide_refund,
     get_refund_status,
+    list_refunds_for_review,
+    llm_refund_key,
+    remaining_refundable,
+    request_refund,
 )
 from tests.tools_helpers import (
     cleanup_tool_rows,
@@ -324,3 +329,240 @@ def test_refund_audit_records_amount_and_flags(clean_writes, refundable_order, s
     assert records[0]["args"]["amount"] == "Decimal('2.00')"  # 审计里金额以字符串形式可读
     assert records[0]["details"]["order_status"] in REFUNDABLE_ORDER_STATUSES
     assert records[0]["caller"] == "api:chat"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 变更 003：客户自助申请（request_refund）与员工审批（decide_refund）
+#
+# 这一节的用例对应需求 2/3，重点不在「能不能跑」，而在四条边界：
+#   ① 客户能申请、但**批不了**（权限点分离：request:refund vs approve:refund）；
+#   ② 客户自助申请**永远建不出** approved/rejected —— 状态由核心写死；
+#   ③ 审批的状态机只有一条（requested → approved/rejected），其余 409；
+#   ④ 审批留痕真落库（谁批的、何时、什么角色、什么意见）。
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_customer_can_request_but_cannot_decide() -> None:
+    """★变更 003 的核心分离：客户有 `request:refund`，**没有** `approve:refund`。
+
+    这是「客户不能自己批准自己的退款」在**权限表**层的判据。
+    HTTP 层的对应判据在 `tests/api/test_authorization.py::test_customer_cannot_decide_their_own_refund`。
+    """
+    from app.security.rbac import PERM_APPROVE_REFUND, PERM_REQUEST_REFUND, permissions_for
+
+    customer = permissions_for("customer")
+    assert PERM_REQUEST_REFUND in customer
+    assert PERM_APPROVE_REFUND not in customer, "客户拿到审批权就等于可以自审批（需求 2 要修的就是它）"
+    # 反向：审批权确实给了该给的角色（否则「员工能批」这条不成立）
+    for role in ("customer_service", "internal_employee", "manager", "finance_auditor", "admin"):
+        assert PERM_APPROVE_REFUND in permissions_for(role), f"{role} 没有审批权"
+
+
+def test_request_refund_rejects_role_without_permission() -> None:
+    """没有 `request:refund` 的角色（例如未登记角色）→ `PermissionDenied`。"""
+    with pytest.raises(PermissionDenied) as excinfo:
+        request_refund(1, 1, Decimal("1.00"), idempotency_key=tool_key("req-guest"), caller=CALLER, role="guest")
+    assert excinfo.value.missing == (PERM_REQUEST_REFUND,)
+
+
+def test_decide_refund_rejects_customer_role() -> None:
+    """★客户角色调审批 → `PermissionDenied`（缺 `approve:refund`）。"""
+    with pytest.raises(PermissionDenied) as excinfo:
+        decide_refund(1, decision="approve", caller=CALLER, role="customer")
+    assert excinfo.value.missing == (PERM_APPROVE_REFUND,)
+
+
+def test_decide_refund_rejects_bad_decision_value() -> None:
+    """`decision` 只接受 approve/reject（形状问题 → `ToolContractError`，不是 500）。"""
+    with pytest.raises(ToolContractError):
+        decide_refund(1, decision="maybe", caller=CALLER, role="customer_service")
+
+
+def test_llm_refund_key_is_deterministic() -> None:
+    """★图侧幂等键：**确定性**（重放安全）。
+
+    三条断言，每条都对应一类真实故障：
+      ① 同样入参 → 同样输出（否则图重放会建出两张退款单）；
+      ② 长度与字符集合规（列宽 64 + `validate_idempotency_key` 的字符集）；
+      ③ 不同的客户原话 / 不同的订单 → 不同的键
+         （客户改了理由再申请是一次**新**意图，不该被静默吞掉）。
+
+    ⚠️ 键里**不含金额**（第一版含了，被重放用例抓出来）：重放时额度已被第一次占满，
+    「剩余可退额度」算出来是 0，含金额的键在重放时**算不出同一个值**，
+    于是永远命中不了按键回查的那一步。理由写在 `llm_refund_key` 的 docstring。
+    """
+    first = llm_refund_key(subject="c2", order_id=7, message="我要退款")
+    assert first == llm_refund_key(subject="c2", order_id=7, message="我要退款"), "不确定的键 = 重放会多退钱"
+    assert first.startswith("llm-")
+    assert len(first) <= 64, "超过 idempotency_key 的列宽（VARCHAR(64)）"
+    assert first.isascii() and all(ch.isalnum() or ch in "-._:" for ch in first), (
+        "键里有非法字符：`validate_idempotency_key` 只允许 [A-Za-z0-9._:-]"
+    )
+    assert first != llm_refund_key(subject="c2", order_id=7, message="这单退了"), "换了理由应当是新的意图"
+    assert first != llm_refund_key(subject="c2", order_id=8, message="我要退款"), "换了订单必须是不同的键"
+    assert first != llm_refund_key(subject="c3", order_id=7, message="我要退款"), "换了客户必须是不同的键"
+
+
+@pytest.mark.db
+def test_request_refund_creates_requested_only(clean_writes, refundable_order, seeded):
+    """★客户自助申请**只能**建 `requested`：库里的状态就是它。"""
+    order_id, user_id, _total, remaining = refundable_order
+    ref = request_refund(
+        user_id,
+        order_id,
+        Decimal("1.00"),
+        idempotency_key=tool_key("req-status"),
+        caller=CALLER,
+        role="customer",
+    )
+    assert ref.status == "requested", f"客户自助申请建出了 {ref.status}，而它只该是 requested"
+    assert remaining >= Decimal("1.00")
+
+
+@pytest.mark.db
+def test_request_refund_is_idempotent(clean_writes, refundable_order, seeded):
+    """同一个键重复申请只落一行（A2 在客户自助路径上同样成立）。"""
+    order_id, user_id, _total, _remaining = refundable_order
+    key = tool_key("req-idem")
+    first = request_refund(user_id, order_id, Decimal("1.00"), idempotency_key=key, caller=CALLER, role="customer")
+    second = request_refund(user_id, order_id, Decimal("1.00"), idempotency_key=key, caller=CALLER, role="customer")
+    assert first.refund_id == second.refund_id
+    assert count_refunds(key) == 1
+
+
+@pytest.mark.db
+def test_decide_refund_approve_then_redecide_is_conflict(clean_writes, refundable_order, seeded):
+    """★审批状态机：`requested → approved` 成功；**再次决策 409**（不是静默覆盖）。
+
+    这条防的是「两个员工同时点通过」与「重复点击」两种真实场景：
+    第二次必须被明确拒绝并带上当前状态，让前端刷新 —— 而不是覆盖掉第一次的审批留痕。
+    """
+    from app.tools.refund import RefundNotDecidable
+
+    order_id, user_id, _total, _remaining = refundable_order
+    created = request_refund(
+        user_id, order_id, Decimal("1.00"), idempotency_key=tool_key("dec-1"), caller=CALLER, role="customer"
+    )
+
+    approved = decide_refund(
+        created.refund_id,
+        decision="approve",
+        note="已核实",
+        decider_subject_id=2,
+        decider_subject_type="employee",
+        caller=CALLER,
+        role="customer_service",
+    )
+    assert approved.status == "approved"
+    assert approved.decided_by == 2
+    assert approved.approver_role == "customer_service"
+    assert approved.decided_at is not None
+    assert approved.decision_note == "已核实"
+
+    with pytest.raises(RefundNotDecidable) as excinfo:
+        decide_refund(
+            created.refund_id,
+            decision="reject",
+            decider_subject_id=2,
+            decider_subject_type="employee",
+            caller=CALLER,
+            role="customer_service",
+        )
+    assert excinfo.value.status == "approved", "冲突时必须带上当前状态（前端据此刷新）"
+    assert excinfo.value.refund_id == created.refund_id
+
+
+@pytest.mark.db
+def test_decide_refund_reject_frees_the_quota(clean_writes, refundable_order, seeded):
+    """被驳回的退款**不再占用额度**：`CONSUMING_REFUND_STATUSES` 不含 rejected。
+
+    这条把「驳回」与「通过」在**账**上的差别钉住：驳回之后客户可以再申请一次
+    （剩下多少钱，就是原来的额度）。
+    """
+    order_id, user_id, _total, remaining = refundable_order
+    created = request_refund(
+        user_id, order_id, Decimal("1.00"), idempotency_key=tool_key("dec-rej"), caller=CALLER, role="customer"
+    )
+    assert remaining_refundable(user_id, order_id) == remaining - Decimal("1.00")
+
+    rejected = decide_refund(
+        created.refund_id,
+        decision="reject",
+        decider_subject_id=2,
+        decider_subject_type="employee",
+        caller=CALLER,
+        role="customer_service",
+    )
+    assert rejected.status == "rejected"
+    assert remaining_refundable(user_id, order_id) == remaining, "被驳回的钱必须能再退一次"
+
+
+@pytest.mark.db
+def test_decide_refund_non_employee_subject_leaves_decided_by_null(clean_writes, refundable_order, seeded):
+    """★非员工主体审批时 `decided_by` 落 `NULL`（**不是 0**）。
+
+    为什么要专门测：`decided_by` 有指向 `employees.emp_id` 的外键。
+    一个客户主体（`accounts.subject_type == "customer"`）理论上可以持有 `approve:refund`
+    （将来可能有的「客户代表」角色）。那时把客户 `user_id` 写进去会**违反外键约束**
+    —— 500，而不是「留下一条审计记录」。
+    落 NULL 的语义是「这张单不是员工批的」，而 `approver_role` 照样记下来。
+    """
+    order_id, user_id, _total, _remaining = refundable_order
+    created = request_refund(
+        user_id, order_id, Decimal("1.00"), idempotency_key=tool_key("dec-nonemp"), caller=CALLER, role="customer"
+    )
+    view = decide_refund(
+        created.refund_id,
+        decision="approve",
+        decider_subject_id=user_id,
+        decider_subject_type="customer",
+        caller=CALLER,
+        role="admin",  # 用一个确实有权限的角色，专门验「主体类别」这一条分支
+    )
+    assert view.decided_by is None, "非员工主体写进 employees 外键会直接违反约束"
+    assert view.approver_role == "admin"
+
+
+@pytest.mark.db
+def test_list_refunds_for_review_filters(clean_writes, refundable_order, seeded):
+    """审批台查询：按单号 / 订单号 / 客户 / 状态多选 都能筛出正确子集。"""
+    order_id, user_id, _total, _remaining = refundable_order
+    created = request_refund(
+        user_id, order_id, Decimal("1.00"), idempotency_key=tool_key("list-1"), caller=CALLER, role="customer"
+    )
+    rows = list_refunds_for_review(
+        refund_id=created.refund_id, role="customer_service", caller=CALLER
+    )
+    assert [row.refund_id for row in rows] == [created.refund_id]
+
+    by_order = list_refunds_for_review(order_id=order_id, role="customer_service", caller=CALLER)
+    assert created.refund_id in {row.refund_id for row in by_order}
+
+    by_user = list_refunds_for_review(user_id=user_id, role="customer_service", caller=CALLER)
+    assert all(row.user_id == user_id for row in by_user)
+
+    # 状态多选：刚建的单在 requested 里，且必然不在 rejected 里
+    only_requested = list_refunds_for_review(
+        refund_id=created.refund_id, statuses=["requested"], role="customer_service", caller=CALLER
+    )
+    assert [row.refund_id for row in only_requested] == [created.refund_id]
+    only_rejected = list_refunds_for_review(
+        refund_id=created.refund_id, statuses=["rejected"], role="customer_service", caller=CALLER
+    )
+    assert only_rejected == []
+
+
+def test_list_refunds_requires_approve_permission() -> None:
+    """没有 `approve:refund` 的角色不能查退款列表（客户不能看别人的退款）。"""
+    with pytest.raises(PermissionDenied) as excinfo:
+        list_refunds_for_review(role="customer", caller=CALLER)
+    assert excinfo.value.missing == (PERM_APPROVE_REFUND,)
+
+
+def test_list_refunds_rejects_unknown_status() -> None:
+    """非法的 status 取值 → `ToolContractError`（不是静默忽略那次筛选）。
+
+    静默忽略是最坏的选择：用户会以为自己筛过了，看到的其实是另一批数据。
+    """
+    with pytest.raises(ToolContractError):
+        list_refunds_for_review(statuses=["nonsense"], role="customer_service", caller=CALLER)

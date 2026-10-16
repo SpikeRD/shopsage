@@ -65,14 +65,17 @@ ROUTER_SYSTEM: Final[str] = build_system_prompt(
     "典型问法「退货政策是什么」「怎么开票」。\n"
     "- analysis：**对内**的数据聚合与解读（趋势、分布、对比、排行），"
     "典型问法「最近三个月的销售趋势」「各类目销量占比」。\n"
-    "- ticket：要求**建工单 / 提交售后申请**，典型问法「帮我报修」「我要投诉物流」。\n"
+    "- refund：要求**申请退款 / 退钱 / 退货退款**，典型问法「我要退款」「这单帮我退了吧」"
+    "「订单 1024 退一下」。\n"
+    "- ticket：要求**建工单 / 报修 / 投诉**，典型问法「帮我报修」「我要投诉物流」。\n"
     "- final：不需要任何检索，纯寒暄、澄清、对上一轮的确认，典型问法「你好」「谢谢」。\n\n"
     "判定要点：\n"
     "1. 「政策/流程/怎么算」类问题永远不是 data —— 即使问法里带业务名词；\n"
     "2. analysis 只对**内部员工**开放，对客问题里出现「趋势/占比/排行」也归 data；\n"
-    "3. 拿不准时选 rag，并在 certainty 上如实给低分；\n"
-    "4. 只输出 JSON，不要解释。",
-    output_schema='{"route": "data|rag|analysis|ticket|final", '
+    "3. **「退款」与「投诉/报修」必须分开**：前者是 refund（要退钱），后者是 ticket（建单）；\n"
+    "4. 拿不准时选 rag，并在 certainty 上如实给低分；\n"
+    "5. 只输出 JSON，不要解释。",
+    output_schema='{"route": "data|rag|analysis|refund|ticket|final", '
     '"certainty": 0~1 的小数, "reason": "不超过 20 字的判断依据"}',
 )
 
@@ -86,6 +89,12 @@ ROUTER_EXAMPLES: Final[tuple[tuple[str, str], ...]] = (
     ("退货政策是什么？七天无理由怎么算的？", "rag"),
     ("最近三个月各类目的销售占比是什么样的？", "analysis"),
     ("物流太慢了，帮我建个工单投诉一下。", "ticket"),
+    # ⚠️ 变更 003 新增的示例：它是 refund 与 ticket 的**边界样本**。
+    # 这两者最容易混（都要「处理一下订单」），而它们的写路径与权限点完全不同：
+    # refund 走 request:refund 落一张退款单，ticket 走 write:ticket 建工单。
+    # 示例里不放一条「退款」样本，模型就会把「我要退款」判成 ticket ——
+    # 结果是客户拿到一张工单，而他的钱一分没动。
+    ("这单我不要了，帮我退款。", "refund"),
     ("你好", "final"),
 )
 

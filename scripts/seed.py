@@ -389,6 +389,22 @@ def _count_rows(db: Session) -> dict[str, int]:
 #    生命周期分开管，谁都不许顺手清对方。
 
 #: 演示账号：(标识, 口令, 角色, 主体类别, 主体 id)。客户 2 / 3 与员工 1 / 2 是种子数据里必然存在的。
+#:
+#: ⚠️ **变更 003 调整了两个员工账号的绑定**，理由必须留住：
+#: `accounts.subject_id` 上有复合唯一约束（一个主体最多一个账号），而变更 003 需要
+#: 一个 `customer_service`（一线审批退款）的演示账号 —— 否则「客服能审批」这条路径
+#: **无法端到端验收**（种子数据里根本没有那个角色）。
+#:
+#: `EMPLOYEES` 里的 5 个人依次是：1 张明（客服主管 L3）/ 2 李静（客服专员 L1）/
+#: 3 王强（仓储主管 L3）/ 4 赵敏（数据分析师 L2）/ 5 陈磊（运维工程师 L2）。
+#: 调整前：员工 1 = admin、员工 2 = internal_employee（客服专员）。
+#: 调整后：员工 1 = admin（不变）、**员工 3 = internal_employee**、**员工 2 = customer_service**。
+#:
+#: 为什么把「客服专员」给 `customer_service` 而不是随便挑个空闲员工：
+#: 语义要对得上 —— 「一线客服审批退款」这件事，绑在「仓储主管」或「运维工程师」身上
+#: 会让演示时的角色表自相矛盾（看代码的人会以为审批权是乱给的）。
+#: 代价是 `internal_employee` 现在绑在一个「仓储主管」身上，而它的用途恰好是
+#: 「读全站订单做分析」—— 仓储看订单是合理的，比反过来好。
 DEMO_ACCOUNTS: tuple[tuple[str, str, str, str, int], ...] = (
     # 管理员：员工表里 role='admin' 的那一行（变更单决策 9 = A：不引入第三种身份）
     ("admin", "admin-demo-pass", "admin", "employee", 1),
@@ -397,8 +413,11 @@ DEMO_ACCOUNTS: tuple[tuple[str, str, str, str, int], ...] = (
     # 第二个客户：**限流场景需要两个不同 user_id** 才能演示「各有一份额度」
     # （桶键里带 user_id，见 `app/api/ratelimit.py`）。少一个这条演示就退化成自说自话。
     ("13800000003", "customer-demo-pass", "customer", "customer", 3),
-    # 演示内部员工：客户服务部主管，能进对内入口（可读全站订单）
-    ("employee", "employee-demo-pass", "internal_employee", "employee", 2),
+    # 演示内部员工：能进对内入口（可读全站订单）。变更 003 改绑员工 3（见上）
+    ("employee", "employee-demo-pass", "internal_employee", "employee", 3),
+    # 演示客服：变更 003 新增。`approve:refund` 的持有者，用来验收
+    # 「员工能审批退款」与「客服能进对内入口却查不到全站订单」两条判据。
+    ("service", "service-demo-pass", "customer_service", "employee", 2),
 )
 
 #: 环境变量：是否灌演示账号（默认开 —— 本脚本本来就只在 dev 跑；prod 部署时显式关掉）

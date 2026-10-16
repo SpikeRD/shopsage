@@ -33,7 +33,13 @@ from app.security.rbac import ROLE_PERMISSIONS, permissions_for
 
 #: 意图路由的取值域。`final` 是「不需要查任何数据，直接回答/拒答」的出口：
 #: 有了它，router 才不必把「你好」硬塞进 rag 或 data（那会白白花一次检索/一次 SQL）。
-ROUTES: Final[tuple[str, ...]] = ("data", "rag", "analysis", "ticket", "final")
+#:
+#: ⚠️ `refund` 是**变更 003 新增**的。为什么不让「我要退款」继续落到 `ticket`：
+#: 两者的**写语义与权限点都不同** —— `ticket` 建工单（客户有 `write:ticket`），
+#: 而 `refund` 申请退款（客户有 `request:refund`，只能建 `requested`，等员工审批）。
+#: 挤在同一条路由上，节点里还得再判一次意图，而那个判断没有任何可断言的事实依据
+#: （router 的产出才是「可断言的事实」，这正是 `SENSITIVE_ROUTES` 当初按 route 判定的理由）。
+ROUTES: Final[tuple[str, ...]] = ("data", "rag", "analysis", "ticket", "refund", "final")
 
 #: 对客角色的名字（`policy.CUSTOMER_ROLE` 的别名，供不方便 import policy 的调用方用）
 CUSTOMER: Final[str] = CUSTOMER_ROLE
@@ -113,6 +119,28 @@ class GraphState(TypedDict, total=False):
     citations: list[str]
     #: 「为什么没答上」的记录（权限不足/能力未就绪/没有数据），**不许编造答案时用它兜底**。
     refusals: list[str]
+
+    # ── 退款申请（变更 003；只有 `refund` 节点写，synthesis 读）─────────────────
+    #: 这一轮退款申请的结果。**两种形状，用 `status` 区分**：
+    #:
+    #: ```python
+    #: # ① 成功落单
+    #: {"status": "submitted", "refund_id": 12, "order_id": 1024,
+    #:  "amount": "58.00", "remaining_after": "0.00"}
+    #: # ② 需要客户补充信息（**没有落库**）
+    #: {"status": "needs_order_id", "candidates": [1024, 1025], "hint": "..."}
+    #: ```
+    #:
+    #: ⚠️ 为什么它是一个**显式的 state 键**而不是塞进 `refusals`：
+    #: `refusals` 的语义是「**这次没拿到什么**」（见 synthesis 的材料边界），
+    #: 而「退款已受理，单号 12」是一件**做成了的事**。把它塞进 refusals 会让
+    #: synthesis 把它渲染成一句「这件事没办成」，与事实完全相反 ——
+    #: 而且那正是变更 001 之前「批准了但什么都没发生」那类错觉的同族问题。
+    #:
+    #: ⚠️ 值必须是**可 msgpack 序列化**的简单类型（str/int/list/dict）：
+    #: LangGraph 的 checkpointer 会对 state 做 msgpack 序列化，放 dataclass
+    #: 会被**静默丢掉**（本仓在缓存那一步实测踩过，见 `rag.remember_answer`）。
+    refund: dict[str, Any]
 
     # ── 缓存（第 13 步；只有 rag 节点写，synthesis 读）─────────────────────────
     #: 语义缓存命中的**整段答案**。命中时 synthesis 直接用它，**不再打模型**（E1 的落点）。

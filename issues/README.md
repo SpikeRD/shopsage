@@ -44,3 +44,4 @@
 | [005](005-cors-missing-patch-method.md) | 管理台「停用 / 改角色」在浏览器里 `Failed to fetch`：CORS 白名单漏了 `PATCH` → 预检 400，请求根本没发出 | 已修复 | `app/api/main.py`（CORS 装配，第 16 步） |
 | [006](006-admin-role-change-not-persisted.md) | 管理台「改角色」**提示成功但没生效**：受控 `select` 的值在异步 thunk 执行前被 React 回滚 → 请求体发的是旧角色 | 已修复 | `web/src/app/(app)/admin/page.tsx` |
 | [007](007-logout-during-llm-hangs-event-loop.md) | **等 LLM 回复时退出登录 → 整个后端被一条死连接锁死**（WS 断连后 `WebSocketDisconnected` 掉进兜底分支 → 纯 CPU 忙等占满事件循环，再也登不进去、一直显示「登录中」） | 已修复 | `app/api/chat.py`（`WS /api/chat/stream` 消息循环，第 9 步） |
+| [008](008-payment-method-masked-for-everyone.md) | `payment_method` 对**所有角色**（含财务级）都被打码成 `***`：脱敏表给它配了面向长数字串的 `mask_bank_card`，而真实值是 `alipay`/`wechat` 这类枚举（一个数字都没有）→ 走「位数不足→整体打码」分支 | 未处理 | `app/security/masking.py::FIELD_RULES`（第 4 步）；变更 003 使用现有规则、不改表 |

@@ -53,10 +53,17 @@ import {
   entryLabel,
   entryPath,
   ROLE_PERMISSIONS,
+  subPagesFor,
   visibleEntriesFor,
   type Entry,
 } from "@/lib/auth";
-import { clearSessionPair, readActiveSession, withFreshToken, type ActiveSession } from "@/lib/session";
+import {
+  clearSessionsForAccount,
+  currentAccountId,
+  readActiveSession,
+  withFreshToken,
+  type ActiveSession,
+} from "@/lib/session";
 
 /** 侧边栏里的一个入口（顺序即显示顺序，来自 `lib/auth.ts::ENTRIES`）。 */
 const ITEM_META: Record<Entry, { label: string; hint: string }> = {
@@ -139,9 +146,18 @@ export function SideNav() {
   }, [load]);
 
   const logout = () => {
-    // ⚠️ 只清**当前路径那个入口**的登录态（三把钥匙互不覆盖，见模块注释 ①）：
-    // 在管理台点「退出」不该把对客页的身份也踢掉。
-    clearSessionPair(currentEntry, browserStorage());
+    // ⚠️ 变更 003：**按账号清掉所有入口的钥匙**（不再是「只清当前入口」）。
+    //
+    // 变更 003 起登录会把同一枚令牌写进多把钥匙（`lib/session.ts::writeSessionPair`），
+    // 所以只清当前入口会留下一条**隐形会话**：用户在 `/admin` 点了退出（看起来退成功了），
+    // 而 `/` 与 `/internal` 的钥匙里还留着同一枚有效令牌 —— 会话其实还活着。
+    // 那是一类「用户以为已经登出、实际没有」的安全问题。
+    //
+    // 判定「是本账号的」用令牌里的 `aid`；解不出来时退化成清全部（宁可比必要的多清一点）。
+    const storage = browserStorage();
+    const accountId = currentAccountId(storage);
+    // 返回被清掉的入口列表（当前没消费它，但保留这个变量让「清了什么」在调试时可见）
+    clearSessionsForAccount(accountId, storage);
     window.location.assign("/login");
   };
 
@@ -165,6 +181,9 @@ export function SideNav() {
     .map((item) => item.role);
   const visible = visibleEntriesFor(roles);
   const activeSession = sessions[currentEntry] ?? sessions.customer ?? null;
+  // 变更 003：子页导航（对客 → 我的订单；对内 → 退款审批）。
+  // 判据仍然只是**显隐**：每一个子页的请求都会被后端按权限单独校验。
+  const pages = subPagesFor(currentEntry, roles);
 
   return (
     <nav className="sidenav" aria-label="主导航">
@@ -194,6 +213,24 @@ export function SideNav() {
         <div className="small muted" style={{ padding: "6px 10px" }}>
           其余入口需要更高权限，未显示（真正的拦截在后端）。
         </div>
+      ) : null}
+
+      {/* ── 变更 003：当前入口下的子页 ──────────────────────────────────── */}
+      {pages.length > 1 ? (
+        <>
+          <div className="sidenav-group">{entryLabel(currentEntry)}的子页</div>
+          {pages.map((page) => (
+            <Link
+              key={page.path}
+              className={`sidenav-link sub${pathname === page.path ? " active" : ""}`}
+              href={page.path}
+              title={page.hint}
+            >
+              <span>{page.label}</span>
+              {pathname === page.path ? <span className="small">当前</span> : null}
+            </Link>
+          ))}
+        </>
       ) : null}
 
       <div className="sidenav-foot">

@@ -24,7 +24,9 @@ from typing import Final, Protocol
 #: 受保护的路径 → scope 名（**方法也参与**：`POST /x` 与 `GET /x` 是两种代价）
 SCOPE_BY_ROUTE: Final[dict[tuple[str, str], str]] = {
     ("POST", "/api/chat"): "chat",
-    ("POST", "/api/chat/approve"): "chat.approve",
+    # ⚠️ 变更 003 **删除了** `("POST", "/api/chat/approve")`：对客人工审批闸门整体移除后，
+    # 那条路径在任何角色下都恒 409（图里再也不会注册闸门节点，见 `graph/config.GATED_ROLES`）。
+    # 留着一个永远不会成功、却占着额度桶与文档位置的接口，只会让下一个人以为它还能用。
     # 第 12 步：提交长任务。**它必须限流**，而且要比 chat 更严：一次提交就是一个
     # 后台长任务（可能几分钟、可能几次模型调用），而被滥用的代价落在**队列**上
     # （积压 → 所有人的任务都变慢），不像 chat 那样只影响调用者自己。
@@ -37,6 +39,18 @@ SCOPE_BY_ROUTE: Final[dict[tuple[str, str], str]] = {
     # 刷新也要限：刷新令牌有效期 14 天，不限流的话它就是一个「可无限尝试的凭证校验口」。
     ("POST", "/api/auth/login"): "auth.login",
     ("POST", "/api/auth/refresh"): "auth.refresh",
+    # ── 变更 003：退款申请与审批（**两条写路径都必须限流**）───────────────────
+    # 申请：一次调用在库里多一行、并且**占用该订单的可退额度**（额度是有限资源）。
+    # 不限流时，一个脚本可以把「同一客户的所有订单」在几秒内全部申请一遍 ——
+    # 员工审批台会被瞬时灌满，而真正的紧急单埋在噪音里。
+    #
+    # ⚠️ 路径**不带路径参数**：`SCOPE_BY_ROUTE` 的键是精确的 `(method, path)`，
+    # 而中间件的判定也是 `(method, path) in LIMITED_SCOPES`。带参数的路径
+    # （如 `/api/refunds/{id}/decision`）**匹配不上**，于是它会静默退回「不限流」——
+    # 那正是 `tests/api/test_api_contracts.py::test_every_scoped_route_is_actually_enforced`
+    # 想防的事。所以审批口写成 `/api/refunds/decision`（退款单号在请求体里）。
+    ("POST", "/api/refunds"): "refunds.request",
+    ("POST", "/api/refunds/decision"): "refunds.decide",
 }
 
 #: WebSocket 的 scope 名（握手成功后由路由自己判定；路径不在 HTTP 的映射里）

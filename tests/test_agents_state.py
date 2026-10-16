@@ -41,8 +41,14 @@ from tests.agents_helpers import FakeLLM
 
 
 def test_routes_cover_the_documented_branches() -> None:
-    """取值域必须与文档里的三类检索 + 写操作 + 直达出口对齐。"""
-    assert set(ROUTES) == {"data", "rag", "analysis", "ticket", "final"}
+    """取值域必须与文档里的三类检索 + 两种写操作 + 直达出口对齐。
+
+    ⚠️ **变更 003 加了 `refund`**（原先是 5 项）。它不是「多一个同义词」：
+    `ticket` 建工单（客户持 `write:ticket`），`refund` 申请退款（客户持 `request:refund`，
+    只能建 `requested` 等员工审批）—— 两条路线的**写语义与权限点都不同**，
+    挤在同一条路由上就得在节点里再判一次意图，而那个判断没有可断言的事实依据。
+    """
+    assert set(ROUTES) == {"data", "rag", "analysis", "ticket", "refund", "final"}
 
 
 def test_last_user_message_prefers_the_newest_user_turn() -> None:

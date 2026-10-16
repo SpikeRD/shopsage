@@ -158,7 +158,15 @@ def _make(
         ("manager", svc.ENTRY_INTERNAL),
         ("finance_auditor", svc.ENTRY_INTERNAL),
         ("customer", svc.ENTRY_CUSTOMER),
-        ("customer_service", svc.ENTRY_CUSTOMER),
+        # ⚠️ **变更 003 改了这一行**：原先是 `ENTRY_CUSTOMER`。
+        # 变更 003 给客服加了 `approve:refund`（一线审批退款），而它**没有**
+        # `read:all_orders` —— 若入口判据仍是「能读全站订单」，客服登录后会被送进
+        # 对客入口，**根本看不到自己的退款审批台**（需求 3 对客服不可用）。
+        # 所以判据放宽成 `can_enter_internal`（＝能读全站订单 **或** 能审批退款）。
+        # ⚠️ 放宽的**只是入口**：他进对内之后能查什么仍由 RBAC 逐接口判定，
+        # 查全站订单依然会被拒（`read:all_orders` 不在他的权限集里）——
+        # 那条判据由 `tests/security/test_rbac.py` 与 `test_entry_permissions` 覆盖。
+        ("customer_service", svc.ENTRY_INTERNAL),
         # 未登记角色 = 零权限 → 只能进对客入口（**默认拒绝**的体现）
         ("nobody", svc.ENTRY_CUSTOMER),
     ],

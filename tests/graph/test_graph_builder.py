@@ -114,6 +114,62 @@ def test_route_table_covers_every_documented_route() -> None:
     assert missing == [], f"这些 route 没有目的地：{missing}（改 router 的取值域时要同步改 ROUTE_NODES）"
 
 
+def test_conditional_edge_map_is_keyed_by_node_names() -> None:
+    """★条件边的映射表**必须用节点名当键**（变更 003 实测踩到的静默 bug）。
+
+    ## 这条防的是什么（一个「编译期不报、边表也正确」的坑）
+
+    `route_by_intent` 返回的是**节点名**（`ROUTE_NODES.get(route)` 的**值**），
+    而 LangGraph 用它去查条件边的 `ends` 映射。变更 003 之前那张表写的是
+    `{**ROUTE_NODES, NODE_SYNTHESIS: NODE_SYNTHESIS}` —— 键是 **route 名**、值是节点名。
+
+    对 `data` / `rag` / `synthesis` 而言键与值**恰好相同**，所以一直没暴露；
+    而 `route=refund` 的返回值是 `"refund_request"`，它不是那张表的键 →
+    `_branch.py::_finish` 里 `self.ends["refund_request"]` 直接抛 `KeyError`。
+
+    ## 为什么它极难被发现（所以必须有一条用例）
+
+    * **编译期不报**：编译只检查「映射的**值**是不是已注册节点」，
+      不检查「分支函数会不会返回映射里没有的键」；
+    * **`get_graph()` 的边表完全正确**（`router → refund_request` 在），
+      所以「图结构断言」全绿；
+    * route 也判对了（`route=refund` 能看见）；
+    * 症状只在**真跑一轮**时出现，最终表现为用户拿到一句**空回答**。
+
+    这条用例直接把「分支函数所有可能的返回值」与「映射表的键」对齐 ——
+    新增一条 route 时，只要忘改映射就会立刻红。
+    """
+    from app.graph.builder import _route_map
+    from app.graph.routing import route_by_intent
+    from app.graph.state import NODE_GATE, NODE_SYNTHESIS
+
+    mapping = _route_map()
+
+    # 1) 分支函数在**任何** route 取值下的返回值，都必须是映射表里的键
+    from app.agents.state import ROUTES
+
+    possible_returns = {route_by_intent({"route": route}) for route in ROUTES}
+    # 野值 route 会兜到 synthesis（`route_by_intent` 的兜底），也要能查到
+    possible_returns.add(route_by_intent({"route": "a_wild_value_nobody_registered"}))
+    missing = sorted(node for node in possible_returns if node not in mapping)
+    assert missing == [], (
+        f"这些分支目的地不是条件边映射表的键：{missing}。"
+        "映射表必须用**节点名**当键（分支函数返回的是节点名，不是 route 名）——"
+        "写错的话真跑一轮会 KeyError，而编译期与边表都不会报"
+    )
+
+    # 2) 映射的值必须是自身（`{node: node}`），也就是「返回值 → 真实节点名」不变形
+    for key, node in mapping.items():
+        assert key == node, f"映射 {key!r} → {node!r} 不是恒等映射：分支返回值必须就是节点名"
+
+    # 3) 终点（synthesis）必须在里面 —— `ticket` / `final` 与野值兜底都靠它
+    assert NODE_SYNTHESIS in mapping
+
+    # 4) 开了闸门时 `after_router_gate` 还会返回 `gate`，调用点负责把它并进映射
+    #    （这里断言常量存在，让「并进映射」那一步有据可查）
+    assert NODE_GATE != NODE_SYNTHESIS
+
+
 def test_graph_is_drawable_and_names_itself() -> None:
     """图必须能画出来（`draw_mermaid` 走 `get_graph()`）。
 

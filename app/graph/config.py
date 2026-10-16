@@ -14,14 +14,21 @@ from typing import Any, Final
 from app.agents.analysis import MAX_ANALYSIS_ROWS
 from app.agents.data import DEFAULT_ROW_LIMIT, MAX_SQL_ATTEMPTS
 from app.agents.rag import DEFAULT_MIN_SCORE, DEFAULT_TOP_K
-from app.security.policy import CUSTOMER_ROLE
 
 #: 需要人工批准的 `route` 取值域（`8.graph.md` §5 第四条：退款/工单等敏感写操作）。
 #:
-#: 为什么按 **route** 而不是按「节点名」判定：本步骤还没有写节点（ticket 节点属第 9 步），
-#: 而 route 是 router 已经产出的、可断言的事实。等第 9 步的 `ticket_node` 落地时，
-#: 闸门仍然挂在同一个位置 —— 变化只是「批准之后跳到哪」。
-SENSITIVE_ROUTES: Final[tuple[str, ...]] = ("ticket",)
+#: ⚠️ **变更 003 把它清空了**，理由必须留住：
+#: 变更 003 之前这里是 `("ticket",)`，配合 `GATED_ROLES={customer}` 的实际效果是
+#: 「**客户自己点按钮批准自己的敏感操作**」（`POST /api/chat/approve` 的调用者就是发起人）。
+#: 那不是人机审批，是**自审批** —— 一线与客户之间没有任何第二个人。
+#: 需求 2 的原始描述「对客入口现在可以自己审批退款申请，明显有问题」指的就是它。
+#:
+#: 审批搬到了**退款单据**上（`refunds` 表 + `/api/refunds/decision`）：
+#: 审批对象从「一轮对话」变成「一笔有 id、有金额、有状态机的记录」，
+#: 而批准人必须是持有 `approve:refund` 的**员工**（客户永远拿不到这个权限点）。
+#: 于是「谁批的、批的哪一笔、批了多少钱」第一次变成了可审计的事实
+#: —— 旧的对话轮闸门连「批的是哪笔单」都说不出来。
+SENSITIVE_ROUTES: Final[tuple[str, ...]] = ()
 
 #: 中断时给审批人看的问题（**固定文本 + 可核对的事实**，不让模型现编）。
 APPROVAL_QUESTION: Final[str] = (
@@ -56,20 +63,33 @@ class InterruptPolicy:
 
 #: 「人工审批闸门」按角色开关的规则（第 9 步落地）：**对客路径开**、内部只读路径关。
 #:
-#: 为什么按**角色**而不是全局开：
+#: ⚠️ **变更 003 把它清空了**（`GATED_ROLES = frozenset()`）：对客路径不再有任何 interrupt。
 #:
-#: * 对客路径上，敏感分支（`ticket` 这类写操作的入口）由客户自己发起，
-#:   没有人工确认就直接执行 = 一个人可以反复触发写操作；
-#: * 内部角色走的是标准作业流程（员工本来就是「被授权的人」），每一步都停下来等批准
-#:   会把「分析一下上月退款率」变成一次审批流程 —— 那是流程倒退，不是安全加固。
+#: 变更前它是 `{CUSTOMER_ROLE}`，含义是「客户发起敏感分支时停下来等人点头」。
+#: 但它停下来的**审批人就是客户自己**（`POST /api/chat/approve` 只校验 thread_id 属于
+#: 当前用户，不校验批准人是不是另一个人），于是「人机审批」在实践中退化成自审批。
+#: 需求 2 要修的正是这件事。
 #:
-#: 这条规则放在 `graph/config.py` 而不是 API 层：它描述的是「图该怎么跑」，
-#: 与 `SENSITIVE_ROUTES` 是同一类知识；API 层只负责**问**它，不负责定义它。
-GATED_ROLES: Final[frozenset[str]] = frozenset({CUSTOMER_ROLE})
+#: 现在的落点：审批变成**单据级**动作（`app/tools/refund.decide_refund`，
+#: 要 `approve:refund`），挂在 `/api/refunds/decision` 上。图里不再需要闸门 ——
+#: 客户的敏感请求（申请退款）**直接就落成 `requested` 状态**，等员工在审批台处理。
+#:
+#: ⚠️ 保留 `InterruptPolicy` / `make_gate` / `NODE_GATE` 这套**原语**（不删）：
+#: 它们是「图能不能停下来」的框架能力，有独立用例覆盖（`tests/graph/test_graph_interrupt.py`
+#: 里用最小图与显式 `InterruptPolicy(enabled=True, routes=("ticket",))` 验证），
+#: 将来若真出现「必须由另一个人批准才能继续的一轮对话」，重建它的代价远高于留着。
+#: 这是变更 003 决策 D2 的显式取舍：**宁可留一段不使用的原语，也不删掉已验的框架能力**。
+GATED_ROLES: Final[frozenset[str]] = frozenset()
 
 
 def interrupt_policy_for(role: str, *, enabled: bool = True) -> InterruptPolicy:
-    """按角色造闸门策略（对客开、内部关）。
+    """按角色造闸门策略。
+
+    ⚠️ 变更 003 之后 `GATED_ROLES` 是**空集**，所以本函数在生产路径上**恒返回
+    `enabled=False`**（对任何角色）。保留它的形状（而不是删掉这个函数）是为了：
+      * `app/api/chat.py::_runtime_with_policy` 的接线不用改（它仍然「问一下策略」）；
+      * 将来往 `GATED_ROLES` 里加回一个角色时，只需改那一个**数据**常量，
+        不需要重建调用链 —— 这正是当初把它做成「查表」而不是硬编码 `if role == ...` 的价值。
 
     `enabled=False` 是「这次调用完全不用闸门」（例如离线评测、只读探活），
     与「角色不在 `GATED_ROLES` 里」是两件事：前者连节点都不注册（图更小、更省），

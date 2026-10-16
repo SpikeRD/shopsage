@@ -20,7 +20,6 @@
 
 /** 一轮业务的状态（HTTP 状态码回答「调用成不成」，它回答「这一轮做到哪一步」）。 */
 export type FlowState = "delivered" | "blocked" | "approval_required";
-
 /** WebSocket 帧的五类 `event`。 */
 export type FrameEvent = "skeleton" | "node" | "answer" | "done" | "error";
 
@@ -55,11 +54,44 @@ export interface ParsedCitation {
   chunkId: string | null;
 }
 
+/**
+ * 敏感操作的审批闸门（`flow_state="approval_required"` 时才有）。
+ *
+ * ⚠️ **变更 003 之后它在生产路径上不可达**：对客闸门整体移除
+ * （`GATED_ROLES` 置空），图里不再注册闸门节点。
+ *
+ * 契约**不收缩**（决策 D2：保留图侧原语），所以前端仍然解析它 ——
+ * 万一将来给另一条业务加对话轮级审批，前端不用改解析。
+ * 但**发起审批的那个接口已经删除了**（`POST /api/chat/approve` 允许发起人批准自己），
+ * 所以 `resumeWith` 指向的是**单据级**审批入口。
+ */
 export interface ApprovalGate {
   threadId: string;
   question: string;
   interruptId: string;
   resumeWith: string;
+}
+
+/**
+ * 退款申请的结果（变更 003；`route=refund` 的那一轮才有）。
+ *
+ * ⚠️ 两种形状用 `status` 区分，**必须分开处理**：
+ *   * `submitted` → 已经落库，`refund_id` / `amount` / `state` 一定有值；
+ *   * `needs_order_id` → **没有落库**，`candidates` 是候选订单号。
+ * 把两者混着渲染（例如无条件显示「已提交」）会让客户以为申请成功了，
+ * 而实际上系统还在等他确认是哪一笔。
+ */
+export interface RefundOutcome {
+  status: "submitted" | "needs_order_id" | "refused";
+  refund_id?: number;
+  order_id?: number;
+  amount?: string;
+  state?: string;
+  remaining_after?: string;
+  candidates?: number[];
+  hint?: string;
+  /** 幂等命中（图重放或重复提问）：这一单之前就提交过 */
+  idempotent_hit?: boolean;
 }
 
 export interface ChatDebug {
@@ -71,6 +103,118 @@ export interface ChatDebug {
   rowCount: number | null;
   truncated: boolean | null;
   sql: string | null;
+}
+
+// ── 变更 003：订单与退款（与 app/api/schemas.py 的响应模型逐字对应）──────────
+
+/** 订单里的一条退款记录（只读展示）。 */
+export interface OrderRefund {
+  refund_id: number;
+  /** 金额是**十进制字符串**（后端不过 JSON float，避免二进制尾巴） */
+  amount: string;
+  status: RefundStatus;
+  reason: string | null;
+  decision_note: string | null;
+  created_at: string | null;
+  decided_at: string | null;
+}
+
+/** 退款单的四种状态（与后端 `models.REFUND_STATUSES` 同源）。 */
+export type RefundStatus = "requested" | "approved" | "rejected" | "refunded";
+
+export const REFUND_STATUSES: readonly RefundStatus[] = [
+  "requested",
+  "approved",
+  "rejected",
+  "refunded",
+];
+
+/** 退款状态的中文标签（**唯一一处**映射：订单页与审批台共用）。 */
+export function refundStatusLabel(status: string): string {
+  switch (status) {
+    case "requested":
+      return "待审批";
+    case "approved":
+      return "已通过";
+    case "rejected":
+      return "已驳回";
+    case "refunded":
+      return "已退款";
+    default:
+      return status || "未知";
+  }
+}
+
+export interface OrderItem {
+  order_item_id: number;
+  product_id: number;
+  product_name: string | null;
+  quantity: number;
+  unit_price: string;
+}
+
+export interface Order {
+  order_id: number;
+  status: string;
+  total_amount: string;
+  /** ⚠️ 按角色脱敏：清晰度不足时是 `***`（**不是** null —— 两者语义不同） */
+  payment_method: string | null;
+  created_at: string | null;
+  items: OrderItem[];
+  refunds: OrderRefund[];
+  consumed_amount: string;
+  /** 还能退多少 = 订单金额 − 已占用（`rejected` 不计入） */
+  remaining_refundable: string;
+  /** 此刻能不能申请退款（状态可退 **且** 还有额度） */
+  refundable: boolean;
+}
+
+export interface OrderList {
+  orders: Order[];
+  total: number;
+  limit: number;
+}
+
+/** 一张退款单的完整形态（客户订单页与员工审批台共用）。 */
+export interface Refund {
+  refund_id: number;
+  order_id: number;
+  user_id: number;
+  amount: string;
+  status: RefundStatus;
+  reason: string | null;
+  created_at: string | null;
+  /** 审批人（`employees.emp_id`）；非员工主体审批时为 null */
+  decided_by: number | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  /** 审批时的角色**快照** */
+  approver_role: string | null;
+}
+
+export interface RefundList {
+  refunds: Refund[];
+  total: number;
+}
+
+/** 订单状态的中文标签（**唯一一处**映射；认不出来时原样显示，不猜）。 */
+export function orderStatusLabel(status: string): string {
+  switch (status) {
+    case "pending":
+      return "待付款";
+    case "paid":
+      return "已付款";
+    case "shipped":
+      return "已发货";
+    case "delivered":
+      return "已送达";
+    case "cancelled":
+      return "已取消";
+    case "refunded":
+      return "已退款";
+    default:
+      return status || "未知";
+  }
 }
 
 /** 图表 spec（与 `app/tools/chart.py::build_chart_spec` 的产物同形）。 */
@@ -107,6 +251,8 @@ export interface ChatResponse {
   refusals: string[];
   chart_spec: ChartSpec | null;
   approval: ApprovalGate | null;
+  /** 变更 003：退款申请的结果（只有 `route=refund` 的那一轮才有） */
+  refund: RefundOutcome | null;
   debug: ChatDebug | null;
 }
 
@@ -229,9 +375,10 @@ export function parseChatResponse(value: unknown): ChatResponse {
           threadId: asString(approvalRaw.thread_id),
           question: asString(approvalRaw.question),
           interruptId: asString(approvalRaw.interrupt_id),
-          resumeWith: asString(approvalRaw.resume_with, "POST /api/chat/approve"),
+          resumeWith: asString(approvalRaw.resume_with, "POST /api/refunds/decision"),
         }
       : null,
+    refund: parseRefundOutcome(record.refund),
     debug: isChatDebug(debugRaw)
       ? {
           visited: asStringList(debugRaw.visited),
@@ -244,6 +391,118 @@ export function parseChatResponse(value: unknown): ChatResponse {
           sql: typeof debugRaw.sql === "string" ? debugRaw.sql : null,
         }
       : null,
+  };
+}
+
+/**
+ * 解析退款结果；形状不认识时**返回 null 而不是抛**。
+ *
+ * 理由与 `parseCitation` 的兜底同源：这一块解析不出来只该让「退款卡片」不显示，
+ * 不该让整轮对话的渲染崩掉（`answer` 仍然是有价值的）。
+ * ⚠️ 但 `status` 必须在白名单里 —— 我们不认识的状态宁可当成「没有退款结果」，
+ * 也不要瞎猜一个卡片出来（那会显示错的信息，比不显示更糟）。
+ */
+export function parseRefundOutcome(value: unknown): RefundOutcome | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const status = asString(record.status);
+  if (status !== "submitted" && status !== "needs_order_id" && status !== "refused") return null;
+  const candidates = Array.isArray(record.candidates)
+    ? record.candidates
+        .map((item) => (typeof item === "number" ? item : Number(item)))
+        .filter((item) => Number.isFinite(item))
+    : undefined;
+  return {
+    status,
+    refund_id: typeof record.refund_id === "number" ? record.refund_id : undefined,
+    order_id: typeof record.order_id === "number" ? record.order_id : undefined,
+    amount: typeof record.amount === "string" ? record.amount : undefined,
+    state: typeof record.state === "string" ? record.state : undefined,
+    remaining_after:
+      typeof record.remaining_after === "string" ? record.remaining_after : undefined,
+    candidates,
+    hint: typeof record.hint === "string" ? record.hint : undefined,
+    idempotent_hit: typeof record.idempotent_hit === "boolean" ? record.idempotent_hit : undefined,
+  };
+}
+
+/** 解析订单列表（`GET /api/orders`）。字段缺失时给**安全默认**，不抛。 */
+export function parseOrderList(value: unknown): OrderList {
+  const record = asRecord(value, "订单列表");
+  const raw = Array.isArray(record.orders) ? record.orders : [];
+  return {
+    orders: raw.map(parseOrder),
+    total: typeof record.total === "number" ? record.total : raw.length,
+    limit: typeof record.limit === "number" ? record.limit : raw.length,
+  };
+}
+
+export function parseOrder(value: unknown): Order {
+  const record = asRecord(value, "订单");
+  return {
+    order_id: Number(record.order_id ?? 0),
+    status: asString(record.status),
+    total_amount: asString(record.total_amount, "0.00"),
+    // ⚠️ **不能**用 `asString(..., "")` 兜底：`null`（没有支付方式）与
+    // `"***"`（有但看不到）是两种不同的语义，必须原样保留。
+    payment_method: typeof record.payment_method === "string" ? record.payment_method : null,
+    created_at: typeof record.created_at === "string" ? record.created_at : null,
+    items: Array.isArray(record.items) ? record.items.map(parseOrderItem) : [],
+    refunds: Array.isArray(record.refunds) ? record.refunds.map(parseOrderRefund) : [],
+    consumed_amount: asString(record.consumed_amount, "0.00"),
+    remaining_refundable: asString(record.remaining_refundable, "0.00"),
+    refundable: asBool(record.refundable),
+  };
+}
+
+function parseOrderItem(value: unknown): OrderItem {
+  const record = asRecord(value, "订单明细");
+  return {
+    order_item_id: Number(record.order_item_id ?? 0),
+    product_id: Number(record.product_id ?? 0),
+    product_name: typeof record.product_name === "string" ? record.product_name : null,
+    quantity: Number(record.quantity ?? 0),
+    unit_price: asString(record.unit_price, "0.00"),
+  };
+}
+
+function parseOrderRefund(value: unknown): OrderRefund {
+  const record = asRecord(value, "订单退款记录");
+  return {
+    refund_id: Number(record.refund_id ?? 0),
+    amount: asString(record.amount, "0.00"),
+    status: asString(record.status) as RefundStatus,
+    reason: typeof record.reason === "string" ? record.reason : null,
+    decision_note: typeof record.decision_note === "string" ? record.decision_note : null,
+    created_at: typeof record.created_at === "string" ? record.created_at : null,
+    decided_at: typeof record.decided_at === "string" ? record.decided_at : null,
+  };
+}
+
+/** 解析退款列表（`GET /api/refunds`，员工审批台）。 */
+export function parseRefundList(value: unknown): RefundList {
+  const record = asRecord(value, "退款列表");
+  const raw = Array.isArray(record.refunds) ? record.refunds : [];
+  return {
+    refunds: raw.map(parseRefund),
+    total: typeof record.total === "number" ? record.total : raw.length,
+  };
+}
+
+export function parseRefund(value: unknown): Refund {
+  const record = asRecord(value, "退款单");
+  return {
+    refund_id: Number(record.refund_id ?? 0),
+    order_id: Number(record.order_id ?? 0),
+    user_id: Number(record.user_id ?? 0),
+    amount: asString(record.amount, "0.00"),
+    status: asString(record.status) as RefundStatus,
+    reason: typeof record.reason === "string" ? record.reason : null,
+    created_at: typeof record.created_at === "string" ? record.created_at : null,
+    decided_by: typeof record.decided_by === "number" ? record.decided_by : null,
+    decided_at: typeof record.decided_at === "string" ? record.decided_at : null,
+    decision_note: typeof record.decision_note === "string" ? record.decision_note : null,
+    approver_role: typeof record.approver_role === "string" ? record.approver_role : null,
   };
 }
 

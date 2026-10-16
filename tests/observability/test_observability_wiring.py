@@ -12,7 +12,7 @@
 | 用例 | 覆盖的路径 |
 |---|---|
 | `test_metrics_exposed` | `GET /metrics` 能拿到 request_count / agent_duration / sql_duration |
-| `test_agent_nodes_are_all_instrumented` | 7 个图节点（含 `gate`）每个都有 span + `AGENT_DURATION` |
+| `test_agent_nodes_are_all_instrumented` | 图节点（含 `refund_request`；`gate` 见下一条）每个都有 span + `AGENT_DURATION` |
 | `test_llm_call_records_tokens_and_cost` | `app.llm.client.llm_call` |
 | `test_llm_retry_produces_one_span_per_attempt` | 重试时的 span 数（成本归因的关键） |
 | `test_sql_execution_records_duration` | `execute_readonly_query` |

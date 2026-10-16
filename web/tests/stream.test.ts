@@ -134,22 +134,80 @@ test("answer 帧的 chart 布尔：WS 只告诉「有没有图」，本体在 HT
   assert.equal(state.hasChart, true);
 });
 
-test("挂起（待人工确认）：approval 落进状态，flow_state=approval_required", () => {
+test("★变更 003：退款结果随 node 帧落进状态（三种形状都认）", () => {
+  // 退款结果由 `refund_request` 节点的增量带出来（后端 `FRAME_SAFE_KEYS` 白名单里有 `refund`）。
+  // 三种形状必须都能解析，且**不能互相混淆** —— 把 `needs_order_id` 也渲染成
+  // 「已提交」会让客户以为申请成功了，而系统其实还在等他确认是哪一笔。
+  const submitted = feed(beginTurn(initialState()), [
+    { event: "skeleton", seq: 1, ts: 1, data: { phase: "accepted", text: "收到…" } },
+    {
+      event: "node",
+      seq: 2,
+      ts: 1,
+      data: {
+        node: "refund_request",
+        progress: "正在提交退款申请…",
+        delta: {
+          refund: {
+            status: "submitted",
+            refund_id: 12,
+            order_id: 1024,
+            amount: "58.00",
+            state: "requested",
+            remaining_after: "0.00",
+          },
+        },
+      },
+    },
+    { event: "answer", seq: 3, ts: 1, data: { text: "已提交", done: true, degraded: false, citations: [], chart: false } },
+    { event: "done", seq: 4, ts: 1, data: { flow_state: "delivered", thread_id: "c2:s", session_id: "s", route: "refund", blocked: false, approval: null, latency_ms: 9, first_frame_ms: 0.1, debug: null } },
+  ]);
+  assert.equal(submitted.refund?.status, "submitted");
+  assert.equal(submitted.refund?.refund_id, 12);
+  assert.equal(submitted.refund?.amount, "58.00");
+
+  const needsOrder = feed(beginTurn(initialState()), [
+    { event: "skeleton", seq: 1, ts: 1, data: { phase: "accepted", text: "收到…" } },
+    {
+      event: "node",
+      seq: 2,
+      ts: 1,
+      data: { node: "refund_request", progress: "", delta: { refund: { status: "needs_order_id", candidates: [1024, 1025], hint: "问客户" } } },
+    },
+    { event: "done", seq: 3, ts: 1, data: { flow_state: "delivered", thread_id: "c2:s", session_id: "s", route: "refund", blocked: false, approval: null, latency_ms: 9, first_frame_ms: 0.1, debug: null } },
+  ]);
+  assert.equal(needsOrder.refund?.status, "needs_order_id");
+  assert.deepEqual(needsOrder.refund?.candidates, [1024, 1025]);
+  assert.equal(needsOrder.refund?.refund_id, undefined, "没落库就不该有单号");
+
+  // 认不出来的形状 → 当成「没有退款结果」，**不瞎猜一个卡片出来**
+  const unknown = feed(beginTurn(initialState()), [
+    { event: "skeleton", seq: 1, ts: 1, data: { phase: "accepted", text: "收到…" } },
+    { event: "node", seq: 2, ts: 1, data: { node: "refund_request", progress: "", delta: { refund: { status: "weird_future_state" } } } },
+    { event: "done", seq: 3, ts: 1, data: { flow_state: "delivered", thread_id: "c2:s", session_id: "s", route: "refund", blocked: false, approval: null, latency_ms: 9, first_frame_ms: 0.1, debug: null } },
+  ]);
+  assert.equal(unknown.refund, null);
+});
+
+test("`approval_required` 仍然被解析（契约不收缩），但指向的是**单据级**入口", () => {
+  // 变更 003：对客闸门整体移除 → 这个取值在生产路径上不可达。
+  // 但契约**不收缩**（决策 D2：保留图侧原语），所以前端仍然解析它 ——
+  // 万一将来给另一条业务加对话轮级审批，前端不用改解析。
+  // ⚠️ `resume_with` 现在指向**单据级**审批入口，而不是已删除的 `/api/chat/approve`。
   const frames = [
     { event: "skeleton", seq: 1, ts: 1, data: { phase: "accepted", text: "收到…" } },
-    { event: "node", seq: 2, ts: 1, data: { node: "gate", progress: "等待人工确认…", delta: { blocked: false } } },
-    { event: "answer", seq: 3, ts: 1, data: { text: "这项操作需要人工确认后再执行。", done: true, degraded: false, citations: [], chart: false } },
+    { event: "answer", seq: 2, ts: 1, data: { text: "已转人工处理。", done: true, degraded: false, citations: [], chart: false } },
     {
       event: "done",
-      seq: 4,
+      seq: 3,
       ts: 1,
       data: {
         flow_state: "approval_required",
-        thread_id: "u2:demo-approve",
+        thread_id: "c2:demo-approve",
         session_id: "demo-approve",
         route: "refund",
         blocked: false,
-        approval: { thread_id: "u2:demo-approve", question: "请确认是否继续执行", interrupt_id: "e77f", resume_with: "POST /api/chat/approve" },
+        approval: { thread_id: "c2:demo-approve", question: "请确认是否继续执行", interrupt_id: "e77f" },
         latency_ms: 30,
         first_frame_ms: 0.2,
         debug: null,
@@ -158,9 +216,9 @@ test("挂起（待人工确认）：approval 落进状态，flow_state=approval_
   ];
   const state = feed(beginTurn(initialState()), frames);
   assert.equal(state.flowState, "approval_required");
-  assert.equal(state.approval?.threadId, "u2:demo-approve");
-  assert.equal(state.approval?.resumeWith, "POST /api/chat/approve");
-  assert.equal(state.blocked, false);
+  assert.equal(state.approval?.threadId, "c2:demo-approve");
+  // 后端没给 `resume_with` 时的默认值必须是**新的**单据级入口
+  assert.equal(state.approval?.resumeWith, "POST /api/refunds/decision");
 });
 
 test("被拦下：flow_state=blocked + answer 是安全话术（前端照实展示）", () => {

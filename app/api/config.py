@@ -89,9 +89,12 @@ def rate_limit_specs(settings: Any = None) -> dict[str, str]:
     for scope, key in (
         ("chat", "rate_limit_chat"),
         ("chat.stream", "rate_limit_chat_stream"),
-        ("chat.approve", "rate_limit_chat_approve"),
         # 第 12 步：长任务提交（默认 10/60，理由见 `ratelimit.DEFAULT_RULES`）
         ("tasks", "rate_limit_tasks"),
+        # ── 变更 003：退款两条写路径 ──────────────────────────────────────────
+        # （默认 20/60 与 60/60，理由见 `ratelimit.DEFAULT_RULES`）
+        ("refunds.request", "rate_limit_refunds_request"),
+        ("refunds.decide", "rate_limit_refunds_decide"),
     ):
         raw = str(_env_value(settings, key, "") or "").strip()
         if raw:

@@ -61,6 +61,7 @@ from app.agents.analysis import analysis_node
 from app.agents.data import data_node
 from app.agents.guardrail import INPUT_STAGE, OUTPUT_STAGE, guardrail_node
 from app.agents.rag import rag_node
+from app.agents.refund import refund_node
 from app.agents.router import router_node
 from app.agents.state import GraphState as AgentGraphState
 from app.agents.synthesis import synthesis_node
@@ -73,6 +74,7 @@ from app.graph.state import (
     NODE_GUARDRAIL_INPUT,
     NODE_GUARDRAIL_OUTPUT,
     NODE_RAG,
+    NODE_REFUND_REQUEST,
     NODE_ROUTER,
     NODE_SYNTHESIS,
     to_openai_messages,
@@ -91,7 +93,16 @@ FALLBACK_MESSAGE: Final[str] = (
 )
 
 #: 网络型节点（异常时按「这份材料没拿到」兜底，继续走 synthesis）
-NETWORK_NODES: Final[tuple[str, ...]] = (NODE_DATA, NODE_RAG, NODE_ANALYSIS)
+#:
+#: ⚠️ `refund_request` 也在里面（变更 003），理由值得写清：它虽然是个**写节点**，
+#: 但它的失败语义与「查不到数据」同类 —— 客户要的是「退款申请有没有提交成功」这句答复，
+#: 而不是一个 500。所以库故障时记一条 refusal 继续跑到 synthesis，由那里如实说
+#: 「这次没能提交，请稍后重试」。这与 `synthesis` / `guardrail_output` 那两个
+#: **收口型**节点不同：它们崩了就没有回答可出网，必须停下。
+#:
+#: ⚠️ 反过来说：`refund_node` **内部**已经把业务拒绝（订单不可退、超额、越权）
+#: 消化成了 refusal（不抛），所以能走到这里兜底的只剩**真正的故障**。
+NETWORK_NODES: Final[tuple[str, ...]] = (NODE_DATA, NODE_RAG, NODE_ANALYSIS, NODE_REFUND_REQUEST)
 
 #: 节点名 → 可读的中文角色（日志与 `refusals` 里用，避免出现 `guardrail_output 挂了` 这种中英混排）
 NODE_LABELS: Final[dict[str, str]] = {
@@ -100,6 +111,7 @@ NODE_LABELS: Final[dict[str, str]] = {
     NODE_DATA: "数据查询",
     NODE_RAG: "知识库检索",
     NODE_ANALYSIS: "数据分析",
+    NODE_REFUND_REQUEST: "退款申请",
     NODE_SYNTHESIS: "回答合成",
     NODE_GUARDRAIL_OUTPUT: "输出护栏",
     NODE_GATE: "人工审批闸门",
@@ -273,6 +285,27 @@ def make_analysis(runtime: GraphRuntime) -> Any:
     return safe_node(_named(node, NODE_ANALYSIS))
 
 
+def make_refund(runtime: GraphRuntime) -> Any:
+    """退款申请节点（**变更 003 新增**）：对客「我要退款」的唯一写路径。
+
+    ⚠️ 它**不接收任何 runtime 注入**（没有 `llm=` / `search=`）：退款申请是
+    「用数据库事实做决定」的事，**不需要模型参与**。给它一个模型注入点，
+    等于给下一个人一个「让模型来决定退多少钱」的入口 —— 而那是把资金安全
+    押在模型的算术与判断上（`app/tools/refund.py` 的模块 docstring 第 1 条
+    已经为同一件事给过理由）。
+
+    保留 `runtime` 形参是为了与 `node_specs` 里其余工厂**同一个签名**：
+    让「所有节点都由同一个工厂表构造」这条结构可见，而不是八个工厂七种形状。
+    """
+
+    del runtime  # 见上：本节点刻意不消费任何注入点
+
+    async def node(state: AgentGraphState) -> dict[str, Any]:
+        return await refund_node(state)
+
+    return safe_node(_named(node, NODE_REFUND_REQUEST))
+
+
 def make_synthesis(runtime: GraphRuntime) -> Any:
     """合成节点：按角色三套模板，写 `answer` + `citations`；缓存命中时直接返回。
 
@@ -397,6 +430,10 @@ def node_specs(runtime: GraphRuntime) -> dict[str, Any]:
         NODE_DATA: make_data,
         NODE_RAG: make_rag,
         NODE_ANALYSIS: make_analysis,
+        # ⚠️ 变更 003：写节点挂在 analysis 之后、synthesis 之前。
+        # 顺序不影响语义（边才是语义），但「先只读的、再写」这个注册顺序
+        # 让 `get_graph().nodes` 的稳定顺序读起来与数据流一致。
+        NODE_REFUND_REQUEST: make_refund,
         NODE_SYNTHESIS: make_synthesis,
         NODE_GUARDRAIL_OUTPUT: make_guardrail_output,
         NODE_GATE: make_gate,
@@ -415,6 +452,7 @@ __all__ = [
     "make_guardrail_input",
     "make_guardrail_output",
     "make_rag",
+    "make_refund",
     "make_router",
     "make_synthesis",
     "node_specs",

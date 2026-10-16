@@ -154,6 +154,43 @@ a:hover {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* 变更 003：入口之下的**子页**链接。
+   视觉上必须与「入口」区分开，否则用户会以为多了几个平级入口 ——
+   而它们是同一个入口里的不同页面（`/internal` 与 `/internal/refunds`）。
+   缩进 + 更小的字号 + 更淡的颜色，三样一起用（只靠颜色在色弱下分不出来）。 */
+.sidenav-link.sub {
+  padding-left: 22px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.sidenav-link.sub.active {
+  color: var(--accent);
+}
+
+/* 退款结果卡片（变更 003）：订单页与对话气泡共用。
+   三档语义与 badge 一致：ok = 已落地、warn = 等人工、danger = 没办成。 */
+.refund-card {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2, rgba(0, 0, 0, 0.02));
+  font-size: 13px;
+}
+
+.refund-card.ok {
+  border-left: 3px solid var(--ok, #2f855a);
+}
+
+.refund-card.warn {
+  border-left: 3px solid var(--warn, #b7791f);
+}
+
+.refund-card.danger {
+  border-left: 3px solid var(--danger, #c53030);
+}
+
 .sidenav-foot {
   margin-top: auto;
   border-top: 1px solid var(--border);

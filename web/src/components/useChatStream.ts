@@ -5,16 +5,23 @@
  *
  * 两条纪律：
  *
- * 1. **业务判断一件都不做**：`blocked` / `refusals` / `approval` 全部**照实展示**。
- *    这里只在「服务端说待审批」时多给我一个按钮 —— 那个按钮调的是
- *    `POST /api/chat/approve`，批准与否的后果由后端的闸门决定（`8.graph.md` §5 第四条）。
- * 2. **会话 id 由前端记住、`thread_id` 不记**：`thread_id` 是服务端派生的
- *    （`u{user_id}:{session_id}`），审批通道要用它，但**只能用响应里回传的那个**，
+ * 1. **业务判断一件都不做**：`blocked` / `refusals` / `refund` 全部**照实展示**。
+ * 2. **会话 id 由前端记住、`thread_id` 不记**：`thread_id` 是服务端派生的，
  *    前端不自己拼（`16.web.md` §4 第 4 条）。
+ *
+ * ## ⚠️ 变更 003 从这里删掉了 `approve()`
+ *
+ * 变更 003 之前这个 hook 暴露一个 `approve(approved, reason)`，调的是
+ * `POST /api/chat/approve` —— 而那个接口的**批准人就是发起人**（客户批准自己发起的
+ * 敏感操作）。那不是人机审批，是自审批，正是需求 2 要修的问题。
+ *
+ * 现在：对客闸门整体移除（图里不再注册闸门节点），审批搬到**单据级**入口
+ * （`/internal/refunds` 页面 → `POST /api/refunds/decision`，要 `approve:refund`）。
+ * 所以这个 hook 里没有、也不该有「批准」这个动作：**客户没有任何东西需要自己批准**。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, postApprove } from "@/lib/api";
+import { ApiError } from "@/lib/api";
 import {
   browserStorage,
   newSessionId,
@@ -49,7 +56,6 @@ export interface UseChatStreamResult {
   /** 已经自动重连过几次（页面上显示出来，别让它成为静默行为） */
   connectionAttempts: number;
   send: (text: string) => void;
-  approve: (approved: boolean, reason?: string) => Promise<void>;
   reset: () => void;
   /** 手动重连：**换一条连接**（不是只清状态 —— 那正是坑 17 里「点新会话就好了」的假修法） */
   reconnect: () => void;
@@ -59,7 +65,7 @@ function messageId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-/** 从 stream 的收尾状态造一条 assistant 消息（含出处、拦下原因、降级标记）。 */
+/** 从 stream 的收尾状态造一条 assistant 消息（含出处、拦下原因、降级标记、退款结果）。 */
 function toAssistantMessage(state: StreamState): Message {
   const turn = toTurnResult(state);
   return {
@@ -71,6 +77,7 @@ function toAssistantMessage(state: StreamState): Message {
     route: turn.route,
     blocked: turn.blocked,
     degraded: turn.degraded,
+    refund: turn.refund,
     refusals: [],
   };
 }
@@ -78,17 +85,19 @@ function toAssistantMessage(state: StreamState): Message {
 /**
  * `answer` 帧为空时给用户看的话 —— **必须按 flow_state 分情况**。
  *
- * ⚠️ 实测踩到（对客页问「帮我申请一笔退款」）：挂起等审批的那一轮，后端刻意**不发回答正文**
- * （`answer.text` 是空串，什么都不做才是对的 —— 批准之前不该调用写路径），
- * 而第一版这里一律显示「这一轮没有产生回答：看下面的状态与拦下原因」。
- * 那句话会让用户以为**助手卡住了 / 坏了**，但页面上其实已经渲染出「需要人工确认」面板、
- * 气泡也带了「待人工确认」徽章 —— **是文案在误导，不是链路有问题**。
+ * ⚠️ 实测踩到（对客页问「帮我申请一笔退款」）：第一版这里一律显示
+ * 「这一轮没有产生回答：看下面的状态与拦下原因」。那句话会让用户以为
+ * **助手卡住了 / 坏了**，但页面上其实已经有对应的面板 —— **是文案在误导，不是链路有问题**。
  *
- * 所以：挂起时明确说「在等你在下面点批准」；被拦下与正常投递各自说自己的话。
+ * ⚠️ 变更 003 删掉了 `approval_required` 那一支：对客闸门整体移除后它不可达
+ * （契约保留，但生产路径上不会再出现）。保留一个「请点批准」的提示只会让
+ * 用户去找一个不存在的按钮。
  */
 function fallbackText(turn: { flowState: string | null; blocked: boolean }): string {
   if (turn.flowState === "approval_required") {
-    return "这一轮没有直接回答 —— 它被判定为需要人工确认的操作，已经在下方挂起。请点「批准并继续」或「拒绝」。";
+    // 契约仍可能给出这个值（图侧原语保留），但**没有匹配的按钮**可点：
+    // 审批已经搬到单据级入口，所以这里如实说明「去哪儿处理」，而不是让它去点不存在的按钮。
+    return "这一轮被判定为需要人工确认的操作，已转交人工处理。退款类申请请到「我的订单」里提交，进度在「退款审批」里查看。";
   }
   if (turn.flowState === "blocked" || turn.blocked) {
     return "这一轮被安全策略拦下了，没有产生回答。原因见下方面板的拦截信息。";
@@ -103,8 +112,8 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
   const [error, setError] = useState("");
   const [sessionId, setSessionId] = useState("");
   const handleRef = useRef<ChatStreamHandle | null>(null);
-  /** 收到 `done` 帧的那一轮是在「发问题」还是「审批」时产生的 —— 决定要不要追加气泡 */
-  const waitingRef = useRef<"ask" | "approve" | null>(null);
+  /** 收到 `done` 帧的那一轮是在「发问题」时产生的 —— 决定要不要追加气泡 */
+  const waitingRef = useRef<"ask" | null>(null);
   /**
    * 重建连接的钥匙：`reconnect()` 把它 +1，下面的 effect 随之重建（并 clean 掉旧连接）。
    *
@@ -237,54 +246,10 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
     [sessionId],
   );
 
-  const approve = useCallback(
-    async (approved: boolean, reason?: string) => {
-      const gate = stream.approval;
-      if (!gate) return;
-      setError("");
-      setMessages((current) => [
-        ...current,
-        {
-          id: messageId("system"),
-          role: "system",
-          text: approved ? "已提交「批准」" : "已提交「拒绝」",
-        },
-      ]);
-      try {
-        // ⚠️ 走 `withFreshToken`（issue 003 的 P1-2）：审批是写操作，令牌过期时
-        //    必须续期后重试，而不是让用户看到「登录失效」而丢掉这次审批动作。
-        const response = await withFreshToken(options.entry, storage, (fresh) =>
-          postApprove(fresh, {
-            threadId: gate.threadId,
-            approved,
-            reason,
-          }),
-        );
-        // 审批的结果走 HTTP 返回（不是 WS 帧）：所以这里直接把响应落成一条 assistant 消息
-        setMessages((current) => [
-          ...current,
-          {
-            id: messageId("assistant"),
-            role: "assistant",
-            text: response.answer || "（审批完成，但没有产生回答）",
-            citations: response.citations,
-            flowState: response.flow_state,
-            route: response.route,
-            blocked: response.blocked,
-            refusals: response.refusals,
-          },
-        ]);
-      } catch (exc) {
-        const message =
-          exc instanceof ApiError
-            ? `${exc.message}${exc.requestId ? `（request_id=${exc.requestId}）` : ""}`
-            : String(exc);
-        setError(message);
-        setMessages((current) => [...current, { id: messageId("system"), role: "system", text: `审批失败：${message}` }]);
-      }
-    },
-    [options.entry, options.token, storage, stream.approval],
-  );
+  // ⚠️ 变更 003 **删除了 `approve()`**：`POST /api/chat/approve` 的批准人就是发起人
+  // （自审批），对客闸门整体移除后它在任何角色下都恒 409。
+  // 审批搬到了单据级入口（`/internal/refunds` → `POST /api/refunds/decision`），
+  // 而那个动作**不属于这个 hook**：它认的是「要审批的退款单」，不是「这一轮流式对话」。
 
   const reset = useCallback(() => {
     const fresh = newSessionId();
@@ -327,7 +292,6 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
       error,
       connectionAttempts,
       send,
-      approve,
       reset,
       reconnect,
     }),
@@ -340,7 +304,6 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
       error,
       connectionAttempts,
       send,
-      approve,
       reset,
       reconnect,
     ],

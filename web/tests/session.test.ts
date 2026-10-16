@@ -27,6 +27,8 @@ import {
 } from "../src/lib/auth.ts";
 import {
   clearSessionPair,
+  clearSessionsForAccount,
+  currentAccountId,
   ensureFreshToken,
   readActiveSession,
   readRefreshToken,
@@ -145,13 +147,59 @@ test("服务端没给 entry（或给了不认识的词）时退回前端兜底",
   assert.equal(writeSessionPair(payloadFor("admin", "e1", "employee", "nonsense"), storage2), "admin");
 });
 
-test("三把钥匙互不覆盖：登录管理台不影响对客页的登录态", () => {
+// ── 变更 003：登录写多把钥匙（需求 1 的根因修复）────────────────────────────
+//
+// ⚠️ **语义变更**：变更 002 建立的「三把钥匙互不覆盖」在这里被有意改写。
+// 变更 003 之前只写 `payload.entry` 指定的那一把，而每个页面只读自己那把 ——
+// 于是**管理员登录后进 `/` 或 `/internal` 会看到「需要先登录」**（需求 1 的现场）。
+//
+// 现在：同一账号登录会把它能进入的**每一个入口**都写上同一对令牌。
+// 代价是**后写覆盖先写**（同一个浏览器里不能同时持两个账号），这是决策 1 的
+// 显式取舍，见 `docs/changes/003` §3.1.1。
+
+test("★管理员登录：三个入口的钥匙都拿到同一枚令牌（需求 1）", () => {
+  const storage = memoryStorage();
+  const payload = payloadFor("admin", "e1", "employee", "admin");
+  writeSessionPair(payload, storage);
+
+  for (const entry of ["customer", "internal", "admin"] as const) {
+    const session = readSession(entry, storage);
+    assert.ok(session, `${entry} 那把钥匙是空的 —— 管理员进那个入口会显示「需要先登录」`);
+    assert.equal(session.role, "admin");
+    assert.equal(session.token, payload.accessToken, `${entry} 的令牌与登录响应不一致`);
+    // 刷新令牌也必须一起写：只写访问令牌会让那个入口在 30 分钟后硬性掉线
+    assert.equal(readRefreshToken(entry, storage), payload.refreshToken);
+  }
+});
+
+test("★客户登录：只写对客那一把（不去碰对内/管理台）", () => {
   const storage = memoryStorage();
   writeSessionPair(payloadFor("customer", "c2", "customer", "customer"), storage);
-  writeSessionPair(payloadFor("admin", "e1", "employee", "admin"), storage);
+  assert.ok(readSession("customer", storage));
+  assert.equal(readSession("internal", storage), null, "客户不该拿到对内入口的登录态");
+  assert.equal(readSession("admin", storage), null, "客户更不该拿到管理台入口的登录态");
+});
+
+test("★客服登录：写对客 + 对内两把（因为他有 approve:refund，能进对内）", () => {
+  const storage = memoryStorage();
+  writeSessionPair(payloadFor("customer_service", "e2", "employee", "internal"), storage);
+  assert.ok(readSession("customer", storage));
+  assert.ok(readSession("internal", storage), "客服必须能进对内，否则看不到自己的退款审批台");
+  assert.equal(readSession("admin", storage), null, "客服没有 admin 权限点");
+});
+
+test("★后写覆盖先写（变更 003 的显式代价，不是 bug）", () => {
+  const storage = memoryStorage();
+  writeSessionPair(payloadFor("customer", "c2", "customer", "customer"), storage);
   assert.equal(readSession("customer", storage)?.role, "customer");
+
+  // 同一个浏览器里再登录管理员：他会写进 customer + internal + admin 三把钥匙，
+  // 于是**客户那把被覆盖**。这是「管理员要能用三个入口」的必然代价 ——
+  // 想同时持两个身份已不可能（变更 002 的能力在这里有意收回）。
+  writeSessionPair(payloadFor("admin", "e1", "employee", "admin"), storage);
+  assert.equal(readSession("customer", storage)?.role, "admin");
+  assert.equal(readSession("internal", storage)?.role, "admin");
   assert.equal(readSession("admin", storage)?.role, "admin");
-  assert.notEqual(refreshKey("customer"), refreshKey("admin"));
 });
 
 test("clearSessionPair 把访问令牌与刷新令牌一起清掉", () => {
@@ -161,6 +209,49 @@ test("clearSessionPair 把访问令牌与刷新令牌一起清掉", () => {
   clearSessionPair("admin", storage);
   assert.equal(readSession("admin", storage), null);
   assert.equal(readRefreshToken("admin", storage), null, "留下刷新令牌会让下次又去试一遍");
+});
+
+// ── 变更 003：退出必须按**账号**清（决策 14）────────────────────────────────
+
+test("★退出按账号清：管理员退出把三个入口一起清掉（不留隐形会话）", () => {
+  const storage = memoryStorage();
+  writeSessionPair(payloadFor("admin", "e1", "employee", "admin", { accountId: 1 }), storage);
+  assert.equal(currentAccountId(storage), 1);
+
+  const cleared = clearSessionsForAccount(1, storage);
+  assert.deepEqual([...cleared].sort(), ["admin", "customer", "internal"]);
+  for (const entry of ["customer", "internal", "admin"] as const) {
+    assert.equal(readSession(entry, storage), null, `${entry} 没清干净：退出后那个入口还能用`);
+    assert.equal(readRefreshToken(entry, storage), null);
+  }
+});
+
+test("★退出不误伤别的账号的钥匙", () => {
+  const storage = memoryStorage();
+  // 客户 7 在客户入口登录（只有一把钥匙）
+  writeSessionPair(payloadFor("customer", "c2", "customer", "customer", { accountId: 7 }), storage);
+  // 另一台账号（id=1）的令牌被手工塞进 admin 入口
+  const adminToken = accountToken("admin", "e1", "employee", 1800, 1);
+  writeSession({ token: adminToken, userId: "e1", role: "admin", entry: "admin" }, storage);
+
+  const cleared = clearSessionsForAccount(1, storage);
+  assert.deepEqual(cleared, ["admin"], "只该清掉 id=1 自己的那把钥匙");
+  assert.ok(readSession("customer", storage), "客户 7 的登录态被误清了");
+});
+
+test("★账号 id 解不出来（手粘令牌）时保守地清全部", () => {
+  const storage = memoryStorage();
+  // `aid` 缺失的令牌（形状合法但 accountId=0）——后端本来就会拒它
+  const legacy = fakeJwt({
+    sub: "c2",
+    role: "customer",
+    typ: "access",
+    exp: Math.floor(Date.now() / 1000) + 1800,
+  });
+  writeSession({ token: legacy, userId: "c2", role: "customer", entry: "customer" }, storage);
+  const cleared = clearSessionsForAccount(0, storage);
+  assert.deepEqual(cleared, ["customer"], "解不出归属时宁可多清一点，也不要留隐形会话");
+  assert.equal(readSession("customer", storage), null);
 });
 
 test("readActiveSession 把主体标识串原样带出来（不是数字 user_id）", () => {

@@ -203,6 +203,7 @@
 |---|---|---|---|---|
 | [001](001-account-login-and-admin-console.md) | 新增账号登录与管理后台（按角色分流入口） | `已完成`（T1–T18） | security / db / api / agents / graph / alembic / web / scripts | 2026-02-19 |
 | [002](002-light-ui-sidebar-and-autoprobe.md) | 前端改版：浅色护眼 + 登录/主界面分离 + 左侧边栏权限分流 + 自动探活 + 管理台表格修复 | `已完成`（T1–T19） | web / scripts（取证） | 2026-10-15 |
+| [003](003-refund-workflow-and-entry-permissions.md) | 退款申请/审批闭环 + 入口权限贯通（管理员三入口、客户订单页、员工退款台） | `已完成`（T1–T17） | security / db / api / graph / agents / tools / alembic / web / scripts / tests | 2026-10-16 |
 
 ## 8. 模板
 

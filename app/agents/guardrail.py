@@ -293,6 +293,24 @@ def _materials_digest(state: GraphState) -> str:
 
     只给**计数与答案本身的来源**，不给原始数据：审查者不需要看到客户的完整地址
     才能判断有没有编造，而把原始数据再喂一次等于把泄漏面扩大一倍。
+
+    ## ⚠️ 变更 003：**必须**把退款申请的结果写进来（实测踩到的假阳性）
+
+    第一版漏了它，后果是**LLM 路径的每一次退款回答都被输出侧护栏拦下**：
+
+    ```
+    材料摘要：业务数据 0 行 / 知识库 0 条 / 分析结论 无 / 未拿到 无
+    待审回答：您的退款申请已提交，退款单号 28，订单 12，金额 12346.75 元…
+    判定：allowed=false，reason="回答包含退款单28…涉嫌编造/越权"
+    ```
+
+    判定者的推理**其实是对的** —— 按它拿到的材料，回答里那几个数字确实**没有来源**
+    （对客退款路径本来就不查 SQL、不检索知识库，所以 rows 与 docs 都是 0）。
+    这是我们漏喂了「本次已经受理了一笔退款」这条事实，而不是判定者太敏感。
+
+    修法是**补事实**而不是降低审查强度：把 `state["refund"]` 摘要进来。
+    这条经验值得记住 —— 新增一条「不经过检索、直接由节点产出事实」的路径时，
+    同时要更新所有「核对有没有编造」的下游，否则护栏会把**真话**当成编造。
     """
     rows = list(state.get("rows") or [])
     docs = list(state.get("docs") or [])
@@ -303,6 +321,25 @@ def _materials_digest(state: GraphState) -> str:
         f"- 分析结论：{'有' if analysis.get('headline') else '无'}",
         f"- 未拿到的材料：{'；'.join(str(r) for r in (state.get('refusals') or [])) or '无'}",
     ]
+    refund = state.get("refund") or {}
+    if refund:
+        # 只写「发生了什么」，不写原始字段名（判定者要判断的是「答案有没有编造」，
+        # 而它需要的正是这几个可核对的事实）。
+        status = str(refund.get("status") or "")
+        if status == "submitted":
+            lines.append(
+                f"- **本次已受理的退款申请（系统刚写入数据库的真实记录）**："
+                f"退款单号 {refund.get('refund_id')}、订单 {refund.get('order_id')}、"
+                f"金额 {refund.get('amount')} 元、状态 `requested`（等待平台审核）。"
+                "回答里出现这些数字是**如实的**，不是编造。"
+            )
+        elif status == "needs_order_id":
+            lines.append(
+                "- 退款申请**尚未提交**（客户有多笔可退订单，需要他先确认是哪一笔）；"
+                f"候选订单号：{refund.get('candidates')}"
+            )
+        else:
+            lines.append(f"- 退款申请**没有提交成功**，原因：{refund.get('hint')}")
     return "\n".join(lines)
 
 

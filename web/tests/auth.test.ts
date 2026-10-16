@@ -10,7 +10,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  canApproveRefund,
+  canRequestRefund,
   canUseInternal,
+  canUseInternalEntry,
   clearSession,
   decodeJwtPayload,
   defaultEntry,
@@ -20,8 +23,10 @@ import {
   isExpired,
   memoryStorage,
   newSessionId,
+  PERM_APPROVE_REFUND,
   PERM_READ_ALL_ORDERS,
   PERM_READ_FINANCE,
+  PERM_REQUEST_REFUND,
   readSession,
   readSessionId,
   ROLE_PERMISSIONS,
@@ -48,6 +53,40 @@ test("权限表：客户没有 read:all_orders，员工有", () => {
   assert.equal(canUseInternal("finance_auditor"), true);
   assert.equal(canUseInternal("admin"), true);
   assert.equal(canUseInternal("未知角色"), false, "表里没有的角色 = 没有任何权限（默认拒绝）");
+});
+
+test("★变更 003：`canUseInternal`（查全站）与 `canUseInternalEntry`（进对内）是两个判据", () => {
+  // 客服有 approve:refund 但**没有** read:all_orders：
+  //   * 能进对内入口（否则看不到自己的退款审批台 → 需求 3 对客服不可用）；
+  //   * 但**查不到全站订单**（RBAC 不给）。
+  // 把两者合成一个判据的症状是：客服看到一个**可用的**查询框，而后端每次都拒。
+  assert.equal(canUseInternal("customer_service"), false, "客服不该能查全站订单");
+  assert.equal(canUseInternalEntry("customer_service"), true, "客服必须能进对内（去审批退款）");
+
+  // 对客角色两个都 false（变更 003 没有放宽客户）
+  assert.equal(canUseInternal("customer"), false);
+  assert.equal(canUseInternalEntry("customer"), false);
+
+  // 有 read:all_orders 的角色两个都 true
+  for (const role of ["internal_employee", "manager", "finance_auditor", "admin"]) {
+    assert.equal(canUseInternal(role), true, `${role} 应当能查全站订单`);
+    assert.equal(canUseInternalEntry(role), true, `${role} 应当能进对内`);
+  }
+
+  // 未登记角色：默认拒绝
+  assert.equal(canUseInternalEntry("未知角色"), false);
+});
+
+test("★变更 003：申请退款与审批退款是两个权限点（客户批不了自己）", () => {
+  assert.equal(canRequestRefund("customer"), true, "客户要能申请退款（需求 2）");
+  assert.equal(canApproveRefund("customer"), false, "★客户永远不能审批退款（需求 2 的核心）");
+  assert.equal(canRequestRefund("admin"), true);
+  for (const role of ["customer_service", "internal_employee", "manager", "finance_auditor", "admin"]) {
+    assert.equal(canApproveRefund(role), true, `${role} 应当能审批退款`);
+  }
+  // 权限点常量与后端逐字一致（名字写错在类型层面看不出来，只能断言）
+  assert.equal(PERM_REQUEST_REFUND, "request:refund");
+  assert.equal(PERM_APPROVE_REFUND, "approve:refund");
 });
 
 test("权限表：只有财务审计与管理员有 read:finance", () => {
@@ -191,16 +230,22 @@ test("权限表的形状：每个角色都是数组，且客户里没有 read:al
   assert.ok(!ROLE_PERMISSIONS.customer.includes(PERM_READ_ALL_ORDERS));
 });
 
-test("演示身份卡片：每个 role 都在权限表里（漏配会让卡片显示成「仅对客」）", () => {
-  assert.ok(DEMO_PRESETS.length >= 3, "至少要有客户 / 员工 / 财务三个演示身份");
+test("★变更 003：DEMO_PRESETS 的 role 都在权限表里，且「对内」卡片真的进得去", () => {
+  assert.ok(DEMO_PRESETS.length >= 3, "至少要有客户 / 员工 / 管理员三个演示身份");
   for (const preset of DEMO_PRESETS) {
     assert.ok(
       Object.hasOwn(ROLE_PERMISSIONS, preset.role),
       `演示身份 ${preset.label} 的角色 ${preset.role} 不在前端权限表里`,
     );
-    // 「对内」卡片必须是真的能进对内的角色，否则点了会被自己的门禁挡回去
+    // 「对内」卡片必须是真的能进对内的角色，否则点了会被自己的门禁挡回去。
+    // ⚠️ 变更 003：判据从 `canUseInternal` 换成 `canUseInternalEntry` ——
+    // 客服（有 approve:refund、无 read:all_orders）也在「能进对内」的集合里。
     if (preset.entry === "internal") {
-      assert.equal(canUseInternal(preset.role), true, `${preset.label} 标了对内，但 canUseInternal 是 false`);
+      assert.equal(
+        canUseInternalEntry(preset.role),
+        true,
+        `${preset.label} 标了对内，但 canUseInternalEntry 是 false`,
+      );
     }
   }
 });

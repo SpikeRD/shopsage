@@ -40,30 +40,41 @@
 > 本表是它们的说明，**改权限请改代码**（前端 `web/src/lib/auth.ts::ROLE_PERMISSIONS` 是副本，
 > 只用于渲染菜单，不用于授权判断）。
 
-### 权限点（6 个）
+### 权限点（8 个）
 
 | 权限点 | 含义 |
 |---|---|
 | `read:own` | 读**自己的**数据（对客路径，永远叠加行级过滤 `WHERE user_id = 本人`） |
-| `read:all_orders` | 读**全站**订单（对内分析路径）——**有它就进「对内」入口** |
+| `read:all_orders` | 读**全站**订单（对内分析路径） |
 | `read:finance` | 读财务级数据（金额明细、支付方式） |
-| `write:refund` | 发起退款 |
+| `write:refund` | **代客户发起**退款（员工侧；变更 003 起语义收窄为「发起」，不再等于「批准」） |
 | `write:ticket` | 建工单 |
+| `request:refund` | **申请**退款（变更 003 新增）。客户持有；只能建 `requested`，等员工审批 |
+| `approve:refund` | **审批**退款（变更 003 新增）。`requested → approved / rejected` |
 | `admin` | 管理台：开账号 / 停用 / 改角色 / 重置口令 ——**有它就进「管理台」入口** |
 
 ### 角色对照表（6 个角色，实测自代码）
 
 | 角色 | 入口 | 权限点 | 数据清晰度上限 |
 |---|---|---|---|
-| `customer` | 对客 | `read:own` `write:ticket` | 脱敏 |
-| `customer_service` | 对客 | `read:own` `write:refund` `write:ticket` | **公开（可对外）** |
-| `internal_employee` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` | 脱敏 |
-| `manager` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` | **内部可见** |
-| `finance_auditor` | 对内 | `read:own` `read:all_orders` `read:finance` `write:ticket` | 财务级 |
-| `admin` | 管理台 | 全部 6 个 | 财务级 |
+| `customer` | 对客 | `read:own` `write:ticket` `request:refund` | 脱敏 |
+| `customer_service` | **对内**（变更 003 起） | `read:own` `write:refund` `write:ticket` `approve:refund` | **公开（可对外）** |
+| `internal_employee` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` `approve:refund` | 脱敏 |
+| `manager` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` `approve:refund` | **内部可见** |
+| `finance_auditor` | 对内 | `read:own` `read:all_orders` `read:finance` `write:ticket` `approve:refund` | 财务级 |
+| `admin` | 管理台 | 全部 8 个 | 财务级 |
 
-**入口分流规则**（`entry_for_role`，判据是**能力**不是角色名）：
-有 `admin` → 管理台；否则有 `read:all_orders` → 对内；否则 → 对客。
+> **变更 003 的两处关键变化**（详见 [docs/changes/003](docs/changes/003-refund-workflow-and-entry-permissions.md)）：
+> 1. **退款拆成「申请 / 发起 / 审批」三个权限点**：客户能**申请**（`request:refund`）但
+>    **永远批不了**（拿不到 `approve:refund`）—— 这修的是「对客入口可以自己审批退款申请」。
+> 2. **客服的入口从「对客」改为「对内」**：他有 `approve:refund` 却没有 `read:all_orders`，
+>    而入口判据已放宽为「能读全站订单 **或** 能审批退款」。
+>    ⚠️ 「能进对内」≠「能查全站」：这两个判据在前后端都是**分开**的函数
+>    （`can_enter_internal` / `canUseInternalEntry` vs `canUseInternal`），不许多写一处。
+
+### 入口分流规则（`entry_for_role`，判据是**能力**不是角色名）
+有 `admin` → 管理台；否则**能进对内**（有 `read:all_orders` **或** `approve:refund`）→ 对内；否则 → 对客。
+（变更 003 把「或 `approve:refund`」加进来，否则客服进不去他自己的退款审批台。）
 
 ### 三条容易看错的地方
 
@@ -116,6 +127,7 @@
 | **issue 005 修复** | ✅ 已修复（**管理台停用/改角色 `Failed to fetch`**：CORS 白名单漏了 `PATCH` → 预检 400，那条请求根本没发出） | `app/api/main.py`、`tests/api/test_cors.py` | `uv run pytest -q tests/api/test_cors.py`；`node scripts/admin-patch-evidence.mjs`（**真浏览器 7 passed**）；见 [`issues/005`](issues/005-cors-missing-patch-method.md) |
 | **issue 006 修复** | ✅ 已修复（**管理台改角色提示成功但没生效**：受控 `select` 的值在异步 thunk 执行前被 React 回滚 → 请求体发的是旧角色） | `web/src/app/(app)/admin/page.tsx`、`web/tests/hook-wiring.test.ts` | `cd web; npm test`（**171 passed**，新增 2）；`node scripts/admin-role-evidence.mjs`（**真浏览器 6 passed**）；见 [`issues/006`](issues/006-admin-role-change-not-persisted.md) |
 | **issue 007 修复** | ✅ 已修复（**等 LLM 回复时退出登录 → 整个后端被一条死连接锁死**：WS 断连抛的 `WebSocketDisconnected` 掉进兜底分支 → 纯 CPU 忙等占满事件循环，之后连登录都永远得不到响应） | `app/api/chat.py`、`tests/api/test_chat_stream_disconnect.py` | `uv run pytest -q tests/api/test_chat_stream_disconnect.py`（**4 passed**；摘掉修复即 2 条红）；`node scripts/logout-during-llm-evidence.mjs`（**真浏览器 4 passed**）；见 [`issues/007`](issues/007-logout-during-llm-hangs-event-loop.md) |
+| 19 **变更 003：退款闭环 + 入口贯通** | ✅ 完成（**管理员能进三个入口**；**客户订单页 + 申请退款（LLM/手动）**；**员工退款审批台**；**客户不能再自己审批退款**） | `app/security/rbac.py`、`app/api/{orders,refunds,refund_errors}.py`、`app/tools/{orders,refund}.py`、`app/agents/refund.py`、`app/graph/builder.py`、`alembic/versions/20261016_c7a4e2f9b1d8_*`、`web/src/app/(app)/{orders,internal/refunds}/`、`web/src/lib/{auth,session,refund_ui}.ts` | `uv run pytest -q`（**1846 passed, 50 skipped**）；`cd web; npm test`（**201 passed**）、`npm run build`（`/orders` 与 `/internal/refunds` 均在路由表）；`uv run alembic upgrade head` + `downgrade -1` 往返；`uv run python -m scripts.evidence_refunds`（**真链路 19/19 PASS**）；见 [`docs/changes/003`](docs/changes/003-refund-workflow-and-entry-permissions.md) |
 
 > 📌 **变更 002（前端改版）的用法**：
 > ① 后端照旧 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
@@ -176,14 +188,19 @@ uv run python -m scripts.dev_token --account admin   # 签一个能粘进 Web �
 uv run python -m scripts.dev_token --role admin      # 也可以按角色取「第一个启用账号」来签
 uv run python -m scripts.evidence_accounts           # 变更 002 取证：账号与口令确实在库里（Argon2id，非明文）
 uv run python -m scripts.evidence_paths              # 变更 002 取证：三条主路径回归（需后端在跑）
+uv run python -m scripts.evidence_refunds            # 变更 003 取证：入口贯通 + 退款申请/审批闭环 + 客户不能自审批（需后端在跑）
 ```
+
+> ⚠️ `scripts.evidence_refunds` 会**真的改演示库**（提交并审批退款），跑完按 `evidence3-` 前缀清理。
+> 后端地址可用 `SHOPSAGE_API` 覆盖（默认 `http://127.0.0.1:8000`）——
+> **改完代码后原进程不会自动更新**，取证时先确认端口上跑的是哪一版。
 
 前端（都在 `web/` 下执行；需要 Node ≥ 22，本机实测 v24.16.0）：
 
 ```bash
 npm install --ignore-scripts   # ⚠️ 必须带 --ignore-scripts（见 16 runbook §10.1 坑 1）
 npm run dev                    # 开发模式 → http://127.0.0.1:3000
-npm test                       # 离线用例（171 条，不连后端；变更 002 起 +31，issue 004/006 再 +12）
+npm test                       # 离线用例（201 条，不连后端；变更 002 起 +31，issue 004/006 再 +12，变更 003 再 +30）
 npm run typecheck              # 类型检查
 npm run build                  # 构建通过（验收第 1 条）
 node tests/run-live.mjs        # 真链路用例（10 条，需要后端在跑）

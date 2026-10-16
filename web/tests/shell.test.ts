@@ -22,7 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { entryForPath, entryPath, visibleEntriesFor } from "../src/lib/auth.ts";
+import { entryForPath, entryPath, subPagesFor, visibleEntriesFor } from "../src/lib/auth.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const APP = path.resolve(HERE, "../src/app");
@@ -67,6 +67,45 @@ test("★ 能读全站订单的员工看到对客 + 对内，但看不到管理�
 
 test("管理员三个入口都看到（管理员也带 read:all_orders，顺序不能反）", () => {
   assert.deepEqual(visibleEntriesFor(["admin"]), ["customer", "internal", "admin"]);
+});
+
+test("★变更 003：客服看得到对内入口（他有 approve:refund，要在那里审批退款）", () => {
+  // 变更 003 之前这里返回 ["customer"] —— 而那时客服没有审批权，是对的。
+  // 现在他有了 approve:refund，若判据仍是「能读全站订单」，他会被送进对客入口、
+  // **根本看不到自己的退款审批台**（需求 3 对客服不可用）。
+  assert.deepEqual(visibleEntriesFor(["customer_service"]), ["customer", "internal"]);
+});
+
+// ── 变更 003：子页导航 ───────────────────────────────────────────────────────
+
+test("★对客入口的子页：对客问答 + 我的订单", () => {
+  const pages = subPagesFor("customer", ["customer"]);
+  assert.deepEqual(
+    pages.map((page) => page.path),
+    ["/", "/orders"],
+  );
+});
+
+test("★对内入口的子页：有审批权才显示「退款审批」", () => {
+  // 客服与内部员工都有 approve:refund
+  for (const role of ["customer_service", "internal_employee", "manager", "finance_auditor", "admin"]) {
+    const pages = subPagesFor("internal", [role]);
+    assert.ok(
+      pages.some((page) => page.path === "/internal/refunds"),
+      `${role} 有 approve:refund 却看不到退款审批子页`,
+    );
+  }
+});
+
+test("★子页判据是 approve:refund，不是「能进对内」", () => {
+  // 这条把「能进对内」与「能审批」两个判据分开钉住（变更 003 决策 15）：
+  // 一个只有 read:all_orders 的角色能进对内，但**不该**看到审批子页
+  // ——否则他会看到一个可用的按钮，而后端每次都会按 404 拒。
+  const pages = subPagesFor("internal", ["internal_employee"]);
+  assert.ok(pages.some((page) => page.path === "/internal"));
+  // 反过来：只给审批权、不给读全站的角色，子页里仍然有审批台
+  const reviewOnly = subPagesFor("internal", ["customer_service"]);
+  assert.ok(reviewOnly.some((page) => page.path === "/internal/refunds"));
 });
 
 test("未登录（空角色列表）只看到对客入口 —— 它是兜底入口，也是登录页之外的唯一去处", () => {
@@ -130,11 +169,26 @@ test("★ 个人信息优先来自 GET /api/auth/me，且回退时标注了「�
   );
 });
 
-test("★ 侧边栏读**多个**入口的登录态（三把钥匙互不覆盖，只读一个会回归）", () => {
+test("★ 侧边栏读**多个**入口的登录态（三把钥匙，只读一个会回归）", () => {
   // 判据是「源码里对三个入口都调了 readActiveSession」——用一个循环写的话，
   // 至少要有 entries 列表与 readActiveSession 两样东西。
   assert.match(SIDE_NAV, /readActiveSession/);
   assert.match(SIDE_NAV, /"admin"/, "没有读 admin 那把钥匙：管理员登录后侧边栏会显示「去登录」");
+});
+
+test("★变更 003：退出必须按**账号**清（不能只清当前入口）", () => {
+  // 变更 003 起登录会把同一枚令牌写进多把钥匙，所以只清当前入口会留下隐形会话：
+  // 用户在 /admin 点了退出（看起来成功了），而 / 与 /internal 的钥匙里还留着有效令牌。
+  assert.match(
+    SIDE_NAV,
+    /clearSessionsForAccount\(/,
+    "侧边栏的退出没有按账号清所有入口：会留下「以为退出了、其实还能用」的隐形会话",
+  );
+  assert.match(SIDE_NAV, /currentAccountId\(/, "没有取当前账号 id，就无法判断哪些钥匙属于本账号");
+});
+
+test("★变更 003：侧边栏渲染子页导航（对客→订单；对内→退款审批）", () => {
+  assert.match(SIDE_NAV, /subPagesFor\(/, "侧边栏没有子页导航：两个新页面没有入口");
 });
 
 test("★ 探活不在模块顶层调用（SSR/构建期不能 fetch，否则 next build 直接失败）", () => {

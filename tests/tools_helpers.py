@@ -24,6 +24,20 @@ from app.tools.refund import CONSUMING_REFUND_STATUSES, REFUNDABLE_ORDER_STATUSE
 # 所有测试造的幂等键都带这个前缀，便于「只删自己造的行」
 TEST_KEY_PREFIX = "test-tools-"
 
+#: **图侧退款节点**造的行的幂等键前缀（`app/tools/refund.llm_refund_key`）。
+#:
+#: ⚠️ 它必须被单独清掉，否则会**永久吃掉演示库的可退额度**（实测踩到）：
+#: `tests/graph/test_graph_refund.py` 里每个用例都会让节点真的落一张单，
+#: 而这些单按设计**只增不减**（`requested`/`approved` 计入 `CONSUMING_REFUND_STATUSES`）。
+#: 它们用的是 `llm-` 前缀，不在 `TEST_KEY_PREFIX` 的清理范围内 ——
+#: 于是跑一遍图用例之后，「客户 2/3 没有可退订单」，后续用例成片 skip，
+#: 而现象看起来像「种子数据坏了」。
+#:
+#: 为什么清理函数按前缀分两个：`test-tools-` 是本套件**自己**造的，
+#: `llm-` 是**被图节点造出来的**（用例只喂了 state）。两者都要清，
+#: 但它们是不同的来源，分开写才能说清「谁造的」。
+LLM_KEY_PREFIX = "llm-"
+
 
 def tool_key(suffix: str) -> str:
     """造一个测试用幂等键（`tool_key("ticket-1")` → `test-tools-ticket-1`）。"""
@@ -34,13 +48,21 @@ def cleanup_tool_rows() -> dict[str, int]:
     """删掉本测试套件造出来的工单/退款行（按幂等键前缀），返回删除条数。
 
     只删 `idempotency_key` 命中前缀的行：种子数据与别的用例造的行（幂等键为 NULL）不受影响。
+
+    ⚠️ **同时清 `llm-` 前缀**（图侧退款节点造的）：那些行会让订单额度永久减少，
+    留着它们会让后续用例以为「演示库没有可退订单」（理由见 `LLM_KEY_PREFIX`）。
+    真实的对话（人通过 /api/chat 或界面）也造 `llm-` 键 —— 但**测试不该在演示库里
+    留下真实的业务数据**，所以测试跑完就清是正确的一侧。
     """
     with SessionLocal() as db:
         tickets = db.execute(
             delete(Ticket).where(Ticket.idempotency_key.like(f"{TEST_KEY_PREFIX}%"))
         ).rowcount
         refunds = db.execute(
-            delete(Refund).where(Refund.idempotency_key.like(f"{TEST_KEY_PREFIX}%"))
+            delete(Refund).where(
+                Refund.idempotency_key.like(f"{TEST_KEY_PREFIX}%")
+                | Refund.idempotency_key.like(f"{LLM_KEY_PREFIX}%")
+            )
         ).rowcount
         db.commit()
     return {"tickets": int(tickets or 0), "refunds": int(refunds or 0)}
@@ -115,6 +137,7 @@ def count_refunds(idempotency_key: str) -> int:
 
 
 __all__ = [
+    "LLM_KEY_PREFIX",
     "TEST_KEY_PREFIX",
     "cleanup_tool_rows",
     "count_refunds",

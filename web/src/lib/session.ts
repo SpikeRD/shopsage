@@ -41,6 +41,7 @@ import {
   type Session,
   type StorageLike,
   tokenKey,
+  visibleEntriesFor,
   writeSession,
 } from "./auth.ts";
 import { postRefresh, type TokenPayload } from "./api.ts";
@@ -68,9 +69,27 @@ export function readRefreshToken(entry: Entry, storage: StorageLike): string | n
 /**
  * 把一登录拿到的一对令牌写进存储。
  *
- * ⚠️ **入口以服务端返回的 `entry` 为准**（`payload.entry`），不是前端算的：
- * 那是变更 001 刻意建立的「入口分流只有一处真相」。服务端没给（或给了个不认识的词）
- * 才退回 `defaultEntry(role)`。
+ * ## ⚠️ 变更 003：写进**该角色可进入的每一个入口**（不再只写一个）
+ *
+ * 变更 003 之前这里只写 `payload.entry` 指定的那一把钥匙，而每个页面只读自己那把
+ * （`/` 读 `.customer`、`/internal` 读 `.internal`）。后果就是需求 1 报的现场：
+ * **管理员登录后进 `/` 或 `/internal`，页面显示「需要先登录」** ——
+ * 他明明有全部权限，只是那两个页面读的钥匙里没有令牌。
+ *
+ * 现在按 `visibleEntriesFor([role])` 把**同一对令牌**写进该角色能进的每个入口。
+ *
+ * ## ⚠️ 必须显式承认的破坏性后果（这是决策 1 的代价，不是实现瑕疵）
+ *
+ * 变更 002 建立的「三把钥匙互不覆盖」**不再成立**：
+ *   * 同一账号登录会写它可进入的**多把**钥匙（不再是「一把钥匙一个身份」）；
+ *   * 所以「用客户身份开着对客页、同时用管理员身份开着管理台」这件事，
+ *     在**不同账号**之间变成了**后写覆盖先写**（同一个浏览器里只能同时持有一个账号）。
+ *
+ * 因此退出也必须按**账号**清（见 `clearSessionsForAccount`），否则会留下
+ * 「用户以为退了、其实 `/` 与 `/internal` 还能用」的隐形会话。
+ *
+ * ⚠️ **入口仍以服务端返回的 `entry` 为准**（`payload.entry`）——那是「登录后落在哪一页」；
+ * 而这里写几把钥匙是「这个身份能进哪几个界面」，两者是不同的决定。
  */
 export function writeSessionPair(
   payload: TokenPayload,
@@ -78,15 +97,83 @@ export function writeSessionPair(
   options: { entry?: Entry } = {},
 ): Entry {
   const entry = options.entry ?? normalizeEntry(payload.entry) ?? defaultEntry(payload.role);
-  const session: Session = {
-    token: payload.accessToken,
-    userId: payload.subject,
-    role: payload.role,
-    entry,
-  };
-  writeSession(session, storage);
-  storage.setItem(refreshKey(entry), payload.refreshToken);
+  // 该角色能进入的全部入口（对客永远是其中之一：它是兜底入口）
+  //
+  // ⚠️ 还要**并入服务端指定的 `entry`**：它回答的是「登录后落在哪一页」，
+  // 而 `visibleEntriesFor` 回答的是「这个角色能进哪几个界面」—— 两者理论上一致，
+  // 但**服务端是权威**（它是 `entry_for_role` 的唯一真相）。
+  // 不并入的后果很具体：万一服务端说「进 internal」而这个角色不在可见集里，
+  // 我们会把它重定向到一个**没有令牌**的页面 —— 用户看到「需要先登录」，
+  // 而他刚刚登录成功（正是变更 003 要修的那类现场）。
+  // 测试 `writeSessionPair 用**服务端返回的 entry**` 钉住了这条。
+  const targets = new Set<Entry>([...visibleEntriesFor([payload.role]), entry]);
+  for (const target of targets) {
+    const session: Session = {
+      token: payload.accessToken,
+      userId: payload.subject,
+      role: payload.role,
+      entry: target,
+    };
+    writeSession(session, storage);
+    storage.setItem(refreshKey(target), payload.refreshToken);
+  }
   return entry;
+}
+
+/**
+ * 退出：清掉**本账号写过的所有入口**钥匙（变更 003 / 决策 14）。
+ *
+ * ## 为什么不能只清当前路径那个入口
+ *
+ * 变更 003 起登录会把同一枚令牌写进多把钥匙（见 `writeSessionPair`）。
+ * 若退出只清当前入口，用户在 `/admin` 点「退出」之后：
+ *   * `/admin` 要重新登录（看起来退成功了）；
+ *   * 但 `/` 与 `/internal` 的钥匙里**还留着同一枚有效令牌** —— 会话其实还活着。
+ * 那是一类「用户以为已经登出、实际没有」的安全问题，比多清一把钥匙严重得多。
+ *
+ * ## 怎么判定「是本账号的」
+ *
+ * 用令牌的 `aid`（账号主键，变更 001 起每个令牌都带）。没有 `aid` 的旧格式令牌
+ * 一律清掉 —— 它们在 `deps.principal_with_account` 里本来就会被拒，
+ * 留着只会让用户看到一次莫名的 401。
+ *
+ * `accountId` 为 0（本地解不出 `aid`，例如手粘的令牌）时退化成「清全部入口」：
+ * 宁可比必要的多清一点，也不要留下一条隐形会话。
+ */
+export function clearSessionsForAccount(
+  accountId: number,
+  storage: StorageLike,
+  options: { entries?: readonly Entry[] } = {},
+): Entry[] {
+  const entries = options.entries ?? (["customer", "internal", "admin"] as const);
+  const cleared: Entry[] = [];
+  for (const entry of entries) {
+    const token = storage.getItem(tokenKey(entry));
+    if (!token) continue;
+    const claims = decodeJwtPayload(token);
+    // 解不出来 / 非账号令牌（`aid` 为 0）→ 一并清掉（保守一侧）
+    const owner = claims?.accountId ?? 0;
+    if (accountId <= 0 || owner <= 0 || owner === accountId) {
+      clearSessionPair(entry, storage);
+      cleared.push(entry);
+    }
+  }
+  return cleared;
+}
+
+/** 当前登录账号的 id（优先取任一入口令牌的 `aid`；取不到返回 0）。 */
+export function currentAccountId(
+  storage: StorageLike,
+  options: { entries?: readonly Entry[] } = {},
+): number {
+  const entries = options.entries ?? (["customer", "internal", "admin"] as const);
+  for (const entry of entries) {
+    const token = storage.getItem(tokenKey(entry));
+    if (!token) continue;
+    const claims = decodeJwtPayload(token);
+    if (claims && claims.accountId > 0) return claims.accountId;
+  }
+  return 0;
 }
 
 /** 把服务端给的 `entry` 字符串收敛成 `Entry`；不认识就返回 null（由调用方兜底）。 */

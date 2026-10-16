@@ -261,14 +261,32 @@ def test_error_envelope_shape_is_stable() -> None:
 
 
 def test_ui_business_paths_are_the_documented_ones(app) -> None:
-    """对外路径与 `9.api.md` §2 一致（改路径要先改文档，反之亦然）。"""
+    """对外路径与 `9.api.md` §2 一致（改路径要先改文档，反之亦然）。
+
+    ⚠️ **变更 003 的两处变化**：
+      * `POST /chat/approve` **被删除**（对客闸门整体移除后它恒 409，
+        且它允许发起人批准自己的操作 —— 那正是需求 2 要修的问题）。
+        所以这里断言它**不在**路径表里：删掉的接口不该被悄悄加回来。
+      * 新增 `GET /orders`、`POST /refunds`、`GET /refunds`、
+        `POST /refunds/decision` 四条（对应需求 2/3）。
+    """
     from app.api.config import DEFAULT_PREFIX, api_prefix
 
     schema = app.openapi()
-    assert f"{DEFAULT_PREFIX}/chat" in schema["paths"]
-    assert f"{DEFAULT_PREFIX}/chat/approve" in schema["paths"]
-    assert "/health" in schema["paths"]
-    assert "/metrics" in schema["paths"]
+    paths = schema["paths"]
+    assert f"{DEFAULT_PREFIX}/chat" in paths
+    assert f"{DEFAULT_PREFIX}/chat/approve" not in paths, (
+        "变更 003 已经删除 /api/chat/approve（发起人可以批准自己，是自审批）；"
+        "它不该被加回来 —— 审批已搬到 /api/refunds/decision"
+    )
+    # ── 变更 003 新增的四条业务路径 ──────────────────────────────────────────
+    assert f"{DEFAULT_PREFIX}/orders" in paths
+    assert f"{DEFAULT_PREFIX}/orders/{{order_id}}" in paths
+    assert "post" in paths[f"{DEFAULT_PREFIX}/refunds"]
+    assert "get" in paths[f"{DEFAULT_PREFIX}/refunds"]
+    assert f"{DEFAULT_PREFIX}/refunds/decision" in paths
+    assert "/health" in paths
+    assert "/metrics" in paths
     # WebSocket 不进 OpenAPI（协议如此），所以从路由表断言它存在，并**拼上前缀**核对
     prefix = api_prefix()
     ws_paths = {f"{prefix}{path}" for path in _websocket_paths(app)}

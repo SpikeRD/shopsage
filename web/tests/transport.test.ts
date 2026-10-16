@@ -13,7 +13,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { ApiError, postApprove, postChat } from "../src/lib/api.ts";
+import { ApiError, postChat } from "../src/lib/api.ts";
 import { WS_SUBPROTOCOL, WS_TOKEN_PREFIX } from "../src/lib/contracts.ts";
 import { initialState, openChatStream, type WebSocketLike } from "../src/lib/stream.ts";
 
@@ -544,13 +544,13 @@ test("契约不符（后端改了字段）：报 contract_mismatch，而不是�
   );
 });
 
-test("postApprove：thread_id 原样回传，approved=false 也要发出去", async () => {
-  let body: unknown = null;
-  const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
-    body = JSON.parse(String(init?.body));
-    return jsonResponse({ answer: "按未执行处理", flow_state: "blocked", thread_id: "u2:s1", session_id: "s1" });
-  }) as unknown as typeof fetch;
-  const response = await postApprove("tok", { threadId: "u2:s1", approved: false, reason: "风险", fetchImpl });
-  assert.deepEqual(body, { thread_id: "u2:s1", approved: false, reason: "风险" });
-  assert.equal(response.flow_state, "blocked");
+test("★变更 003：`postApprove` 已被删除（自审批的口子必须关掉）", async () => {
+  // 现场：`POST /api/chat/approve` 的批准人就是**发起人**（客户批准自己发起的敏感操作）。
+  // 那不是人机审批，正是需求 2 报的问题。对客闸门整体移除后，前端也不该再有这个调用点。
+  //
+  // ⚠️ 判据是「模块里**没有**这个导出」，而不是「调用它会失败」：
+  // 留着导出就等于留着一个「只要后端加回接口就能用」的口子。
+  const api = await import("../src/lib/api.ts");
+  assert.ok(!("postApprove" in api), "api.ts 又导出了 postApprove —— 自审批的口子被打开了");
+  assert.ok(!("ApproveOptions" in api), "ApproveOptions 也不该再存在");
 });

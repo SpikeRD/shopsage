@@ -9,6 +9,8 @@
 | `build_chart_spec` | `chart.py` | 纯计算 | 返回结构化 spec，不返回图片 |
 | `create_ticket` / `get_ticket_status` | `ticket.py` | 写 / 读 | 幂等（DB 唯一约束）+ RBAC + 审计 |
 | `create_refund_request` / `get_refund_status` | `refund.py` | 写 / 读 | 幂等 + 剩余额度校验 + 行锁 + SoD |
+| `request_refund` / `decide_refund` / `list_refunds_for_review` | `refund.py` | 写 / 读 | 变更 003：客户申请只能建 `requested`；审批 `requested → approved/rejected`（行锁 + 409） |
+| `list_orders_for_customer` / `get_order_view` | `orders.py` | 读（对客订单页） | 行级过滤 + 脱敏 + 派生「还剩多少可退」 |
 
 三条使用铁律（与 `6.tools.md` 第 4、5 节对应）：
 
@@ -36,7 +38,19 @@ from app.tools.errors import (
     ToolError,
     ToolNotAvailableError,
 )
-from app.tools.refund import RefundNotAllowed, RefundRef, create_refund_request, get_refund_status
+from app.tools.orders import get_order_view, list_orders_for_customer
+from app.tools.refund import (
+    RefundNotAllowed,
+    RefundNotDecidable,
+    RefundRef,
+    RefundView,
+    create_refund_request,
+    decide_refund,
+    get_refund_status,
+    list_refunds_for_review,
+    refund_rows_for_output,
+    request_refund,
+)
 from app.tools.retriever import RetrievedDoc, retrieve_docs, retrieve_docs_async
 from app.tools.sql_executor import execute_readonly_query
 from app.tools.ticket import TicketRef, create_ticket, get_ticket_status
@@ -49,7 +63,9 @@ __all__ = [
     "CHART_TYPES",
     "PermanentToolError",
     "RefundNotAllowed",
+    "RefundNotDecidable",
     "RefundRef",
+    "RefundView",
     "RetryableToolError",
     "RetrievedDoc",
     "TicketRef",
@@ -60,9 +76,15 @@ __all__ = [
     "build_chart_spec",
     "create_refund_request",
     "create_ticket",
+    "decide_refund",
     "execute_readonly_query",
+    "get_order_view",
     "get_refund_status",
     "get_ticket_status",
+    "list_orders_for_customer",
+    "list_refunds_for_review",
+    "refund_rows_for_output",
+    "request_refund",
     "retrieve_docs",
     "retrieve_docs_async",
 ]

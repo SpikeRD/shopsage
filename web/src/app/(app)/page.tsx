@@ -1,17 +1,29 @@
 "use client";
 
 /**
- * 对客入口（`/`）：聊天框 + 流式渲染 + 溯源 + 人机审批。
+ * 对客入口（`/`）：聊天框 + 流式渲染 + 溯源。
  *
  * 这一页只做四件事（`16.web.md` §4）：
- * ① 分流 —— 没登录就去登录；② 流式展示；③ 展示出处；④ 展示「被拦下 / 待确认」。
- * **没有任何业务判断**：能不能查到这行数据、这句话能不能答，全在后端。
+ * ① 分流 —— 没登录就去登录；② 流式展示；③ 展示出处；④ **照实展示**退款结果。
+ * **没有任何业务判断**：能不能查到这行数据、这句话能不能答、这笔退款能不能提交，
+ * 全在后端。
+ *
+ * ## ⚠️ 变更 003 从这里删掉了「需要人工确认」面板
+ *
+ * 变更 003 之前，这一页在服务端返回 `approval_required` 时会渲染一个
+ * 「批准并继续 / 拒绝」面板，调 `POST /api/chat/approve` —— 而**批准人就是发起人**
+ * （自审批）。那不是人机审批，正是需求 2 要修的问题。
+ *
+ * 现在：对客闸门整体移除（客户没有任何东西需要自己批准），审批搬到
+ * `/internal/refunds`（要 `approve:refund`，客户拿不到那个权限点）。
+ * 所以这一页不再有审批面板 —— 也**不该**有：留一个按钮在那里，
+ * 用户会以为「点一下就能把自己的退款批掉」。
  */
 
 import { useMemo, useState, useEffect } from "react";
 import Link from "next/link";
 import { apiBase, configWarnings, resolvedApiBase, streamUrl } from "@/lib/config";
-import { canUseInternal } from "@/lib/auth";
+import { canUseInternalEntry } from "@/lib/auth";
 import { Composer } from "@/components/Composer";
 import { MessageList } from "@/components/MessageList";
 import { StreamStatus } from "@/components/StreamStatus";
@@ -69,7 +81,6 @@ function ChatWorkspace({
 }) {
   const chat = useChatStream({ entry, token });
   const refused = useMemo(() => chat.messages.flatMap((message) => message.refusals ?? []), [chat.messages]);
-  const [reason, setReason] = useState("");
   // ⚠️ 配置问题要在**发请求之前**就说（坑 14）：`NEXT_PUBLIC_API_BASE` 指到前端自己时，
   // HTTP 可能看着正常（同源的 /api/kb 由 Next 自己答）而 WS 一定失败 —— 那种「半通」最难查
   const [configNotes, setConfigNotes] = useState<string[]>([]);
@@ -130,11 +141,14 @@ function ChatWorkspace({
                 {chat.stream.phase === "failed" ? "连接已断开" : "已连接"}
               </span>
             )}
-            {canUseInternal(role) ? (
+            {canUseInternalEntry(role) ? (
               <Link className="btn ghost tiny" href="/internal">
                 切到对内查询
               </Link>
             ) : null}
+            <Link className="btn ghost tiny" href="/orders">
+              我的订单
+            </Link>
             <button className="btn ghost tiny" type="button" onClick={chat.reset}>
               新会话
             </button>
@@ -163,7 +177,10 @@ function ChatWorkspace({
           <ul className="hint-list">
             <li>首帧（骨架）来自后端：先出「正在理解你的问题…」，再补节点与回答。</li>
             <li>回答底部的「来源」可点开看文档 / 页码 / 片段。</li>
-            <li>敏感操作会挂起（<span className="mono">approval_required</span>），需要在这里点「批准」或「拒绝」。</li>
+            <li>
+              说「帮我退款」即可**真的提交**一笔退款申请（落在 <span className="mono">我的订单</span> 里），
+              审批由平台客服处理 —— 客户本人不需要、也不能批准自己的退款。
+            </li>
           </ul>
         </div>
       ) : null}
@@ -208,29 +225,6 @@ function ChatWorkspace({
           <Composer running={chat.running} onSubmit={chat.send} />
         </div>
       </div>
-
-      {chat.stream.approval ? (
-        <div className="approval">
-          <strong>需要人工确认</strong>
-          <p style={{ margin: "6px 0" }}>{chat.stream.approval.question}</p>
-          <div className="small muted mono">thread_id = {chat.stream.approval.threadId}</div>
-          <div className="row" style={{ marginTop: 10 }}>
-            <button className="btn" type="button" onClick={() => void chat.approve(true, reason)}>
-              批准并继续
-            </button>
-            <button className="btn ghost" type="button" onClick={() => void chat.approve(false, reason)}>
-              拒绝（按未执行处理）
-            </button>
-            <input
-              className="input"
-              style={{ maxWidth: 320 }}
-              placeholder="审批意见（可选，进审计日志）"
-              value={reason}
-              onChange={(event) => setReason(event.target.value)}
-            />
-          </div>
-        </div>
-      ) : null}
 
       {chat.stream.debug ? (
         <div className="card">
