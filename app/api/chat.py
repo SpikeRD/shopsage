@@ -56,6 +56,11 @@ import time
 from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect, status
+# ⚠️ `WebSocketDisconnected` **必须单独引**（issue 007）：它与 `WebSocketDisconnect`
+# 是**两个不同的异常**（前者是 `RuntimeError` 子类，表示「这条连接已经不可用」；
+# 后者表示「收到对端的断开消息」）。只接住后者会让前者的现场滑进兜底分支，
+# 而那正是「退出登录后整个后端忙等锁死」的那个 bug。
+from starlette.websockets import WebSocketDisconnected
 
 from app.api import deps
 from app.api.errors import ApiError
@@ -509,12 +514,34 @@ async def chat_stream(websocket: WebSocket) -> None:
             except WebSocketDisconnect:
                 logger.debug("WS 客户端断开（user=%s）", principal.user_id)
                 return
+            except WebSocketDisconnected:
+                # ── ★连接已不可用（issue 007 的修复点）────────────────────────────
+                #
+                # ⚠️ 它与上面的 `WebSocketDisconnect` 是**两个不同的异常**（见 import 处注释）：
+                # 那个是「收到对端的断开消息」，这个是「**这条连接已经不可用**」。
+                #
+                # 不接住它（本仓实测，issue 007）：滑进下面的兜底分支，而那里对
+                # 「坏内容」的处理是「回一条 error 帧、`continue` 继续收下一帧」——
+                # 连接已死时 `receive_*` **不 await 任何 I/O 就立刻抛**，循环里于是
+                # **没有任何让出点** → **纯 CPU 忙等**占满单线程事件循环，所有请求
+                # （含 `POST /api/auth/login`）永远得不到调度。用户看到的就是
+                # 「**等 LLM 回复时退出登录 → 之后一直显示「登录中…」**」。
+                #
+                # ⚠️ 这个忙等**连 `asyncio.wait_for` 都压不住**（实测：套 2s 超时仍永久
+                # 挂住）—— 没有让出点，定时器回调永远没机会跑。必须在代码层修掉它。
+                # 完整现场（`py-spy` 栈、为什么只有「等 LLM 时退出」才触发）见
+                # `issues/007-logout-during-llm-hangs-event-loop.md`。
+                logger.debug("WS 连接已不可用，结束消息循环（user=%s）", principal.user_id)
+                return
             except json.JSONDecodeError:
                 seq += 1
                 await _send_frame(websocket, seq, FRAME_ERROR, {"code": "bad_json", "message": "消息不是合法 JSON"})
                 continue
             except Exception as exc:  # noqa: BLE001 - 客户端发来非文本帧等
                 seq += 1
+                # 这里处理的是「这一帧内容不合法」（连接本身是好的）：回一条 error 帧并继续服务。
+                # 万一 `_send_frame` 之后连接已经坏了，下一轮会走上面的
+                # `except WebSocketDisconnected` 收尾 —— 不会忙等。
                 await _send_frame(websocket, seq, FRAME_ERROR, {"code": "bad_frame", "message": str(exc)})
                 continue
 

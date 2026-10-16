@@ -115,6 +115,7 @@
 | **issue 004 修复** | ✅ 已修复（**管理员开账号 422**：口令策略只落在后端 → 前端不知道、报错不说原因、失败还清空表单） | `web/src/lib/password.ts`、`web/src/app/(app)/admin/page.tsx` | `cd web; npm test`（**169 passed**，新增 10）；`node scripts/admin-create-evidence.mjs`（**真浏览器 5 passed**）；见 [`issues/004`](issues/004-admin-cannot-create-account.md) |
 | **issue 005 修复** | ✅ 已修复（**管理台停用/改角色 `Failed to fetch`**：CORS 白名单漏了 `PATCH` → 预检 400，那条请求根本没发出） | `app/api/main.py`、`tests/api/test_cors.py` | `uv run pytest -q tests/api/test_cors.py`；`node scripts/admin-patch-evidence.mjs`（**真浏览器 7 passed**）；见 [`issues/005`](issues/005-cors-missing-patch-method.md) |
 | **issue 006 修复** | ✅ 已修复（**管理台改角色提示成功但没生效**：受控 `select` 的值在异步 thunk 执行前被 React 回滚 → 请求体发的是旧角色） | `web/src/app/(app)/admin/page.tsx`、`web/tests/hook-wiring.test.ts` | `cd web; npm test`（**171 passed**，新增 2）；`node scripts/admin-role-evidence.mjs`（**真浏览器 6 passed**）；见 [`issues/006`](issues/006-admin-role-change-not-persisted.md) |
+| **issue 007 修复** | ✅ 已修复（**等 LLM 回复时退出登录 → 整个后端被一条死连接锁死**：WS 断连抛的 `WebSocketDisconnected` 掉进兜底分支 → 纯 CPU 忙等占满事件循环，之后连登录都永远得不到响应） | `app/api/chat.py`、`tests/api/test_chat_stream_disconnect.py` | `uv run pytest -q tests/api/test_chat_stream_disconnect.py`（**4 passed**；摘掉修复即 2 条红）；`node scripts/logout-during-llm-evidence.mjs`（**真浏览器 4 passed**）；见 [`issues/007`](issues/007-logout-during-llm-hangs-event-loop.md) |
 
 > 📌 **变更 002（前端改版）的用法**：
 > ① 后端照旧 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
@@ -191,6 +192,7 @@ npx tsx scripts/sidebar-evidence.ts    # 变更 002 取证：三角色的侧边�
 node scripts/admin-create-evidence.mjs # issue 004 取证：**真浏览器**点管理台的「开账号」（需前后端都在跑）
 node scripts/admin-patch-evidence.mjs  # issue 005 取证：**真浏览器**点「停用」（验 CORS 预检 + 状态翻转）
 node scripts/admin-role-evidence.mjs   # issue 006 取证：**真浏览器**改角色（验请求体、后端值、提示语三者一致）
+node scripts/logout-during-llm-evidence.mjs  # issue 007 取证：**真浏览器**「等 LLM 回复时退出登录 → 再登录」
 ```
 
 > ⚠️ 三个 `admin-*-evidence.mjs` 都会**真的改演示库**（建号 / 停用 / 改角色），跑完各自复原现场。
