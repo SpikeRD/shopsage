@@ -364,14 +364,17 @@ def test_role_change_invalidates_live_tokens(client: Any, provisioned: _Ledger) 
             "/api/admin/accounts",
             {
                 "identifier": "x",
-                "password": "y",
+                # ⚠️ 口令必须**够长**才能走到授权判定：这条用例验的是「非管理员被拒」，
+                #    而请求体校验（P1-3 的 min_length）排在鉴权**之后** ——
+                #    用 1 个字符的 `"y"` 会先拿到 422，用例就测不到授权了。
+                "password": "authz-probe-pw-1",
                 "role": "customer",
                 "subject_type": "customer",
                 "subject_id": 1,
             },
         ),
         ("patch", "/api/admin/accounts/1", {"status": "disabled"}),
-        ("post", "/api/admin/accounts/1/password", {"new_password": "z"}),
+        ("post", "/api/admin/accounts/1/password", {"new_password": "authz-probe-pw-1"}),
     ],
 )
 def test_admin_endpoints_require_admin(
@@ -443,7 +446,7 @@ def test_create_account_rejects_unknown_role_and_missing_subject(client: Any, pr
         "/api/admin/accounts",
         json={
             "identifier": f"{TEMP_PREFIX}badrole",
-            "password": "pw-123456",
+            "password": "pw-123456789",
             "role": "not-a-role",
             "subject_type": svc.SUBJECT_CUSTOMER,
             "subject_id": provisioned.next_subject(svc.SUBJECT_CUSTOMER),
@@ -456,7 +459,7 @@ def test_create_account_rejects_unknown_role_and_missing_subject(client: Any, pr
         "/api/admin/accounts",
         json={
             "identifier": f"{TEMP_PREFIX}ghost",
-            "password": "pw-123456",
+            "password": "pw-123456789",
             "role": "customer",
             "subject_type": svc.SUBJECT_CUSTOMER,
             "subject_id": 999_999,
@@ -464,6 +467,40 @@ def test_create_account_rejects_unknown_role_and_missing_subject(client: Any, pr
         headers={"Authorization": f"Bearer {admin}"},
     )
     assert ghost.status_code == 422, "指向不存在的主体必须被拒（accounts 没有外键）"
+
+
+def test_create_account_rejects_a_one_character_password(client: Any, provisioned: _Ledger) -> None:
+    """★1 个字符的口令必须被拒（issue 003 的 P1-3）。
+
+    修复前：`schemas.AccountCreateRequest.password` 是 `min_length=1`，
+    实测 `password="x"` 返回 **201 Created**，而且能用它真的登录成功
+    （登录限流当时也失效，弱口令 + 无限次尝试 = 可直接爆破）。
+    """
+    admin = _admin_token(client)
+    response = client.post(
+        "/api/admin/accounts",
+        json={
+            "identifier": f"{TEMP_PREFIX}shortpw",
+            "password": "x",
+            "role": "customer",
+            "subject_type": svc.SUBJECT_CUSTOMER,
+            "subject_id": provisioned.next_subject(svc.SUBJECT_CUSTOMER),
+        },
+        headers={"Authorization": f"Bearer {admin}"},
+    )
+    assert response.status_code == 422, f"1 个字符的口令不该被接受：{response.status_code} {response.text}"
+
+
+def test_password_reset_also_enforces_the_policy(client: Any, provisioned: _Ledger) -> None:
+    """重置口令也要过强度校验：否则「开号时拦住、重置时放回去」形同虚设。"""
+    admin = _admin_token(client)
+    created = _create(provisioned, client, admin_token=admin, identifier=f"{TEMP_PREFIX}resetweak")
+    response = client.post(
+        f"/api/admin/accounts/{created['account_id']}/password",
+        json={"new_password": "z"},
+        headers={"Authorization": f"Bearer {admin}"},
+    )
+    assert response.status_code == 422, f"重置成弱口令必须被拒：{response.text}"
 
 
 def test_admin_cannot_disable_self_or_last_admin(client: Any, provisioned: _Ledger) -> None:

@@ -47,7 +47,7 @@ class RevisionStore(Protocol):
 
     def current(self) -> int: ...
 
-    def bump(self, *, by: str = "", version: int | None = None, force: bool = False) -> int: ...
+    def bump(self, *, by: str = "", version: int | None = None) -> int: ...
 
     def health(self) -> dict[str, Any]: ...
 
@@ -68,9 +68,13 @@ class MemoryRevisionStore:
     def current(self) -> int:
         return int(self.revision)
 
-    def bump(self, *, by: str = "", version: int | None = None, force: bool = False) -> int:
-        if version is not None and not force and int(version) == int(self.revision):
-            return int(self.revision)
+    def bump(self, *, by: str = "", version: int | None = None) -> int:
+        """无条件 +1（与 `PostgresRevisionStore.bump` 同语义，见那里的说明）。
+
+        ⚠️ 旧版也有「version 与当前版本相同就不动」的短路 —— 那是 P1-1 的 bug，
+        `version` 与 `revision` 量纲不同，不能比较。现在只用于日志。
+        """
+        del version  # 仅供调用方标注「哪一版文档触发的」，不参与判断
         self.revision = int(self.revision) + 1
         self.bumps += 1
         self.bumped_by = str(by or "manual")
@@ -121,20 +125,44 @@ class PostgresRevisionStore:
             return UNKNOWN_REVISION
         return int(value or UNKNOWN_REVISION)
 
-    def bump(self, *, by: str = "", version: int | None = None, force: bool = False) -> int:
-        """把版本 +1（返回新版本）。
+    def bump(self, *, by: str = "", version: int | None = None) -> int:
+        """把版本 +1（返回新版本）。**无条件推进**。
 
-        `version` + `force=False` 是「**只在版本确实变化时才 bump**」：
-        `app/rag/ingest.py` 把 `rag_documents.version` 传进来，
-        于是「同一份文档重复入库」不会制造一个假的新版本 ——
-        否则每次跑一次同步（即使什么都没改）都会把所有缓存清空一次。
+        ## ⚠️ 为什么这里曾经有个短路，以及它为什么是错的（issue 003 的 P1-1）
+
+        旧实现有一句「`version` 与当前版本相同就不 bump」，本意是
+        「**同一份文档**重复入库不算变化，别把缓存白清一遍」。
+        但它比较的两个量**量纲不同**：
+
+        * `version` 是调用方传进来的 `rag_documents.version`（**每份文档各自的**版本号）；
+        * `current()` 是全局知识库版本（`cache_corpus_versions.corpus_revision`）。
+
+        于是只要某份文档的版本号**恰好等于**当前的全局版本号，这次真实变更就**不会推进版本**
+        —— 首次全量灌库尤其容易撞上（新文档的 version 普遍是 1，而初始
+        `corpus_revision` 也是 1）。实测：
+
+        ```text
+        corpus_revision = 1
+        bump(version=1) -> 1     # 新文档入库，但版本没动 → 缓存不失效
+        bump(version=2) -> 2     # 只有碰巧不等时才推进
+        ```
+
+        后果是「推了新文档但缓存不失效」：用户在**知识库为空时**问过的问题，
+        灌库之后仍然拿到那条无出处的旧答案（实测 `hit_count=10`，答案一直没更新）。
+        这类症状极难归因 —— 接口 200、`/health` 全绿、日志无异常，只是答案悄悄不对。
+
+        ## 现在为什么可以无条件推进
+
+        「重复入库不要白清缓存」这件事**已经由上游闸门负责**：
+        `app/rag/ingest.py` 只在 `report.doc_changed` 为真时才调 `on_change`
+        （`_is_noop()` 已经把「什么都没变」挡在外面）。所以走到这里就意味着
+        **确实有变更**，无条件 +1 才是正确语义。
+
+        `version` 参数保留下来**只用于日志**（说清是哪一版文档触发的），
+        不再参与任何判断 —— 把两个不同量纲的数字放在一起比较，正是这个 bug 的根源。
         """
         from sqlalchemy import text
 
-        if version is not None and not force:
-            current = self.current()
-            if int(version) == current:
-                return current
         with self.engine.begin() as conn:
             row = conn.execute(
                 text(
@@ -157,7 +185,12 @@ class PostgresRevisionStore:
                     text(f"select corpus_revision from {self.table} where singleton = true")
                 ).one()
         new_revision = int(row[0])
-        logger.info("知识库版本 → %d（by=%s）", new_revision, by or "manual")
+        logger.info(
+            "知识库版本 → %d（by=%s%s）",
+            new_revision,
+            by or "manual",
+            f", document_version={int(version)}" if version is not None else "",
+        )
         return new_revision
 
     def health(self) -> dict[str, Any]:
@@ -192,9 +225,14 @@ def bump_after_ingest(
     """入库之后的版本推进（`app/rag/ingest.py` 的 `on_change` 回调就调它）。
 
     为什么这段逻辑单独一个函数（而不是直接写 `store.bump()`）：
-    「入库了什么」→「版本怎么变」这个映射要被**一条用例**钉住
-    （重复入库不 bump、真正改动才 bump），而回调是在 RAG 侧被调用的，
-    放一个函数在这里让 RAG 侧只负责「什么时候调」。
+    「入库了什么」→「版本怎么变」这个映射要被**一条用例**钉住，
+    而回调是在 RAG 侧被调用的，放一个函数在这里让 RAG 侧只负责「什么时候调」。
+
+    ⚠️ **「什么时候调」由 RAG 侧负责，这里只负责「调了就推进」**：
+    `app/rag/ingest.py` 已经用 `report.doc_changed`（`_is_noop()`）把
+    「跑了一次同步但什么都没变」挡在外面，所以走到这里就是**确实有变更**。
+    本函数**不再**拿 `document_version` 与全局 `corpus_revision` 比较 ——
+    那两个量纲不同，比较会让真实变更漏掉（issue 003 的 P1-1，见 `bump` 的说明）。
     """
     active = store or _default_store()
     return active.bump(by=f"ingest:{source}", version=document_version)

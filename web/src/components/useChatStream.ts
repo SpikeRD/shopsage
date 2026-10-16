@@ -24,6 +24,7 @@ import {
   type Entry,
   type StorageLike,
 } from "@/lib/auth";
+import { ensureFreshToken, withFreshToken } from "@/lib/session";
 import { openChatStream, toTurnResult, type ChatStreamHandle, type StreamState, initialState } from "@/lib/stream";
 import type { Message } from "@/components/MessageList";
 
@@ -126,54 +127,73 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
 
   useEffect(() => {
     let settled = false;
-    const handle = openChatStream({
-      token: options.token,
-      url: options.url,
-      socketFactory: options.socketFactory,
-      onOpen: () => {
-        settled = true;
-        // 连接建立：把「等它好了再发」的那条消息发出去（见 `send` 的排队分支）
-        const queued = pendingRef.current;
-        if (queued !== null) {
-          pendingRef.current = null;
-          waitingRef.current = "ask";
-          handle.ask(queued.text, queued.sessionId || null);
-        }
-      },
-      onState: (next) => {
-        setStream(next);
-        if (next.error && next.phase === "failed") {
-          setError(next.error.message);
-          // ⚠️ 连不上时把排队的那条消息丢掉并**如实说明**（坑 17）：
-          // 留着它会在下一次连上时突然发出去一条「很久以前打的字」——
-          // 那比不发更让人困惑。用户重新发一遍成本很低，误导成本很高。
-          if (pendingRef.current !== null) {
+    let cancelled = false;
+    /**
+     * ⚠️ **建连前先确保令牌新鲜**（issue 003 的 P1-2）。
+     *
+     * 为什么 WS 也要做：`openChatStream` 把令牌写进握手子协议（`bearer.<token>`），
+     * 而**握手只发生一次** —— 连接建立后令牌就在服务端被记住了。
+     * 用一个 30 秒后就过期的令牌去握手，会立刻收到 4401 并断开，
+     * 用户看到的是「刚打开就说登录失效」（而刷新令牌明明还在本地）。
+     *
+     * ⚠️ 异步解析令牌会让 effect 变成「先等再建连」：所以用 `cancelled` 兜住
+     * 「等待期间组件卸载/依赖变化」的情况，避免建出一条没人管的连接。
+     */
+    const connect = async () => {
+      const fresh = await ensureFreshToken(options.entry, storage, {}).catch(() => null);
+      if (cancelled) return;
+      const handle = openChatStream({
+        token: fresh ?? options.token,
+        url: options.url,
+        socketFactory: options.socketFactory,
+        onOpen: () => {
+          settled = true;
+          // 连接建立：把「等它好了再发」的那条消息发出去（见 `send` 的排队分支）
+          const queued = pendingRef.current;
+          if (queued !== null) {
             pendingRef.current = null;
-            setError(`${next.error.message}\n（排队中的那条消息没有发出，请重连后重新发送。）`);
+            waitingRef.current = "ask";
+            handle.ask(queued.text, queued.sessionId || null);
           }
-          // ── 连接根本没建立起来时的**自动重连一次**（坑 16 / 坑 17）────────────
-          // ⚠️ 用 ref 记次数而不是读 `connectionAttempts` state：后者在闭包里是**旧值**，
-          // 会让「最多重试一次」变成「重试无限次」（每次都是 1）。
-          if (
-            !settled &&
-            (next.error.code === "connect_timeout" || next.error.code === "socket_error") &&
-            attemptsRef.current < 2
-          ) {
-            attemptsRef.current += 1;
-            setConnectionAttempts(attemptsRef.current);
-            setTimeout(() => setConnectionKey((key) => key + 1), 800);
+        },
+        onState: (next) => {
+          setStream(next);
+          if (next.error && next.phase === "failed") {
+            setError(next.error.message);
+            // ⚠️ 连不上时把排队的那条消息丢掉并**如实说明**（坑 17）：
+            // 留着它会在下一次连上时突然发出去一条「很久以前打的字」——
+            // 那比不发更让人困惑。用户重新发一遍成本很低，误导成本很高。
+            if (pendingRef.current !== null) {
+              pendingRef.current = null;
+              setError(`${next.error.message}\n（排队中的那条消息没有发出，请重连后重新发送。）`);
+            }
+            // ── 连接根本没建立起来时的**自动重连一次**（坑 16 / 坑 17）────────────
+            // ⚠️ 用 ref 记次数而不是读 `connectionAttempts` state：后者在闭包里是**旧值**，
+            // 会让「最多重试一次」变成「重试无限次」（每次都是 1）。
+            if (
+              !settled &&
+              (next.error.code === "connect_timeout" || next.error.code === "socket_error") &&
+              attemptsRef.current < 2
+            ) {
+              attemptsRef.current += 1;
+              setConnectionAttempts(attemptsRef.current);
+              setTimeout(() => setConnectionKey((key) => key + 1), 800);
+            }
           }
-        }
-        if (next.phase === "done" && waitingRef.current === "ask") {
-          // 把这一轮的产物落成一条消息（**只在 done 时落**：中途的 answer 帧可能被替换）
-          waitingRef.current = null;
-          setMessages((current) => [...current, toAssistantMessage(next)]);
-        }
-      },
-    });
-    handleRef.current = handle;
+          if (next.phase === "done" && waitingRef.current === "ask") {
+            // 把这一轮的产物落成一条消息（**只在 done 时落**：中途的 answer 帧可能被替换）
+            waitingRef.current = null;
+            setMessages((current) => [...current, toAssistantMessage(next)]);
+          }
+        },
+      });
+      handleRef.current = handle;
+    };
+
+    void connect();
     return () => {
-      handle.close();
+      cancelled = true;
+      handleRef.current?.close();
       handleRef.current = null;
     };
     // ⚠️ **`connectionKey` 必须在依赖里**（坑 17）：上一版漏了它，于是
@@ -183,8 +203,9 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
     // 现在这条接线由 `web/tests/hook-wiring.test.ts` 的源码级断言钉住。
     // token/url 在登录后是常量，放进来不会造成每次重渲染重建连接；
     // `options.socketFactory` 只在测试里注入，也不参与（否则每渲染一次就重连）。
+    // `storage`/`options.entry` 参与是因为建连前要用它们续期令牌（P1-2）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [options.token, options.url, connectionKey]);
+  }, [options.token, options.entry, options.url, connectionKey, storage]);
 
   const send = useCallback(
     (text: string) => {
@@ -230,11 +251,15 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
         },
       ]);
       try {
-        const response = await postApprove(options.token, {
-          threadId: gate.threadId,
-          approved,
-          reason,
-        });
+        // ⚠️ 走 `withFreshToken`（issue 003 的 P1-2）：审批是写操作，令牌过期时
+        //    必须续期后重试，而不是让用户看到「登录失效」而丢掉这次审批动作。
+        const response = await withFreshToken(options.entry, storage, (fresh) =>
+          postApprove(fresh, {
+            threadId: gate.threadId,
+            approved,
+            reason,
+          }),
+        );
         // 审批的结果走 HTTP 返回（不是 WS 帧）：所以这里直接把响应落成一条 assistant 消息
         setMessages((current) => [
           ...current,
@@ -258,7 +283,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamResul
         setMessages((current) => [...current, { id: messageId("system"), role: "system", text: `审批失败：${message}` }]);
       }
     },
-    [options.token, stream.approval],
+    [options.entry, options.token, storage, stream.approval],
   );
 
   const reset = useCallback(() => {

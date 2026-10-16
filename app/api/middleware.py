@@ -64,6 +64,15 @@ LIMITED_SCOPES: Final[frozenset[tuple[str, str]]] = frozenset(
         # 三道登记缺一不可：本常量（中间件要不要限）、`scope.py`（用哪个 scope）、
         # `ratelimit.DEFAULT_RULES`（默认额度是多少）。
         ("POST", "/api/tasks"),
+        # ── 变更 001 的账号接口（**issue 003 修复**）─────────────────────────────
+        # ⚠️ 这两条曾经漏了这里：`scope.SCOPE_BY_ROUTE` 有 `auth.login`、
+        # `ratelimit.DEFAULT_RULES` 也配了 10/300s，但**中间件根本不会去问限流器** ——
+        # 因为下面 `__call__` 只在 `(method, path) in LIMITED_SCOPES` 时才判定。
+        # 症状是「登录额度配了却完全不起作用」：实测连续 40 次错误登录全是 401、
+        # 一次 429 都没有（对照 `POST /api/chat` 第 31 次起正常 429）。
+        # 登录是唯一能用「猜」换到令牌的入口，漏登记等于给暴力破解无限次尝试。
+        ("POST", "/api/auth/login"),
+        ("POST", "/api/auth/refresh"),
     }
 )
 

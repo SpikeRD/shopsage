@@ -323,7 +323,23 @@ def create_app(
             # 令牌走 `Authorization` 头，不靠 Cookie —— 所以不开放 credentials
             # （开放它意味着「任意允许的来源都能带着用户凭据发请求」，那是另一个量级的风险）
             allow_credentials=False,
-            allow_methods=["GET", "POST", "OPTIONS"],
+            # ⚠️ **这里必须列出路由真正用到的每一个方法**（issue 005 实测）：
+            #    `GET`/`POST` 是 CORS 的**简单方法**（不触发预检），漏掉也看不出来；
+            #    而 `PATCH`（管理台的停用/改角色，`app/api/admin.py`）是**非简单方法**，
+            #    浏览器一定先发预检 —— 预检过不去，那条请求**根本不会发出**。
+            #    症状是页面报 `Failed to fetch`（**没有状态码**）+ 控制台
+            #    `Response to preflight request doesn't pass access control check`，
+            #    而后端日志里**一条请求都没有**（预检在中间件层就被答掉了）——
+            #    极易被误判成「后端没起」或「令牌失效」。
+            #
+            #    ⚠️ 刻意**不写 `["*"]`**：那会一并放通 DELETE/TRACE 等本 API 根本不提供的方法，
+            #    与本项目「表白名单、默认拒绝」的纪律相悖（同 `cors_origins` 拒绝 `*` 的理由）。
+            #    漏项的防线是**测试**而不是通配符：
+            #    `tests/api/test_cors.py::test_every_route_method_is_allowed_by_cors`
+            #    从 OpenAPI schema 取路由实际用到的方法，逐个断言它们都在这儿。
+            #
+            #    `OPTIONS` 保留：预检自身用的就是它。
+            allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "X-Request-Id"],
             expose_headers=[REQUEST_ID_HEADER],
             max_age=600,

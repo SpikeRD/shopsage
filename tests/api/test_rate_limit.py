@@ -1,4 +1,4 @@
-﻿"""限流用例：`9.api.md` §7 的 `test_rate_limit`（超过阈值 → 429，D1 纵深）。
+"""限流用例：`9.api.md` §7 的 `test_rate_limit`（超过阈值 → 429，D1 纵深）。
 
 本文件覆盖「滑动窗口」的四个可断言性质 + 两个容易做错的地方：
 
@@ -47,6 +47,34 @@ def test_exceeding_quota_returns_429_with_retry_after(
 
     assert codes[:3] == [200, 200, 200], f"额度是 3，前三次应当放行：{codes}"
     assert codes[3] == 429, f"第四次应当被拦：{codes}"
+
+
+def test_login_is_rate_limited(app_factory) -> None:
+    """★登录接口**必须真的被限流**（issue 003 的 P0-1 行为回归判据）。
+
+    修复前：`scope.SCOPE_BY_ROUTE` 有 `auth.login`、`ratelimit.DEFAULT_RULES` 也配了
+    10/300s，但 `middleware.LIMITED_SCOPES` 里没有它 —— 中间件根本不去问限流器，
+    于是**连续 40 次错误登录全是 401、一次 429 都没有**（实测）。
+    登录是唯一能用「猜」换到令牌的入口，这条失效等于给暴力破解无限次尝试。
+
+    这条用例走**真实 HTTP 路径**（而不是只断言常量），所以它能在「有人把
+    `LIMITED_SCOPES` 里的登录项删掉」时立刻红。
+    """
+    limiter = tiny_limiter()
+    # `tiny_limiter` 只给 chat 相关的三个 scope 配额度，这里显式补一条很小的登录规则
+    limiter.rules["auth.login"] = RateLimitRule(limit=2, window_seconds=60.0)
+
+    with TestClient(app_factory(rate_limiter=limiter)) as client:
+        codes = [
+            client.post(
+                "/api/auth/login", json={"identifier": "nobody", "password": "wrong"}
+            ).status_code
+            for _ in range(4)
+        ]
+
+    # 前两次放行（凭据错 → 401），第三次起必须被限流拦下（429）
+    assert codes[:2] == [401, 401], f"额度是 2，前两次应当放行到鉴权层：{codes}"
+    assert codes[2:] == [429, 429], f"超限后必须是 429（而不是继续 401）：{codes}"
 
 
 def test_429_body_has_the_error_envelope_and_headers(

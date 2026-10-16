@@ -1,4 +1,4 @@
-"""真库那一组：`PostgresEntryStore`（pgvector 的相似度查询 + upsert + 显式失效）。
+﻿"""真库那一组：`PostgresEntryStore`（pgvector 的相似度查询 + upsert + 显式失效）。
 
 依赖不可用时整组 `skip`（`tests/conftest.py` 的 `db` 标记装置），
 与第 10 步 `tests/rag/test_rag_store_db.py` 同一口径。
@@ -299,6 +299,6 @@ def test_revision_store_bumps_monotonically(pg_ready) -> None:
 
     revisions = PostgresRevisionStore()
     start = revisions.current()
-    assert revisions.bump(by="test", force=True) == start + 1
-    assert revisions.bump(by="test", force=True) == start + 2
+    assert revisions.bump(by="test") == start + 1
+    assert revisions.bump(by="test") == start + 2
     assert revisions.current() == start + 2

@@ -191,6 +191,53 @@ def test_account_view_has_no_credential_fields():
 # ── 真库层：建号校验 ─────────────────────────────────────────────────────────
 
 
+# ── 口令强度（issue 003 的 P1-3）────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "",  # 空
+        "x",  # 1 位（修复前**能建出可登录的账号**）
+        "short",  # 5 位
+        "12345678901",  # 11 位（差一位）
+        "   ",  # 全空白
+        "password",  # 常见口令
+        "shopsage1234",  # 常见口令（项目名）
+    ],
+)
+def test_validate_password_strength_rejects_weak(temp_accounts, password: str) -> None:
+    """★弱口令必须被拒（P1-3：修复前 `min_length=1`，实测 `"x"` 能建号并登录）。"""
+    with pytest.raises(svc.AccountError):
+        svc.validate_password_strength(password, identifier=f"{TEMP_PREFIX}weak")
+
+
+def test_validate_password_strength_rejects_identifier_echo() -> None:
+    """口令与登录标识相同 → 拒（那是「猜三次就能进」的形态）。"""
+    with pytest.raises(svc.AccountError, match="不能与登录标识相同"):
+        # 标识与口令都够长，才会走到「与标识相同」这条规则（而不是先被长度拦下）
+        svc.validate_password_strength("employee-zhang", identifier="employee-zhang")
+
+
+def test_validate_password_strength_accepts_a_reasonable_one() -> None:
+    """长度够、不常见、与标识不同 → 放行（修复不能把正常口令也挡掉）。"""
+    svc.validate_password_strength("a-long-enough-passphrase", identifier="someone")
+
+
+def test_create_account_rejects_short_password(temp_accounts) -> None:
+    """★真库路径也要拦：脚本/后台任务直接调 `create_account` 不走 pydantic。"""
+    with SessionLocal() as db:
+        with pytest.raises(svc.AccountError, match="至少"):
+            svc.create_account(
+                db,
+                identifier=f"{TEMP_PREFIX}weakpw",
+                password="x",
+                role="customer",
+                subject_type=svc.SUBJECT_CUSTOMER,
+                subject_id=temp_accounts.next_subject(svc.SUBJECT_CUSTOMER),
+            )
+
+
 def test_create_account_rejects_unregistered_role(temp_accounts):
     """未登记角色建不出账号：它按默认拒绝是零权限，建出来是个「点不动」的账号。"""
     with SessionLocal() as db:
@@ -198,7 +245,7 @@ def test_create_account_rejects_unregistered_role(temp_accounts):
             svc.create_account(
                 db,
                 identifier=f"{TEMP_PREFIX}role",
-                password="pw",
+                password="pw-for-tests",
                 role="not-a-role",
                 subject_type=svc.SUBJECT_CUSTOMER,
                 subject_id=temp_accounts.next_subject(svc.SUBJECT_CUSTOMER),
@@ -217,7 +264,7 @@ def test_create_account_rejects_missing_subject(temp_accounts):
             svc.create_account(
                 db,
                 identifier=f"{TEMP_PREFIX}ghost",
-                password="pw",
+                password="pw-for-tests",
                 role="customer",
                 subject_type=svc.SUBJECT_CUSTOMER,
                 subject_id=999_999,
@@ -235,7 +282,7 @@ def test_create_account_rejects_duplicate_handle_and_subject(temp_accounts):
             svc.create_account(
                 db,
                 identifier=f"{TEMP_PREFIX}dup",
-                password="pw",
+                password="pw-for-tests",
                 role="customer",
                 subject_type=svc.SUBJECT_EMPLOYEE,
                 subject_id=temp_accounts.next_subject(svc.SUBJECT_EMPLOYEE),
@@ -246,7 +293,7 @@ def test_create_account_rejects_duplicate_handle_and_subject(temp_accounts):
             svc.create_account(
                 db,
                 identifier=f"{TEMP_PREFIX}same-subject",
-                password="pw",
+                password="pw-for-tests",
                 role="customer",
                 subject_type=record.subject_type,
                 subject_id=record.subject_id,
@@ -263,9 +310,9 @@ def test_identifier_is_stored_normalized(temp_accounts):
 
 
 def test_authenticate_success_and_failure(temp_accounts):
-    view = _make(temp_accounts, identifier=f"{TEMP_PREFIX}auth", password="correct-horse")
+    view = _make(temp_accounts, identifier=f"{TEMP_PREFIX}auth", password="correct-horse-battery")
     with SessionLocal() as db:
-        record = svc.authenticate(db, f"{TEMP_PREFIX}auth", "correct-horse")
+        record = svc.authenticate(db, f"{TEMP_PREFIX}auth", "correct-horse-battery")
         db.commit()
         assert record.account_id == view.account_id
         assert record.is_active
@@ -278,9 +325,9 @@ def test_authenticate_success_and_failure(temp_accounts):
 
 
 def test_authenticate_is_case_insensitive_on_identifier(temp_accounts):
-    _make(temp_accounts, identifier=f"{TEMP_PREFIX}case", password="pw-123456")
+    _make(temp_accounts, identifier=f"{TEMP_PREFIX}case", password="pw-123456789")
     with SessionLocal() as db:
-        assert svc.authenticate(db, f"{TEMP_PREFIX.upper()}CASE", "pw-123456").identifier
+        assert svc.authenticate(db, f"{TEMP_PREFIX.upper()}CASE", "pw-123456789").identifier
 
 
 def test_last_login_does_not_bump_token_version(temp_accounts):
@@ -290,10 +337,10 @@ def test_last_login_does_not_bump_token_version(temp_accounts):
     在签发的同时就被这次登录自己作废了。这是本模块最隐蔽的一个坑，
     所以它有一条专门的用例。
     """
-    _make(temp_accounts, identifier=f"{TEMP_PREFIX}ver", password="pw-123456")
+    _make(temp_accounts, identifier=f"{TEMP_PREFIX}ver", password="pw-123456789")
     with SessionLocal() as db:
         before = svc.get_account_by_identifier(db, f"{TEMP_PREFIX}ver").token_version
-        svc.authenticate(db, f"{TEMP_PREFIX}ver", "pw-123456")
+        svc.authenticate(db, f"{TEMP_PREFIX}ver", "pw-123456789")
         db.commit()
         after = svc.get_account_by_identifier(db, f"{TEMP_PREFIX}ver").token_version
     assert after == before
@@ -327,12 +374,12 @@ def test_disabled_account_is_rejected_after_password_check(temp_accounts):
     _make(
         temp_accounts,
         identifier=f"{TEMP_PREFIX}off",
-        password="pw-123456",
+        password="pw-123456789",
         status=svc.STATUS_DISABLED,
     )
     with SessionLocal() as db:
         with pytest.raises(svc.AccountAuthError, match="停用"):
-            svc.authenticate(db, f"{TEMP_PREFIX}off", "pw-123456")
+            svc.authenticate(db, f"{TEMP_PREFIX}off", "pw-123456789")
         # 口令错时仍然只报「不正确」，不泄露状态
         with pytest.raises(svc.AccountAuthError, match="不正确"):
             svc.authenticate(db, f"{TEMP_PREFIX}off", "wrong")
@@ -345,7 +392,7 @@ def test_legacy_hash_is_upgraded_in_place_on_login(temp_accounts):
     """
     from app.security.auth import LEGACY_PASSWORD_SCHEME, PASSWORD_SCHEME
 
-    view = _make(temp_accounts, identifier=f"{TEMP_PREFIX}legacy", password="ignored")
+    view = _make(temp_accounts, identifier=f"{TEMP_PREFIX}legacy", password="ignored-for-tests")
     legacy = svc.hash_password("legacy-pw", scheme=LEGACY_PASSWORD_SCHEME)
     with SessionLocal() as db:
         row = db.get(Account, view.account_id)
@@ -560,29 +607,29 @@ def test_cannot_disable_last_active_admin(temp_accounts):
 
 def test_reset_and_change_password(temp_accounts):
     """重置（管理员，不需要旧口令）与本人改口令（需要旧口令）都要作废在途令牌。"""
-    view = _make(temp_accounts, identifier=f"{TEMP_PREFIX}pw", password="old-pw-123")
+    view = _make(temp_accounts, identifier=f"{TEMP_PREFIX}pw", password="old-pw-1234567")
     with SessionLocal() as db:
         before = svc.get_account(db, view.account_id).token_version
-        svc.reset_password(db, view.account_id, "reset-pw-123")
+        svc.reset_password(db, view.account_id, "reset-pw-1234567")
         db.commit()
         assert svc.get_account(db, view.account_id).token_version == before + 1
 
     with SessionLocal() as db:
         # 旧口令已失效、新口令可用
         with pytest.raises(svc.AccountAuthError):
-            svc.authenticate(db, f"{TEMP_PREFIX}pw", "old-pw-123")
-        svc.authenticate(db, f"{TEMP_PREFIX}pw", "reset-pw-123")
+            svc.authenticate(db, f"{TEMP_PREFIX}pw", "old-pw-1234567")
+        svc.authenticate(db, f"{TEMP_PREFIX}pw", "reset-pw-1234567")
         db.commit()
 
     with SessionLocal() as db:
         with pytest.raises(svc.AccountAuthError, match="当前口令"):
             svc.change_own_password(
-                db, view.account_id, current_password="wrong", new_password="next-pw-123"
+                db, view.account_id, current_password="wrong-password-1", new_password="next-pw-1234567"
             )
     with SessionLocal() as db:
         before = svc.get_account(db, view.account_id).token_version
         svc.change_own_password(
-            db, view.account_id, current_password="reset-pw-123", new_password="next-pw-123"
+            db, view.account_id, current_password="reset-pw-1234567", new_password="next-pw-1234567"
         )
         db.commit()
         assert svc.get_account(db, view.account_id).token_version == before + 1
@@ -590,7 +637,7 @@ def test_reset_and_change_password(temp_accounts):
 
 def test_password_is_never_stored_in_plaintext(temp_accounts):
     """库里存的必须是散列，且**不可能是明文**（这条防线在真库上再验一次）。"""
-    _make(temp_accounts, identifier=f"{TEMP_PREFIX}plain", password="plaintext-pw-xyz")
+    _make(temp_accounts, identifier=f"{TEMP_PREFIX}plain", password="plaintext-pw-xyz-123")
     with SessionLocal() as db:
         record = svc.get_account_by_identifier(db, f"{TEMP_PREFIX}plain")
     assert "plaintext-pw-xyz" not in record.password_hash

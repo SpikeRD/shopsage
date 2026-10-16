@@ -241,7 +241,13 @@ def test_purge_expired_only_removes_expired(space: SemanticSpace) -> None:
 
 
 def test_make_ingest_callback_bumps_the_revision(space: SemanticSpace, revisions) -> None:
-    """入库回调：真正改动才推进版本（重复入库不 bump）。"""
+    """★入库回调**每次都推进版本**（issue 003 的 P1-1）。
+
+    「重复入库不要白清缓存」由 `ingest.py` 的 `doc_changed` 闸门负责 ——
+    回调只会在**确实有变更**时被调到，所以它必须无条件 +1。
+    旧实现拿 `document_version` 与全局 `corpus_revision` 比较（量纲不同），
+    版本号巧合相等时就不推进，导致缓存不失效。
+    """
     from app.cache.invalidate import make_ingest_callback
 
     callback = make_ingest_callback(revisions=revisions)
@@ -254,6 +260,9 @@ def test_make_ingest_callback_bumps_the_revision(space: SemanticSpace, revisions
         return Report()
 
     before = revisions.current()
-    assert callback(report(before))["revision"] == before  # 版本相同 → 不动
-    assert revisions.current() == before
-    assert callback(report(before + 1))["revision"] == before + 1  # 真的变了 → +1
+    # ⚠️ 关键：version 恰好等于当前 revision —— 旧实现会在这里**不推进**（P1-1）
+    assert callback(report(before))["revision"] == before + 1, (
+        "document_version 与 corpus_revision 相等时也必须推进（缓存失效不能漏）"
+    )
+    assert revisions.current() == before + 1
+    assert callback(report(before + 1))["revision"] == before + 2

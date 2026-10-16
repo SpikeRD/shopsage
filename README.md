@@ -32,6 +32,73 @@
 3. **docs/modules/Number.xxx.md**：开始写某个模块前，读它对应的「开发 + 测试」文档；开发完按「验收标准」自检并回填证据。
 4. **docs/runbook/**：动到环境/库/迁移这类「必须一步步确认」的操作时，照抄同编号的实操手册（`3.db-runbook.md` 等），并把实测输出回填到模块文档第 8 节。
 
+## 角色与权限
+
+> 权威定义在代码里：角色→权限点 [`app/security/rbac.py::ROLE_PERMISSIONS`](app/security/rbac.py)、
+> 角色→敏感等级 [`app/security/policy.py::ROLE_MAX_SENSITIVITY`](app/security/policy.py)、
+> 角色→入口 [`app/security/accounts.py::entry_for_role`](app/security/accounts.py)。
+> 本表是它们的说明，**改权限请改代码**（前端 `web/src/lib/auth.ts::ROLE_PERMISSIONS` 是副本，
+> 只用于渲染菜单，不用于授权判断）。
+
+### 权限点（6 个）
+
+| 权限点 | 含义 |
+|---|---|
+| `read:own` | 读**自己的**数据（对客路径，永远叠加行级过滤 `WHERE user_id = 本人`） |
+| `read:all_orders` | 读**全站**订单（对内分析路径）——**有它就进「对内」入口** |
+| `read:finance` | 读财务级数据（金额明细、支付方式） |
+| `write:refund` | 发起退款 |
+| `write:ticket` | 建工单 |
+| `admin` | 管理台：开账号 / 停用 / 改角色 / 重置口令 ——**有它就进「管理台」入口** |
+
+### 角色对照表（6 个角色，实测自代码）
+
+| 角色 | 入口 | 权限点 | 数据清晰度上限 |
+|---|---|---|---|
+| `customer` | 对客 | `read:own` `write:ticket` | 脱敏 |
+| `customer_service` | 对客 | `read:own` `write:refund` `write:ticket` | **公开（可对外）** |
+| `internal_employee` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` | 脱敏 |
+| `manager` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` | **内部可见** |
+| `finance_auditor` | 对内 | `read:own` `read:all_orders` `read:finance` `write:ticket` | 财务级 |
+| `admin` | 管理台 | 全部 6 个 | 财务级 |
+
+**入口分流规则**（`entry_for_role`，判据是**能力**不是角色名）：
+有 `admin` → 管理台；否则有 `read:all_orders` → 对内；否则 → 对客。
+
+### 三条容易看错的地方
+
+1. **`manager` 与 `internal_employee` 的权限点完全相同** —— 差别只在**数据清晰度上限**
+   （主管看得到真实姓名，普通员工只看到脱敏值）。「权限点管能做什么，敏感等级管看得多清楚」
+   是两条**正交**的轴，别指望在权限点列表里看出主管的差别。
+2. **`customer_service` 的可见度是六个角色里最低的（公开级）**，比客户本人还低。
+   这是**刻意**的：客服是一线、最容易被社工或被要求截图，所以连脱敏后的手机号都不给
+   （要联系客户走工单流程，不靠肉眼读号）。
+3. **`admin` 是「财务级」而不是「无限」** —— 它真正多出来的是**动作权限**
+   （`admin` 权限点），不是「能看到所有人的手机号明文」。敏感等级最高就到财务级。
+
+### 数据清晰度等级（4 级）
+
+| 等级 | 名称 | 典型字段 / 形态 |
+|---|---|---|
+| 0 | 公开（可对外） | 订单号、状态、时间 |
+| 1 | 脱敏 | 手机号 `138****1234`、地址只到区/县级、邮箱 |
+| 2 | 内部可见 | 真实姓名 |
+| 3 | 财务级 | 金额明细、支付方式 |
+
+**未登记的角色 = 权限点空集、清晰度 -1（什么都看不到）**，即**默认拒绝**。
+
+### 三条正交的边界（不要混）
+
+| 边界 | 回答的问题 | 唯一真相 |
+|---|---|---|
+| **行级过滤（D1）** | 能不能看到**这一行** | [`app/db/queries.py`](app/db/queries.py)（对客强制 `WHERE user_id = 本人`） |
+| **RBAC** | 这个**角色**能不能做这件事 | [`app/security/rbac.py`](app/security/rbac.py) |
+| **脱敏** | 同一条数据，给这个角色**看多清楚** | [`app/security/masking.py`](app/security/masking.py) + `policy.ROLE_MAX_SENSITIVITY` |
+
+> ⚠️ 前端 `web/src/lib/auth.ts` 的角色表**只是副本**，用来决定「显示哪些菜单」；
+> **任何真正的授权判断都在后端**。客户把地址栏敲成 `/admin` 一样能打开那个页面，
+> 但那一页的每个请求都会被后端拒（`@require_permission(PERM_ADMIN)`，越权按 404 返回）。
+
 ## 当前进度
 
 | 模块 | 状态 | 代码 | 验证方式 |
@@ -45,6 +112,9 @@
 | 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py`、`scripts/check_web_cors.py` | `cd web; npm test`（**119 passed**）；`npm run build`（**✓ 4.3s**）；`node tests/run-live.mjs`（**10 passed**） |
 | 17 **变更 001：账号登录 + 管理台** | ✅ 完成（**真登录**：账号+口令、刷新续期、三档入口、管理员开账号） | `app/security/accounts.py`、`app/api/auth.py`、`app/api/admin.py`、`web/src/app/admin/`、`web/src/lib/session.ts` | `uv run pytest -q tests/security tests/api`；`uv run python -m scripts.seed`；`cd web; npm test`；全量 **1745 passed, 50 skipped** |
 | 18 **变更 002：前端改版** | ✅ 完成（**浅色护眼** + 登录/主界面分离 + **左侧边栏**按权限分流 + **自动探活** + 管理台表格修复） | `web/src/app/(auth)/`、`web/src/app/(app)/`、`web/src/components/SideNav.tsx`、`HealthBanner.tsx`、`web/src/lib/health.ts` | `cd web; npm test`（**150 passed**）；`npm run build`；`npm run typecheck`；`uv run python -m scripts.evidence_accounts`；`uv run python -m scripts.evidence_paths` |
+| **issue 004 修复** | ✅ 已修复（**管理员开账号 422**：口令策略只落在后端 → 前端不知道、报错不说原因、失败还清空表单） | `web/src/lib/password.ts`、`web/src/app/(app)/admin/page.tsx` | `cd web; npm test`（**169 passed**，新增 10）；`node scripts/admin-create-evidence.mjs`（**真浏览器 5 passed**）；见 [`issues/004`](issues/004-admin-cannot-create-account.md) |
+| **issue 005 修复** | ✅ 已修复（**管理台停用/改角色 `Failed to fetch`**：CORS 白名单漏了 `PATCH` → 预检 400，那条请求根本没发出） | `app/api/main.py`、`tests/api/test_cors.py` | `uv run pytest -q tests/api/test_cors.py`；`node scripts/admin-patch-evidence.mjs`（**真浏览器 7 passed**）；见 [`issues/005`](issues/005-cors-missing-patch-method.md) |
+| **issue 006 修复** | ✅ 已修复（**管理台改角色提示成功但没生效**：受控 `select` 的值在异步 thunk 执行前被 React 回滚 → 请求体发的是旧角色） | `web/src/app/(app)/admin/page.tsx`、`web/tests/hook-wiring.test.ts` | `cd web; npm test`（**171 passed**，新增 2）；`node scripts/admin-role-evidence.mjs`（**真浏览器 6 passed**）；见 [`issues/006`](issues/006-admin-role-change-not-persisted.md) |
 
 > 📌 **变更 002（前端改版）的用法**：
 > ① 后端照旧 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
@@ -112,10 +182,16 @@ uv run python -m scripts.evidence_paths              # 变更 002 取证：三�
 ```bash
 npm install --ignore-scripts   # ⚠️ 必须带 --ignore-scripts（见 16 runbook §10.1 坑 1）
 npm run dev                    # 开发模式 → http://127.0.0.1:3000
-npm test                       # 离线用例（150 条，不连后端；变更 002 起 +31）
+npm test                       # 离线用例（171 条，不连后端；变更 002 起 +31，issue 004/006 再 +12）
 npm run typecheck              # 类型检查
 npm run build                  # 构建通过（验收第 1 条）
 node tests/run-live.mjs        # 真链路用例（10 条，需要后端在跑）
 npx tsx scripts/probe-evidence.ts      # 变更 002 取证：探活判据（改 NEXT_PUBLIC_API_BASE 可对比断连/正常）
 npx tsx scripts/sidebar-evidence.ts    # 变更 002 取证：三角色的侧边栏入口分流（需后端在跑 + TOK_* 环境变量）
+node scripts/admin-create-evidence.mjs # issue 004 取证：**真浏览器**点管理台的「开账号」（需前后端都在跑）
+node scripts/admin-patch-evidence.mjs  # issue 005 取证：**真浏览器**点「停用」（验 CORS 预检 + 状态翻转）
+node scripts/admin-role-evidence.mjs   # issue 006 取证：**真浏览器**改角色（验请求体、后端值、提示语三者一致）
 ```
+
+> ⚠️ 三个 `admin-*-evidence.mjs` 都会**真的改演示库**（建号 / 停用 / 改角色），跑完各自复原现场。
+> 它们只该对着**开发/演示库**跑。

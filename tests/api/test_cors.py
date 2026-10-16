@@ -194,3 +194,74 @@ def test_request_id_header_is_exposed_to_the_browser(client: TestClient) -> None
     response = client.get("/health", headers={"Origin": WEB_ORIGIN})
     exposed = response.headers.get("access-control-expose-headers", "").lower()
     assert "x-request-id" in exposed
+
+
+# ── 反向断言：路由用到的方法**都**要在 allow_methods 里（issue 005）────────────
+
+def _cors_allow_methods() -> set[str]:
+    """从中间件配置里取 CORS 放通的方法集合（`create_app()` 的装配结果）。"""
+    from starlette.middleware.cors import CORSMiddleware
+
+    for middleware in create_app().user_middleware:
+        if middleware.cls is CORSMiddleware:
+            declared = middleware.kwargs.get("allow_methods") or []
+            return {str(item).upper() for item in declared}
+    raise AssertionError("没找到 CORSMiddleware：跨源调用会全线失败（配置被删了？）")
+
+
+def _route_methods() -> set[str]:
+    """路由**实际**用到的 HTTP 方法（从 OpenAPI schema 取，那是权威）。
+
+    ⚠️ 为什么不用遍历 `app.routes`：Starlette 1.7 把 `include_router` 的结果包成
+    `_IncludedRouter`，直接遍历只能看到 `/docs` 那几条**内置**路由 ——
+    本用例第一版就是这么写的，于是「API 用到的 PATCH」根本没被枚举到，
+    一条本该红的断言反而绿了（实测）。OpenAPI schema 是 FastAPI 生成的权威视图，
+    它一定包含全部已注册的业务路由。
+    """
+    schema = create_app().openapi()
+    out: set[str] = set()
+    for operations in schema.get("paths", {}).values():
+        out.update(str(method).upper() for method in operations)
+    return out
+
+
+def test_every_route_method_is_allowed_by_cors() -> None:
+    """★路由用到的每个方法都必须在 `allow_methods` 里（issue 005 的防回归判据）。
+
+    ## 这条用例要挡的是什么
+
+    管理台的「停用 / 改角色」走 `PATCH /api/admin/accounts/{id}`，而 CORS 的
+    `allow_methods` 一度只有 `["GET", "POST", "OPTIONS"]`。`PATCH` 是**非简单方法**，
+    浏览器一定先发预检 —— 预检被 `400 Disallowed CORS method` 拒掉之后，
+    **那条真正的请求根本不会发出**：
+
+    ```text
+    页面：  请求没有到达后端（没有状态码）… TypeError: Failed to fetch
+    控制台：Response to preflight request doesn't pass access control check
+    后端：  一条请求都没有（预检在中间件层就被答掉了）
+    ```
+
+    这个症状极易被误判成「后端没起」或「令牌失效」，而真相是白名单漏了一个方法。
+
+    ## 为什么既有用例没拦住
+
+    `test_preflight_is_answered_without_authentication` 只验了 `POST`（简单方法），
+    它证明「allow_methods 里的方法能过预检」，**证不了反方向**
+    （有 scope、有额度、却没登记 —— 与 `issues/003` 的 P0-1 是同一类漏项）。
+    所以这里做的是**反向**断言：以路由为起点，逐个要求白名单包含它。
+    """
+    allowed = _cors_allow_methods()
+    used = _route_methods()
+
+    assert used, "OpenAPI schema 里没有任何路由方法（收集逻辑坏了？）"
+
+    # 预检自身要用 OPTIONS；漏了它所有跨源写请求都会被拒
+    assert "OPTIONS" in allowed, "allow_methods 里没有 OPTIONS：浏览器发不了预检"
+
+    missing = sorted(used - allowed)
+    assert not missing, (
+        f"这些方法被路由用到、但 CORS 没放通：{missing}\n"
+        "  —— 浏览器会先发预检，预检被 400 拒 → 那条请求根本不会发出\n"
+        "  （症状：页面上 `Failed to fetch` 且**没有状态码**，后端日志里一条请求都没有）"
+    )
+

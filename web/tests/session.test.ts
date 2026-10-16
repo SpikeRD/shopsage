@@ -31,9 +31,11 @@ import {
   readActiveSession,
   readRefreshToken,
   refreshKey,
+  SessionExpiredError,
+  withFreshToken,
   writeSessionPair,
 } from "../src/lib/session.ts";
-import type { TokenPayload } from "../src/lib/api.ts";
+import { ApiError, type TokenPayload } from "../src/lib/api.ts";
 
 /** 造一个**形状真实**的 JWT（不验签，前端只解码 payload）。 */
 function fakeJwt(payload: Record<string, unknown>): string {
@@ -251,6 +253,124 @@ test("没有刷新令牌时**不当作错误**（手粘的演示令牌就是这�
   });
   assert.equal(called, 0);
   assert.equal(result, token, "把现有令牌交出去：它可能还能用几分钟，用不了时后端会 401");
+});
+
+// ── withFreshToken：401 自动续期并重试（issue 003 的 P1-2）────────────────────
+
+test("★401 时自动刷新令牌并重试一次（而不是把用户踢回登录页）", async () => {
+  const storage = memoryStorage();
+  writeSessionPair(payloadFor("customer", "c2", "customer", "customer", { ttlSeconds: 1800 }), storage);
+  const refreshed = payloadFor("customer", "c2", "customer", "customer", {
+    ttlSeconds: 1800,
+    accountId: 4242,
+  });
+
+  const seen: string[] = [];
+  const result = await withFreshToken(
+    "customer",
+    storage,
+    async (token) => {
+      seen.push(token);
+      // 第一次用旧令牌 → 401；第二次（刷新后的）→ 成功
+      if (seen.length === 1) {
+        throw new ApiError({ status: 401, code: "unauthorized", message: "令牌过期" });
+      }
+      return "ok";
+    },
+    {
+      fetchImpl: (async () =>
+        new Response(JSON.stringify(respondWith(refreshed)), { status: 200 })) as unknown as typeof fetch,
+    },
+  );
+
+  assert.equal(result, "ok");
+  assert.equal(seen.length, 2, "401 之后必须重试一次");
+  assert.notEqual(seen[0], seen[1], "重试用的必须是刷新后的令牌");
+  assert.equal(decodeAccountId(seen[1]), 4242);
+});
+
+test("★只重试一次：第二次仍 401 就把错误抛出去（不进入死循环）", async () => {
+  const storage = memoryStorage();
+  writeSessionPair(payloadFor("customer", "c2", "customer", "customer", { ttlSeconds: 1800 }), storage);
+  const refreshed = payloadFor("customer", "c2", "customer", "customer", {
+    ttlSeconds: 1800,
+    accountId: 4242,
+  });
+  let attempts = 0;
+  await assert.rejects(
+    () =>
+      withFreshToken(
+        "customer",
+        storage,
+        async () => {
+          attempts += 1;
+          throw new ApiError({ status: 401, code: "unauthorized", message: "还是不行" });
+        },
+        {
+          fetchImpl: (async () =>
+            new Response(JSON.stringify(respondWith(refreshed)), { status: 200 })) as unknown as typeof fetch,
+        },
+      ),
+    /还是不行/,
+  );
+  assert.equal(attempts, 2, "最多两次：一次原请求 + 一次重试");
+});
+
+test("非 401 的错误**不**触发刷新（避免无谓的令牌轮换）", async () => {
+  const storage = memoryStorage();
+  writeSessionPair(payloadFor("customer", "c2", "customer", "customer", { ttlSeconds: 1800 }), storage);
+  let refreshCalled = 0;
+  await assert.rejects(
+    () =>
+      withFreshToken(
+        "customer",
+        storage,
+        async () => {
+          throw new ApiError({ status: 500, code: "internal_error", message: "服务端炸了" });
+        },
+        {
+          fetchImpl: (async () => {
+            refreshCalled += 1;
+            return new Response("{}", { status: 200 });
+          }) as unknown as typeof fetch,
+        },
+      ),
+    /服务端炸了/,
+  );
+  assert.equal(refreshCalled, 0, "500 不该触发刷新");
+});
+
+test("★并发刷新只发一次请求（刷新令牌互相作废是真实故障）", async () => {
+  const storage = memoryStorage();
+  writeSessionPair(payloadFor("customer", "c2", "customer", "customer", { ttlSeconds: 5 }), storage);
+  const refreshed = payloadFor("customer", "c2", "customer", "customer", {
+    ttlSeconds: 1800,
+    accountId: 4242,
+  });
+  let refreshCalls = 0;
+  const fetchImpl = (async () => {
+    refreshCalls += 1;
+    return new Response(JSON.stringify(respondWith(refreshed)), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  // 三个并发调用（模拟页面同时发起多个请求）
+  const results = await Promise.all([
+    ensureFreshToken("customer", storage, { fetchImpl }),
+    ensureFreshToken("customer", storage, { fetchImpl }),
+    ensureFreshToken("customer", storage, { fetchImpl }),
+  ]);
+
+  assert.equal(refreshCalls, 1, "并发刷新必须共享一次请求（否则会互相作废刷新令牌）");
+  assert.ok(results.every((token) => token !== null));
+  assert.equal(decodeAccountId(results[0] as string), 4242);
+});
+
+test("没有登录态时 withFreshToken 抛 SessionExpiredError", async () => {
+  const storage = memoryStorage();
+  await assert.rejects(
+    () => withFreshToken("customer", storage, async () => "never"),
+    (exc: unknown) => exc instanceof SessionExpiredError,
+  );
 });
 
 /** 把 `TokenPayload` 转成后端 `TokenResponse` 的形状（刷新响应体）。 */

@@ -139,3 +139,144 @@ test("`reconnect` 必须真的换连接（不只是清状态）", () => {
   assert.match(slice, /setConnectionKey\(\(key\) => key \+ 1\)/, "reconnect 没有换连接");
   assert.match(slice, /waitingRef\.current = null/, "reconnect 没有清掉挂起的一轮（否则界面会一直转圈）");
 });
+
+// ── 刷新令牌必须真的被接线（issue 003 的 P1-2）────────────────────────────────
+
+/**
+ * ★ 这一组防的是「**实现了、测试了、但没人调用**」这类漏项。
+ *
+ * P1-2 的真实形态：`ensureFreshToken` / `postRefresh` 写得完整、
+ * `session.test.ts` 也覆盖了它们，但**全项目没有任何一处调用** ——
+ * 于是访问令牌 30 分钟一到期，用户就被硬性踢回登录页，
+ * 而刷新令牌（14 天有效）明明还躺在 localStorage 里。
+ *
+ * ⚠️ 单测**测不出**这种问题：单测直接调那个函数，当然能过。
+ * 只有「源码里到底有没有调用点」这一层能发现它，所以这里做源码级断言。
+ */
+function readSource(relative: string): string {
+  return readFileSync(path.resolve(HERE, relative), "utf8");
+}
+
+test("★`withFreshToken` 必须在真实调用点被使用（不只是定义 + 单测）", () => {
+  // ⚠️ 只列**直接发起受保护请求**的文件。`(app)/page.tsx` 不在里面：
+  //    它把令牌交给 `useChatStream`，由那个 hook 负责续期（见下一条断言）。
+  const callSites = [
+    "../src/app/(app)/internal/page.tsx",
+    "../src/app/(app)/admin/page.tsx",
+    "../src/components/useChatStream.ts",
+    "../src/components/SideNav.tsx",
+  ];
+  for (const relative of callSites) {
+    const source = readSource(relative);
+    // ⚠️ 判据必须带 `(`：只写 `/withFreshToken/` 会被 **import 那一行**满足
+    //    （`import { ..., withFreshToken, ... }`），于是「删掉调用、留着 import」
+    //    这种最常见的漏项照样绿 —— 第一版就是这么写的，实测抓不到，已收紧。
+    assert.match(
+      source,
+      /(withFreshToken|ensureFreshToken)\s*\(/,
+      `${relative} 没有接上令牌续期：该文件的请求会在令牌过期后直接 401 ——` +
+        "用户被踢回登录页，而刷新令牌还在本地（P1-2 的原始故障）",
+    );
+  }
+});
+
+test("★对客页把令牌交给 useChatStream，而那个 hook 必须负责续期", () => {
+  // 对客页自己不发请求（它只用 WS + 审批），所以判据是「它走 hook」+「hook 会续期」。
+  assert.match(
+    PAGE_SOURCE,
+    /useChatStream\(\{/,
+    "对客页没有用 useChatStream：令牌续期的接线点就没了",
+  );
+  assert.match(
+    HOOK_SOURCE,
+    /ensureFreshToken|withFreshToken/,
+    "useChatStream 没有接上续期：对客页的 WS 会用过期令牌握手（立刻 4401）",
+  );
+});
+
+test("★建连前必须先续期令牌（WS 握手只发生一次，用过期的令牌会立刻 4401）", () => {
+  const connectBody = HOOK_SOURCE.slice(HOOK_SOURCE.indexOf("const connect = async"));
+  assert.ok(connectBody.length > 0, "找不到建连函数（源码结构变了？）");
+  assert.match(
+    connectBody.slice(0, 600),
+    /ensureFreshToken/,
+    "建连前没有续期令牌：握手只发生一次，用即将过期的令牌会立刻收到 4401 并断开",
+  );
+});
+
+test("★`withFreshToken` 的 401 重试必须有次数上限（否则是死循环）", () => {
+  const source = readSource("../src/lib/session.ts");
+  const body = source.slice(source.indexOf("export async function withFreshToken"));
+  const slice = body.slice(0, 1200);
+  // 判据：只有**一次**重试调用（`return await run(refreshed)`），且刷新后比对令牌
+  const retries = slice.match(/await run\(/g) ?? [];
+  assert.equal(retries.length, 2, "应当是「原请求 + 最多一次重试」，多了就是死循环");
+  assert.match(slice, /refreshed === token/, "刷新后没有比对令牌：同一条令牌重试只是白打一次");
+});
+
+// ── 事件值必须在**同步阶段**取出（issue 006）──────────────────────────────────
+
+/**
+ * ★ 这一组防的是「**受控输入 + 异步读 `event.target.value`**」这类时序 bug。
+ *
+ * issue 006 的真实形态：管理台改角色的 `<select>` 是受控的（`value={account.role}`）。
+ * 用户选了 `manager` 之后：
+ *
+ * ```text
+ * change 同步 = manager     ← 只有这一瞬间是对的
+ * microtask   = customer    ← React 用旧的 account.role 把 DOM 回滚了
+ * t+50ms      = customer
+ * ```
+ *
+ * 而 `onChange` 里的 thunk 是**异步执行**的（`run()` 先 `setNotice(null)` 调度重渲染）。
+ * 于是请求体发的是**旧角色**（等于什么都没改）→ 后端照旧 200 →
+ * 而**同步求值**的提示语却说「已改为 manager」→
+ * 用户看到「提示成功、实际没生效」。
+ *
+ * ⚠️ 纯逻辑单测**测不出**它（不渲染 React、没有受控组件回滚这种事）。
+ * 所以这里做源码级断言：受控控件的事件值必须**先存进局部常量**，
+ * 再交给异步 thunk 使用。
+ */
+test("★管理台改角色：必须同步取出事件值（受控 select 会在异步 thunk 执行前被回滚）", () => {
+  const admin = readSource("../src/app/(app)/admin/page.tsx");
+  const at = admin.indexOf("aria-label={`改 ${account.identifier} 的角色`}");
+  assert.ok(at >= 0, "找不到改角色的 select（aria-label 改了吗？）");
+  // 取这个 select 的 onChange 到收尾（足够覆盖 handler 全文）
+  const handler = admin.slice(at, at + 1600);
+
+  assert.match(
+    handler,
+    /const\s+nextRole\s*=\s*event\.target\.value/,
+    "改角色的 onChange 没有把事件值先存进局部常量：" +
+      "受控 select 会在异步 thunk 执行前被 React 回滚成旧值（issue 006 实测），" +
+      "结果是「请求体发旧角色（没改）+ 提示语说改了」",
+  );
+  // 反向：thunk 里不许再读 `event.target.value`（那正是 bug 的形态）
+  assert.ok(
+    !/patchAccount[\s\S]{0,120}event\.target\.value/.test(handler),
+    "`patchAccount` 的实参里仍在读 `event.target.value`：它是**异步**执行的，" +
+      "那时受控 select 已经被回滚 —— 这正是 issue 006 的原始故障",
+  );
+});
+
+test("★管理台：所有异步 thunk 里都不许直接读 `event.target.value`", () => {
+  // 通用防线：`run(...)` 的 thunk 是异步的，受控控件的值在那时不可信。
+  // 判据是「thunk 内部（`run(` 到它的收尾）没有 event.target.value」。
+  const admin = readSource("../src/app/(app)/admin/page.tsx");
+  const offenders = [];
+  let cursor = admin.indexOf("void run(");
+  while (cursor >= 0) {
+    const chunk = admin.slice(cursor, cursor + 400);
+    if (/event\.target\.value/.test(chunk)) offenders.push(chunk.slice(0, 120));
+    cursor = admin.indexOf("void run(", cursor + 1);
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "这些 `void run(...)` 的异步 thunk 里直接读了 `event.target.value`：" +
+      `\n${offenders.join("\n---\n")}\n` +
+      "受控控件（input/select）的值必须**在 onChange 的同步阶段**先取出，" +
+      "否则 React 已把它回滚成旧值（issue 006）",
+  );
+});
+

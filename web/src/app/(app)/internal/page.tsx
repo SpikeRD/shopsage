@@ -27,7 +27,8 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { ApiError, postChat } from "@/lib/api";
-import { canUseInternal, ROLE_PERMISSIONS } from "@/lib/auth";
+import { browserStorage, canUseInternal, ROLE_PERMISSIONS } from "@/lib/auth";
+import { SessionExpiredError, withFreshToken } from "@/lib/session";
 import { chartWarnings, toEChartsOption, toTableView } from "@/lib/chart";
 import type { ChatResponse, ChartSpec } from "@/lib/contracts";
 import { apiBase } from "@/lib/config";
@@ -42,6 +43,9 @@ const SUGGESTIONS = [
   "销售额最高的 10 个商品",
   "本月退款金额按商品分类的占比，用饼图",
 ];
+
+/** 这一页用哪把「钥匙」（令牌按入口分开存，见 `lib/session.ts` 的三把钥匙说明）。 */
+const ENTRY = "internal" as const;
 
 export default function InternalPage() {
   const { session, ready } = useSession("internal");
@@ -89,7 +93,12 @@ function InternalConsole({ token, role, userId }: { token: string; role: string;
     setRunning(true);
     setError("");
     try {
-      const payload = await postChat(token, { message: text, sessionId });
+      // ⚠️ 走 `withFreshToken`（issue 003 的 P1-2）：令牌快过期时先续期、被 401 拒时
+      //    自动换一条重试一次。直接用 `token` 会让用户每 30 分钟被踢回登录页 ——
+      //    而刷新令牌明明还在本地。
+      const payload = await withFreshToken(ENTRY, browserStorage(), (fresh) =>
+        postChat(fresh, { message: text, sessionId }),
+      );
       setResponse(payload);
       if (payload.session_id) setSessionId(payload.session_id);
     } catch (exc) {
@@ -97,6 +106,10 @@ function InternalConsole({ token, role, userId }: { token: string; role: string;
         setError(
           `${exc.message}（HTTP ${exc.status} · code=${exc.code}${exc.requestId ? ` · request_id=${exc.requestId}` : ""}）`,
         );
+      } else if (exc instanceof SessionExpiredError) {
+        // 登录态彻底不可用（刷新也失败）→ 回登录页，而不是留在页面上反复失败
+        setError(`${exc.message}（登录态已失效，正在跳转登录页…）`);
+        window.location.assign("/login");
       } else {
         // ⚠️ 走到这里的是 **fetch 本身抛的 TypeError**（跨源被拦 / 后端没起 / 地址写错）——
         // 它与「后端返回了一个错误」是两件事，所以用同一套诊断话术（`lib/diagnostics.ts`），

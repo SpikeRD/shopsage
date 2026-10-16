@@ -256,8 +256,16 @@ async def default_llm(messages: list[dict[str, Any]], **kwargs: Any) -> LLMRespo
 # ── NL→SQL 的行级过滤自检（对客路径的硬约束）─────────────────────────────────
 
 
+#: 行级过滤要用的**绑定参数名**。与 `app/db/queries.py` 的出口口径一致，
+#: 也与 `data.py::_bind_customer_id` 覆写的键名一致 —— 三处必须是同一个字符串。
+ROW_FILTER_PARAM: Final[str] = "uid"
+
+#: 行级过滤的列名（唯一真相在 `app/security/policy.py`，这里只做本地的字面量比较）
+ROW_FILTER_COLUMN_NAME: Final[str] = "user_id"
+
+
 def customer_row_filter_error(sql: str, *, user_id: int, agent: str = "data") -> str | None:
-    """对客 SQL 缺少 `user_id = :绑定参数` 行级过滤时返回**可回喂的报错**，否则 None。
+    """对客 SQL 缺少 `user_id = :uid` 行级过滤时返回**可回喂的报错**，否则 None。
 
     为什么在建 SQL 之后、执行之前再加这一道（`validate_sql` 已经不缺校验了）：
     `sql_guard` 只知道「有 WHERE 且不恒真」，它**不知道你是谁**——
@@ -269,62 +277,180 @@ def customer_row_filter_error(sql: str, *, user_id: int, agent: str = "data") ->
     唯一真相（WHERE 怎么写）仍在模型/caller 手里，这里只负责「不满足就拒绝」。
     一旦这里开始**改写** SQL（比如自动补 WHERE），就会出现第二处 SQL 生成逻辑，那才是要防的。
 
-    判据只要两条（宽严适度）：
-      ① 存在一个列名 `user_id` 的比较，且等号右边是**参数占位符**（`:uid` / `%(uid)s`）——
-         不要字面量：字面量意味着「user_id 写死在 SQL 里」，模型可以写 1 而调用方是 2；
-      ② 该比较必须落在**最外层 SELECT 的 WHERE**里（子查询里的不算：外层仍可能全表扫）。
+    ## 判据（issue 003 修复后：从「查形状」升级为「查语义」）
+
+    ⚠️ **旧版只查「形状」**（WHERE 里有没有任意一个 `user_id = 占位符`），
+    于是下面这些**越权查询全被放行**（实测）：
+
+    | 绕过形态 | 后果 |
+    |---|---|
+    | `WHERE user_id = :uid OR user_id = 3` | 读出 3 号客户的订单 |
+    | `... UNION SELECT ... WHERE user_id = 3` | 同上（且只要**任一**分支合规即放行）|
+    | `WHERE user_id = :evil` | 占位符名不是 `uid`，`_bind_customer_id` 不会覆写它 |
+    | `WHERE user_id = :uid AND user_id = 3` | 多条件叠加，范围被放宽 |
+
+    现在按**语义**判定，规则是「每个查表的 SELECT 都必须自己限定到本人」：
+
+    1. **顶层不许是集合运算**（`UNION` / `INTERSECT` / `EXCEPT`）：每个分支要单独限定范围，
+       无法用一个 WHERE 保证 —— 对客路径直接拒绝；
+    2. 最外层 WHERE 摊平成**合取项**（AND 链）后，必须有**恰好一个** `user_id` 比较；
+    3. 那一个必须是 `user_id = :uid`（等值 + 占位符名**精确等于** `uid`，
+       否则 `_bind_customer_id` 覆写不到它，模型就能自带一个越权值）；
+    4. **其它任何**合取项都不许再出现 `user_id`（挡 `AND user_id = 3`、`AND user_id IN (...)`）。
+
+    ⚠️ 为什么**不**简单地「WHERE 里出现 OR 就拒」：那会误伤
+    `WHERE user_id = :uid AND (status = 'a' OR status = 'b')` 这种合法写法 ——
+    那个 OR 被 AND 限定在本人范围内，不会放宽结果集。
+    真正危险的是**顶层 OR**（`A OR B` 会把范围并起来），所以按「合取项」而不是「出现 OR」判定。
+
+    第 1 条与第 2/4 条同时覆盖子查询：`SELECT (SELECT count(*) FROM orders WHERE user_id=3)
+    FROM orders WHERE user_id = :uid` 里的内层 SELECT 查了表却**没有**自己的 `user_id = :uid`，
+    会在第 2 条被拒。
     """
     try:
         tree = sqlglot.parse_one(sql, read=DIALECT)
     except Exception as exc:  # noqa: BLE001 - 解析失败＝校验不了，一律拒绝（与 sql_guard 同口径）
         return f"SQL 无法解析，无法核实行级过滤：{type(exc).__name__}: {exc}"
 
-    select = tree if isinstance(tree, sqlglot.exp.Select) else _last_select(tree)
-    if select is None:
-        return "SQL 里找不到最外层 SELECT，无法核实行级过滤"
+    # ① 顶层集合运算：一个 WHERE 管不住所有分支（issue 003 实测的 UNION 绕过）
+    if isinstance(tree, sqlglot.exp.SetOperation):
+        return _row_filter_hint(
+            user_id,
+            "对客查询不允许 UNION / INTERSECT / EXCEPT：每个分支都要单独限定范围，"
+            "无法用一个 WHERE 保证只查本人数据",
+        )
 
+    # ② 逐个 SELECT 检查（含子查询）：凡是查了表的 SELECT，都必须自己限定到本人
+    selects = [s for s in tree.find_all(sqlglot.exp.Select) if _has_table_source(s)]
+    if not selects:
+        return "SQL 里找不到查表的 SELECT，无法核实行级过滤"
+
+    for select in selects:
+        error = _check_one_select(select, user_id=user_id)
+        if error is not None:
+            return error
+    return None
+
+
+def _has_table_source(select: sqlglot.exp.Select) -> bool:
+    """这个 SELECT 是否真的「查了表」（有 FROM 或 JOIN）。
+
+    与 `app/security/sql_guard.py::_has_table_source` 同口径：
+    sqlglot 里 FROM 的键名是 `from_`（带下划线），写成 `"from"` 会**永远返回 None**。
+    """
+    return select.args.get("from_") is not None or bool(select.args.get("joins"))
+
+
+def _check_one_select(select: sqlglot.exp.Select, *, user_id: int) -> str | None:
+    """校验单个查表的 SELECT：它的 WHERE 必须把自己限定到 `user_id = :uid`。"""
     where = select.args.get("where")
     condition = getattr(where, "this", None) if where is not None else None
     if condition is None:
-        return _row_filter_hint(user_id, "最外层 SELECT 没有 WHERE 子句")
+        return _row_filter_hint(user_id, "有一个查表的 SELECT 没有 WHERE 子句")
 
-    for column, value in _equalities(condition):
-        if column.name.lower() != "user_id":
-            continue
-        if isinstance(value, sqlglot.exp.Placeholder):
-            return None  # ✅ 形如 `user_id = :uid`
+    conjuncts = _split_conjuncts(condition)
+    row_filters = [c for c in conjuncts if _mentions_row_filter_column(c)]
+
+    if not row_filters:
+        return _row_filter_hint(user_id, "最外层 WHERE 里没有 `user_id = 绑定参数`")
+    if len(row_filters) > 1:
         return _row_filter_hint(
             user_id,
-            f"`user_id` 是用字面量 {value.sql(dialect=DIALECT)!r} 比较的；"
-            "对客 SQL 必须用绑定参数（不能把身份写死在 SQL 文本里）",
+            f"有 {len(row_filters)} 个条件都涉及 `user_id`（必须恰好一个）；"
+            "多个 `user_id` 条件会放宽查询范围",
         )
-    return _row_filter_hint(user_id, "最外层 WHERE 里没有 `user_id = 绑定参数`")
+
+    only = row_filters[0]
+    if not _is_bound_uid_equality(only):
+        rendered = only.sql(dialect=DIALECT)
+        # 给一句**指向具体原因**的话（而不是笼统的「形态不合法」）：
+        # 「用了字面量」与「占位符名不对」的修法完全不同（改 SQL vs 改参数名），
+        # 回喂给模型的提示语必须能区分，否则它会原样重写。
+        literal = _literal_row_filter_value(only)
+        if literal is not None:
+            problem = (
+                f"`user_id` 是用字面量 {literal!r} 比较的；"
+                "对客 SQL 必须用绑定参数（不能把身份写死在 SQL 文本里）"
+            )
+        else:
+            problem = (
+                f"`user_id` 条件的形态不合法：{rendered!r}；"
+                f"对客 SQL 只允许 `{ROW_FILTER_COLUMN_NAME} = :{ROW_FILTER_PARAM}`"
+                "（等值 + 绑定参数名必须是 uid，否则身份无法由程序覆写）"
+            )
+        return _row_filter_hint(user_id, problem)
+    return None
+
+
+def _literal_row_filter_value(node: sqlglot.exp.Expression) -> str | None:
+    """`user_id` 若是与**字面量**比较，返回那个字面量的 SQL 文本；否则 None。
+
+    只为把报错文案说准（「用了字面量」与「占位符名不对」的修法不同）。
+    """
+    if isinstance(node, sqlglot.exp.Paren):
+        return _literal_row_filter_value(node.this)
+    if not isinstance(node, (sqlglot.exp.EQ, sqlglot.exp.NEQ, sqlglot.exp.In, sqlglot.exp.Between)):
+        return None
+    for column, value in ((node.this, node.expression), (node.expression, node.this)):
+        if isinstance(column, sqlglot.exp.Column) and column.name.lower() == ROW_FILTER_COLUMN_NAME:
+            if isinstance(value, sqlglot.exp.Literal):
+                return value.sql(dialect=DIALECT)
+    return None
+
+
+def _split_conjuncts(condition: sqlglot.exp.Expression) -> list[sqlglot.exp.Expression]:
+    """把顶层的 `AND` 链摊平成合取项列表；`OR` **不摊平**（它在语义上是一个整体）。
+
+    为什么要摊平而不是直接看整棵树：我们需要区分
+    「`A OR B`」（顶层 OR，范围会并起来 → 危险）与
+    「`A AND (B OR C)`」（OR 被 AND 限定在 A 的范围内 → 安全）。
+    摊平后每个合取项各自检查，这两种形态自然被区分开。
+    """
+    if isinstance(condition, sqlglot.exp.Paren):
+        return _split_conjuncts(condition.this)
+    if isinstance(condition, sqlglot.exp.And):
+        return _split_conjuncts(condition.this) + _split_conjuncts(condition.expression)
+    return [condition]
+
+
+def _mentions_row_filter_column(node: sqlglot.exp.Expression) -> bool:
+    """这个条件里有没有引用行级过滤那一列（`user_id`）。"""
+    return any(
+        isinstance(col, sqlglot.exp.Column) and col.name.lower() == ROW_FILTER_COLUMN_NAME
+        for col in node.find_all(sqlglot.exp.Column)
+    )
+
+
+def _is_bound_uid_equality(node: sqlglot.exp.Expression) -> bool:
+    """这个条件是不是**恰好** `user_id = :uid`（占位符名必须精确等于 `uid`）。
+
+    ⚠️ 占位符名必须精确匹配：`data.py::_bind_customer_id` 只在 SQL 里出现 `:uid` 时
+    才把身份覆写进去（`if ":uid" in sql`）。若模型写 `user_id = :evil`，
+    覆写不会发生，模型就能自带 `{'evil': 3}` 把范围定到别人身上（issue 003 实测）。
+
+    谁在等号左边不假设（`user_id = :uid` 与 `:uid = user_id` 都接受）。
+    """
+    if isinstance(node, sqlglot.exp.Paren):
+        return _is_bound_uid_equality(node.this)
+    if not isinstance(node, sqlglot.exp.EQ):
+        return False
+    for column, value in ((node.this, node.expression), (node.expression, node.this)):
+        if isinstance(column, sqlglot.exp.Column) and column.name.lower() == ROW_FILTER_COLUMN_NAME:
+            return isinstance(value, sqlglot.exp.Placeholder) and str(value.name) == ROW_FILTER_PARAM
+    return False
 
 
 def _row_filter_hint(user_id: int, problem: str) -> str:
     return (
         f"{problem}。对客查询必须自己限定到本人："
-        f"`WHERE user_id = :uid ...` 并把 `{{'uid': {user_id}}}` 一起绑定。"
+        f"`WHERE {ROW_FILTER_COLUMN_NAME} = :{ROW_FILTER_PARAM} ...` "
+        f"并把 `{{'{ROW_FILTER_PARAM}': {user_id}}}` 一起绑定。"
     )
 
 
 def _last_select(tree: sqlglot.exp.Expression) -> sqlglot.exp.Select | None:
     selects = list(tree.find_all(sqlglot.exp.Select))
     return selects[-1] if selects else None
-
-
-def _equalities(condition: sqlglot.exp.Expression) -> list[tuple[sqlglot.exp.Column, sqlglot.exp.Expression]]:
-    """列出条件里的等值对（`a = b`），两侧都试 —— 谁在左谁在右不许假设。"""
-    pairs: list[tuple[sqlglot.exp.Column, sqlglot.exp.Expression]] = []
-    for node in condition.walk():
-        if not isinstance(node, sqlglot.exp.EQ):
-            continue
-        left, right = node.this, node.expression
-        if isinstance(left, sqlglot.exp.Column):
-            pairs.append((left, right))
-        if isinstance(right, sqlglot.exp.Column):
-            pairs.append((right, left))
-    return pairs
 
 
 def format_rows(rows: Sequence[Mapping[str, Any]], *, limit: int = 20) -> str:
@@ -367,6 +493,8 @@ def build_system_prompt(role_text: str, *, output_schema: str) -> str:
 __all__ = [
     "DEFAULT_REPAIRS",
     "MAX_ECHO_CHARS",
+    "ROW_FILTER_COLUMN_NAME",
+    "ROW_FILTER_PARAM",
     "AgentOutputError",
     "JsonLLM",
     "build_system_prompt",

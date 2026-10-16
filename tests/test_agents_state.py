@@ -241,6 +241,61 @@ def test_customer_row_filter_requires_outermost_where() -> None:
     assert customer_row_filter_error(sql, user_id=1) is not None
 
 
+# ── 跨租户绕过（issue 003 的 P0-2 回归判据）────────────────────────────────────
+#
+# ⚠️ 这些形态在修复前**全部被放行**（旧实现只查「WHERE 里有没有任意一个
+# `user_id = 占位符`」这个形状，不查语义）。每一条都对应一种真实的越权读法：
+# 调用者是 user_id=2，这些 SQL 却会把 3 号客户的订单读出来。
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # 顶层 OR：范围被并起来
+        "SELECT order_id FROM orders WHERE user_id = :uid OR user_id = 3 LIMIT 5",
+        "SELECT order_id FROM orders WHERE user_id = :uid OR TRUE LIMIT 5",
+        # 叠加第二个 user_id 条件
+        "SELECT order_id FROM orders WHERE user_id = :uid AND user_id = 3 LIMIT 5",
+        "SELECT order_id FROM orders WHERE user_id = :uid AND user_id IN (1, 2, 3) LIMIT 5",
+        # 占位符名不是 uid → `_bind_customer_id` 不会覆写它，模型可自带越权值
+        "SELECT order_id FROM orders WHERE user_id = :evil LIMIT 5",
+        # UNION：一个 WHERE 管不住所有分支（且只要任一分支合规，旧实现就放行）
+        "SELECT order_id FROM orders WHERE user_id = :uid UNION "
+        "SELECT order_id FROM orders WHERE user_id = 3 LIMIT 5",
+        "SELECT order_id FROM orders WHERE user_id = 3 UNION "
+        "SELECT order_id FROM orders WHERE user_id = :uid LIMIT 5",
+        # 子查询：内层查了表却没有自己的行级过滤
+        "SELECT (SELECT count(*) FROM orders WHERE user_id = 3) FROM orders WHERE user_id = :uid LIMIT 5",
+        "SELECT order_id, (SELECT total_amount FROM orders WHERE user_id = 3) x "
+        "FROM orders WHERE user_id = :uid LIMIT 5",
+    ],
+)
+def test_customer_row_filter_rejects_cross_tenant_bypass(sql: str) -> None:
+    """★跨租户 SQL 必须被拒（issue 003 的 P0-2）。"""
+    error = customer_row_filter_error(sql, user_id=2)
+    assert error is not None, f"越权 SQL 被放行了：{sql}"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT order_id FROM orders WHERE user_id = :uid LIMIT 5",
+        "SELECT order_id FROM orders WHERE :uid = user_id LIMIT 5",
+        "SELECT o.order_id FROM orders o WHERE o.user_id = :uid LIMIT 5",
+        "SELECT status, count(*) FROM orders WHERE user_id = :uid GROUP BY status LIMIT 5",
+        "SELECT order_id FROM orders WHERE user_id = :uid AND status = 'paid' LIMIT 5",
+        # ⚠️ 这条**必须继续放行**：OR 被 AND 限定在本人范围内，不会放宽结果集。
+        # 「出现 OR 就拒」是过度收紧，会把正常的状态筛选一起挡掉。
+        "SELECT order_id FROM orders WHERE user_id = :uid AND (status = 'a' OR status = 'b') LIMIT 5",
+        "SELECT o.order_id FROM orders o JOIN order_items i ON i.order_id = o.order_id "
+        "WHERE o.user_id = :uid LIMIT 5",
+    ],
+)
+def test_customer_row_filter_still_accepts_legitimate_queries(sql: str) -> None:
+    """修复不能过度收紧：合法的「限定到本人」查询必须继续通过。"""
+    assert customer_row_filter_error(sql, user_id=2) is None, f"合法查询被误拒：{sql}"
+
+
 def test_customer_row_filter_rejects_unparsable_sql() -> None:
     error = customer_row_filter_error("SELECT FROM WHERE", user_id=1)
     assert error and "无法解析" in error

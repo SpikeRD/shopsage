@@ -32,6 +32,10 @@ from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# 口令长度下限的**唯一真相**在 `app.security.accounts`（业务层），这里只引用它，
+# 不重新写一个数字 —— 两处各写一个「至少 8 位/至少 12 位」迟早会漂移。
+from app.security.accounts import MIN_PASSWORD_LENGTH
+
 # ── 取值域（前端与后端共用一份字面量，避免各写各的字符串）────────────────────
 
 #: 会话 id 允许的字符：字母/数字/下划线/连字符/点。
@@ -487,7 +491,16 @@ class AccountCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     identifier: str = Field(min_length=1, max_length=64)
-    password: str = Field(min_length=1, max_length=200, description="初始口令（由管理员告知本人）")
+    # ⚠️ 长度下限与 `accounts.MIN_PASSWORD_LENGTH` 是**同一个数**（issue 003 的 P1-3）：
+    # 修复前这里是 `min_length=1`，实测管理员能用 `password="x"` 建出可登录的账号。
+    # schema 这一层的作用是「更早失败 + 进 OpenAPI 文档」；
+    # 真正的强度校验（弱口令、与标识相同）在 `accounts.validate_password_strength()`，
+    # 因为脚本/后台任务不经过 pydantic。
+    password: str = Field(
+        min_length=MIN_PASSWORD_LENGTH,
+        max_length=200,
+        description=f"初始口令（至少 {MIN_PASSWORD_LENGTH} 位，由管理员告知本人）",
+    )
     role: str = Field(max_length=32, description="取值必须是 `rbac.ROLE_PERMISSIONS` 的键")
     subject_type: str = Field(description="`customer` 或 `employee`")
     subject_id: int = Field(
@@ -516,7 +529,11 @@ class PasswordResetRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    new_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(
+        min_length=MIN_PASSWORD_LENGTH,
+        max_length=200,
+        description=f"新口令（至少 {MIN_PASSWORD_LENGTH} 位）",
+    )
 
 
 __all__ = [

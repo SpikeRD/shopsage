@@ -1,4 +1,4 @@
-"""语义缓存的**端到端**语义（内存后端 + 可控假 embedding + 内存版本表）。
+﻿"""语义缓存的**端到端**语义（内存后端 + 可控假 embedding + 内存版本表）。
 
 这一组对应 `13.cache.md` §7 的五条用例，逐条落地：
 
@@ -273,7 +273,7 @@ def test_invalidate_on_change(space: SemanticSpace, revisions) -> None:
     cache.semantic.respond(prepared, ANSWER)
     assert cache.lookup(messages("怎么退货"), user_id=2, role="customer").hit is True
 
-    revisions.bump(by="test:ingest", force=True)  # 知识库变了
+    revisions.bump(by="test:ingest")  # 知识库变了
 
     after = cache.lookup(messages("怎么退货"), user_id=2, role="customer")
     assert after.hit is False
@@ -284,7 +284,7 @@ def test_invalidation_is_explainable_by_the_fingerprint(space: SemanticSpace, re
     """指纹**随版本变化**（这是「失效不需删行」的全部依据）。"""
     cache = build(space, revisions=revisions)
     before = cache.lookup(messages("怎么退货"), user_id=2, role="customer").fingerprint
-    revisions.bump(force=True)
+    revisions.bump()
     after = cache.lookup(messages("怎么退货"), user_id=2, role="customer").fingerprint
     assert before != after
     assert fingerprint_for(corpus_revision=1, embedding_model="fake/model") != fingerprint_for(
@@ -292,12 +292,24 @@ def test_invalidation_is_explainable_by_the_fingerprint(space: SemanticSpace, re
     )
 
 
-def test_revision_survives_a_repeated_ingest_without_changes(space: SemanticSpace, revisions) -> None:
-    """**重复入库不 bump**：否则每跑一次同步都会白清一次缓存（命中率掉一个坑）。"""
-    assert revisions.bump(by="ingest:x", version=1) == 1  # 与当前版本相同 → 不动
-    assert revisions.current() == 1
-    assert revisions.bump(by="ingest:x", version=2) == 2  # 真的变了 → +1
-    assert revisions.current() == 2
+def test_revision_always_advances_on_ingest(space: SemanticSpace, revisions) -> None:
+    """★入库**必须**推进版本，即使 `document_version` 与当前版本号巧合相等。
+
+    issue 003 的 P1-1：旧实现有一句「version 与当前 corpus_revision 相同就不 bump」，
+    但它比较的两个量**量纲不同** —— `version` 是 `rag_documents.version`（每份文档各自的
+    版本号），`corpus_revision` 是全局知识库版本。于是「新文档 version=1 撞上
+    corpus_revision=1」时**版本不动 → 缓存不失效**，用户长期拿到旧答案。
+
+    「重复入库不要白清缓存」由上游闸门负责（`ingest.py` 只在 `doc_changed` 时才回调），
+    所以这里必须无条件 +1。
+    """
+    start = revisions.current()
+    assert revisions.bump(by="ingest:x", version=start) == start + 1, (
+        "document_version 与当前 corpus_revision 相等时也必须推进（这正是 P1-1 的触发条件）"
+    )
+    assert revisions.current() == start + 1
+    assert revisions.bump(by="ingest:x", version=start + 1) == start + 2
+    assert revisions.current() == start + 2
 
 
 # ── 写路径的六条闸 ──────────────────────────────────────────────────────────

@@ -56,7 +56,7 @@ import {
   visibleEntriesFor,
   type Entry,
 } from "@/lib/auth";
-import { clearSessionPair, readActiveSession, type ActiveSession } from "@/lib/session";
+import { clearSessionPair, readActiveSession, withFreshToken, type ActiveSession } from "@/lib/session";
 
 /** 侧边栏里的一个入口（顺序即显示顺序，来自 `lib/auth.ts::ENTRIES`）。 */
 const ITEM_META: Record<Entry, { label: string; hint: string }> = {
@@ -115,7 +115,11 @@ export function SideNav() {
       return;
     }
     try {
-      const me = await getMe(active.token);
+      // ⚠️ 走 `withFreshToken`（issue 003 的 P1-2）：身份自检也要能在令牌快过期时续期，
+      //    否则用户看到的是「权限莫名回退到本地值」而不是一次正常的续期。
+      //    入口用 `active.entry`（**实际持有令牌的那个**），不是 `currentEntry`
+      //    （路径对应的入口）—— 两者在「从 / 进来但只有 internal 钥匙」时不同。
+      const me = await withFreshToken(active.entry, storage, (fresh) => getMe(fresh));
       setIdentity({
         subject: String(me.subject ?? active.subject),
         role: String(me.role ?? active.role),

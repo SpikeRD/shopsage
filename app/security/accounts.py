@@ -81,6 +81,63 @@ ENTRY_CUSTOMER: Final[str] = "customer"
 #: 两处各写一个「初始值」迟早会漂移成「有的账号从 0 开始、有的从 1 开始」。
 INITIAL_TOKEN_VERSION: Final[int] = DEFAULT_TOKEN_VERSION
 
+# ── 口令强度（issue 003 的 P1-3）─────────────────────────────────────────────
+#
+# ⚠️ 修复前这里**只有「不能为空」**：实测管理员可以用 `password="x"` 建账号
+# （返回 201），并且能真的用它登录成功。项目对其它配置项都是 fail-fast 且写清理由的
+# （限流表达式、`API_CORS_ORIGINS` 的 `*`），唯独口令强度没有任何约束 ——
+# 而登录限流当时也是失效的，弱口令 + 无限次尝试可以直接爆破。
+#
+# 12 位是**长度下限**（不是「必须含大小写数字符号」那类复杂度规则）：
+# 复杂度规则会把人逼成 `Passw0rd!` 这种可预测的形态，长度对熵的贡献更实在。
+# 与 NIST SP 800-63B 的口径一致：优先长度、不强制周期性更换与字符类别组合。
+MIN_PASSWORD_LENGTH: Final[int] = 12
+
+#: 与登录标识/常见弱口令重合时直接拒绝（按小写比较）。
+#: 这些是「猜三次就能进」的形态，长度够了也不能放行。
+_WEAK_PASSWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "password",
+        "password1234",
+        "passw0rdpassw0rd",
+        "123456789012",
+        "qwertyuiop12",
+        "administrator",
+        "changeme1234",
+        "shopsage1234",
+    }
+)
+
+
+def validate_password_strength(password: str, *, identifier: str = "") -> None:
+    """口令强度校验；不合格抛 `AccountError`（**唯一真相**，两层都调它）。
+
+    ⚠️ 为什么放在 `accounts.py`（业务层）而不是只在 pydantic schema 里：
+    1. schema 只在 HTTP 入口生效，脚本/后台任务直接调 `create_account()` 就绕过了；
+    2. 错误类型统一成 `AccountError`，与「标识重复」「主体不存在」走同一条错误通道，
+       调用方（`app/api/account_errors.py`）不需要为它单开一个分支。
+
+    HTTP 层（`schemas.AccountCreateRequest`）**也**有 `min_length` 约束 ——
+    那是为了让 OpenAPI 文档与 422 校验错误更早生效；两处共用本常量，不会漂移。
+
+    ⚠️ 报错文案**不回显口令本身**（日志/响应里都不该出现凭据）。
+    """
+    text = str(password or "")
+    if not text:
+        raise AccountError("口令不能为空")
+    if len(text) < MIN_PASSWORD_LENGTH:
+        raise AccountError(
+            f"口令至少 {MIN_PASSWORD_LENGTH} 位（当前 {len(text)} 位）："
+            "弱口令配合登录接口等于把账号交出去"
+        )
+    if not text.strip():
+        raise AccountError("口令不能全是空白字符")
+    lowered = text.strip().lower()
+    if lowered in _WEAK_PASSWORDS:
+        raise AccountError("口令过于常见：请换一个（常见口令会被优先尝试）")
+    if identifier and lowered == str(identifier).strip().lower():
+        raise AccountError("口令不能与登录标识相同")
+
 
 class AccountError(Exception):
     """账号操作的通用失败（参数不对、主体不存在、状态冲突）。调用方映射成 4xx。"""
@@ -360,10 +417,12 @@ def create_account(
         )
     if not password:
         raise AccountError("口令不能为空")
-
+    # ⚠️ 强度校验放在**标识规范化之前**会拿不到标识，所以这里先规范化再校验
+    #    （「口令不能与登录标识相同」那条规则需要 identifier）。
     normalized = normalize_identifier(identifier)
     if not normalized:
         raise AccountError("登录标识不能为空")
+    validate_password_strength(password, identifier=normalized)
     if get_account_by_identifier(db, normalized) is not None:
         raise AccountError(f"登录标识 {normalized!r} 已被占用")
     if get_account_for_subject(db, subject_type, int(subject_id)) is not None:
@@ -482,6 +541,8 @@ def reset_password(db: Session, account_id: int, new_password: str) -> AccountVi
     row = db.get(Account, int(account_id))
     if row is None:
         raise AccountError(f"账号 {account_id} 不存在")
+    # ⚠️ 重置也要过强度校验：否则「开账号时拦住弱口令、重置时又放回去」形同虚设。
+    validate_password_strength(new_password, identifier=str(row.identifier))
     row.password_hash = hash_password(new_password)
     row.token_version = int(row.token_version) + 1
     row.updated_at = datetime.now(UTC)
@@ -505,6 +566,7 @@ def change_own_password(
         raise AccountError(f"账号 {account_id} 不存在")
     if not verify_password(current_password or "", str(row.password_hash)):
         raise AccountAuthError("当前口令不正确")
+    validate_password_strength(new_password, identifier=str(row.identifier))
     row.password_hash = hash_password(new_password)
     row.token_version = int(row.token_version) + 1
     row.updated_at = datetime.now(UTC)
@@ -579,6 +641,7 @@ __all__ = [
     "ENTRY_CUSTOMER",
     "ENTRY_INTERNAL",
     "INITIAL_TOKEN_VERSION",
+    "MIN_PASSWORD_LENGTH",
     "STATUS_ACTIVE",
     "STATUS_DISABLED",
     "SUBJECT_CUSTOMER",
@@ -603,4 +666,5 @@ __all__ = [
     "subject_exists",
     "unaccounted_subjects",
     "update_account",
+    "validate_password_strength",
 ]

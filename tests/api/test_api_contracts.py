@@ -189,6 +189,49 @@ def test_limited_scopes_are_a_subset_of_the_scope_table() -> None:
     assert LIMITED_SCOPES <= set(SCOPE_BY_ROUTE), f"这些路径限流了但没有 scope：{LIMITED_SCOPES - set(SCOPE_BY_ROUTE)}"
 
 
+def test_every_scoped_route_is_actually_enforced() -> None:
+    """★**反向**断言：每条登记了 scope 的业务路由都必须真的被中间件限流。
+
+    ## 为什么必须有这一条（issue 003 的 P0-1 就是从这里漏过去的）
+
+    上面那条只断言 `LIMITED_SCOPES ⊆ SCOPE_BY_ROUTE` —— 它能拦住「限流了但没 scope」，
+    **拦不住反方向**：`scope.SCOPE_BY_ROUTE` 里有、`ratelimit.DEFAULT_RULES` 里也配了额度、
+    唯独 `middleware.LIMITED_SCOPES` 里没有 → 中间件根本不去问限流器 → **额度完全不生效**，
+    而且没有任何报错。实测症状：连续 40 次错误登录全是 401、一次 429 都没有，
+    而 `POST /api/chat`（登记过）第 31 次起正常 429。
+
+    限流要生效需要三处登记，缺任何一处都是「静默失效」。这条用例把三处钉在一起，
+    以后新增受保护接口时**漏登记会直接红**，而不是等到安全评审才被发现。
+    """
+    from app.api.middleware import LIMITED_SCOPES
+    from app.api.scope import SCOPE_BY_ROUTE
+
+    missing = set(SCOPE_BY_ROUTE) - set(LIMITED_SCOPES)
+    assert not missing, (
+        "这些路径登记了 scope 却没有被中间件限流（额度配了也不生效）："
+        f"{sorted(missing)}。请把它们加进 app/api/middleware.py::LIMITED_SCOPES，"
+        "或从 scope.SCOPE_BY_ROUTE 里删掉。"
+    )
+
+
+def test_auth_endpoints_are_rate_limited() -> None:
+    """★登录与刷新**必须**受限流保护（issue 003 的 P0-1 回归判据）。
+
+    单列一条而不是只靠上面那条通用断言，是因为这两条路径的失效后果最严重：
+    登录是唯一能用「猜」换到令牌的入口，不限流等于给暴力破解无限次尝试
+    （`.env.example` 与 `scope.py` 的注释都是这么写的，但代码曾经没做到）。
+    """
+    from app.api.middleware import LIMITED_SCOPES
+    from app.api.ratelimit import DEFAULT_RULES
+    from app.api.scope import SCOPE_BY_ROUTE
+
+    for path in ("/api/auth/login", "/api/auth/refresh"):
+        route = ("POST", path)
+        assert route in LIMITED_SCOPES, f"{path} 没有登记限流（额度不生效）"
+        scope = SCOPE_BY_ROUTE[route]
+        assert scope in DEFAULT_RULES, f"{path} 的 scope {scope} 没有默认额度"
+
+
 def test_health_and_metrics_never_get_rate_limited() -> None:
     """探针与抓取不吃配额（`9.api.md` §2 的两个基础设施接口）。
 

@@ -39,3 +39,7 @@
 |---|---|---|---|
 | [001](001-internal-query-chart-nondeterminism.md) | 对内报表出图非确定性（5 句里偶有不出图）＋ 探针脚本报错不指向真因 | 部分处理 | 第 7 步 `analysis` 节点（prompt/解析健壮性） |
 | [002](002-hf-cache-outside-workspace.md) | HF 模型缓存默认写仓库外 → 首次真检索抛 `PermissionError` | 已修复 | `app/llm/hf_cache.py`（第 5/10 步） |
+| [003](003-security-and-correctness-fixes.md) | 实测发现的 2 个 P0 安全问题（登录限流失效 / SQL 行级过滤可绕过）与 3 个 P1 问题（缓存版本不推进 / 刷新令牌未接线 / 口令可设 1 字符） | 已修复 | `app/api/middleware.py`、`app/agents/agent_llm.py`、`app/cache/corpus.py`、`app/security/accounts.py`、`web/src/lib/session.ts` |
+| [004](004-admin-cannot-create-account.md) | 管理员在管理台**开账号总是 422**：口令策略（≥12 位）只落在后端，前端一无所知、报错不说原因、失败还清空表单 | 已修复 | `web/src/app/(app)/admin/page.tsx`、`web/src/lib/password.ts` |
+| [005](005-cors-missing-patch-method.md) | 管理台「停用 / 改角色」在浏览器里 `Failed to fetch`：CORS 白名单漏了 `PATCH` → 预检 400，请求根本没发出 | 已修复 | `app/api/main.py`（CORS 装配，第 16 步） |
+| [006](006-admin-role-change-not-persisted.md) | 管理台「改角色」**提示成功但没生效**：受控 `select` 的值在异步 thunk 执行前被 React 回滚 → 请求体发的是旧角色 | 已修复 | `web/src/app/(app)/admin/page.tsx` |

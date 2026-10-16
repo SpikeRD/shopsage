@@ -33,7 +33,8 @@ import {
   type AccountSummary,
 } from "@/lib/api";
 import { browserStorage, canUseAdmin, entryLabel, type Entry, type Session } from "@/lib/auth";
-import { clearSessionPair } from "@/lib/session";
+import { clearSessionPair, withFreshToken } from "@/lib/session";
+import { fieldProblemText, MIN_PASSWORD_LENGTH, passwordProblem } from "@/lib/password";
 import { useSession } from "@/components/useChatStream";
 
 const ENTRY: Entry = "admin";
@@ -104,37 +105,67 @@ function AdminConsole({ session }: { session: Session }) {
     setLoading(true);
     setNotice(null);
     try {
-      const rows = await getAccounts(session.token, {
-        role: filters.role || undefined,
-        status: filters.status || undefined,
-      });
+      // ⚠️ 走 `withFreshToken`（issue 003 的 P1-2）：令牌快过期时先续期、被 401 拒时
+      //    自动换一条重试一次，而不是把管理员直接踢回登录页。
+      const rows = await withFreshToken(ENTRY, browserStorage(), (fresh) =>
+        getAccounts(fresh, {
+          role: filters.role || undefined,
+          status: filters.status || undefined,
+        }),
+      );
       setAccounts(rows);
     } catch (exc) {
       setNotice({ kind: "error", text: describe(exc) });
     } finally {
       setLoading(false);
     }
-  }, [filters.role, filters.status, session.token]);
+  }, [filters.role, filters.status]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  const run = async (action: () => Promise<unknown>, okText: string) => {
+  /**
+   * 跑一个管理动作：成功刷新列表，失败把原因显示出来。
+   *
+   * ⚠️ **返回是否成功**（issue 004 的根因 ③）：修复前它返回 `void`，于是调用方
+   * （`create()`）没法知道结果，只能**无条件**清空表单 —— 失败时管理员得把
+   * 「标识 / 口令 / 主体 id」全部重填一遍，然后再失败一次。
+   *
+   * ⚠️ **成功提示要在 `load()` 之后设**（issue 004 修复时一并发现的第二个缺陷）：
+   * `load()` 开头会 `setNotice(null)` 清掉上一轮提示，所以原先
+   * 「先设成功提示、再 load」的写法会让成功提示被**自己**清掉 ——
+   * 结果是**开号成功时页面什么都不说**（实测：HTTP 201、新账号在列表里、
+   * 而通知区一片空白）。于是「成功」与「什么都没发生」在界面上长得一样，
+   * 管理员只能去列表里数行数。失败路径没有这个问题（`load()` 只在成功后才走）。
+   */
+  const run = async (action: () => Promise<unknown>, okText: string): Promise<boolean> => {
     setNotice(null);
     try {
       await action();
-      setNotice({ kind: "ok", text: okText });
       await load();
+      // 放在 load 之后：否则会被 load 开头的 setNotice(null) 清掉
+      setNotice({ kind: "ok", text: okText });
+      return true;
     } catch (exc) {
       setNotice({ kind: "error", text: describe(exc) });
+      return false;
     }
   };
 
-  const create = () => {
+  const create = async () => {
+    const identifier = draft.identifier.trim();
     const subjectId = Number(draft.subjectId);
-    if (!draft.identifier.trim() || !draft.password) {
+    if (!identifier || !draft.password) {
       setNotice({ kind: "error", text: "登录标识与初始口令都要填。" });
+      return;
+    }
+    // ⚠️ 口令策略在**发送之前**判一次（issue 004）：修复前这里只判「非空」，
+    //    于是 8 位的口令被原样发出去、后端 422、而页面只说「请求参数不合规」。
+    //    后端仍是权威 —— 它拒了的话下面的 `describe()` 会把字段级原因翻出来。
+    const weak = passwordProblem(draft.password, identifier);
+    if (weak) {
+      setNotice({ kind: "error", text: weak });
       return;
     }
     if (!Number.isInteger(subjectId) || subjectId <= 0) {
@@ -144,30 +175,43 @@ function AdminConsole({ session }: { session: Session }) {
       });
       return;
     }
-    void run(
+    const ok = await run(
       () =>
-        postAccount(session.token, {
-          identifier: draft.identifier.trim(),
-          password: draft.password,
-          role: draft.role,
-          subjectType: draft.subjectType,
-          subjectId,
-        }),
-      `已开账号 ${draft.identifier.trim()}（角色 ${draft.role}）。把口令告诉本人；本页不会回显它。`,
+        withFreshToken(ENTRY, browserStorage(), (fresh) =>
+          postAccount(fresh, {
+            identifier,
+            password: draft.password,
+            role: draft.role,
+            subjectType: draft.subjectType,
+            subjectId,
+          }),
+        ),
+      `已开账号 ${identifier}（角色 ${draft.role}）。把口令告诉本人；本页不会回显它。`,
     );
-    setDraft({ ...draft, identifier: "", password: "", subjectId: "" });
+    // ⚠️ **只在成功时清空**：失败时留着草稿让管理员改一个字再试
+    //    （修复前无条件清空，把「改一下再试」变成「全部重填再失败」）。
+    if (ok) setDraft({ ...draft, identifier: "", password: "", subjectId: "" });
   };
 
   const resetPassword = (account: AccountSummary) => {
     const next = window.prompt(
-      `给 ${account.identifier} 设一个新口令。\n\n` +
+      `给 ${account.identifier} 设一个新口令（至少 ${MIN_PASSWORD_LENGTH} 位）。\n\n` +
         "⚠️ 这会立刻作废该账号**所有在途令牌**（他会掉线，需要重新登录）。\n" +
         "本页不会回显口令，请自己记好并告知本人。",
       "",
     );
     if (!next) return;
+    // 重置与建号走**同一套判据**（issue 004）：只拦建号会导致「开号时拦住、重置时放回去」。
+    const weak = passwordProblem(next, account.identifier);
+    if (weak) {
+      setNotice({ kind: "error", text: weak });
+      return;
+    }
     void run(
-      () => postPasswordReset(session.token, account.accountId, next),
+      () =>
+        withFreshToken(ENTRY, browserStorage(), (fresh) =>
+          postPasswordReset(fresh, account.accountId, next),
+        ),
       `已重置 ${account.identifier} 的口令（他的在途令牌已全部失效）。`,
     );
   };
@@ -219,6 +263,13 @@ function AdminConsole({ session }: { session: Session }) {
           员工填 <span className="mono">employees.emp_id</span>。后端会校验主体真的存在
           （账号表没有外键，那是一处已知取舍）。
         </p>
+        {/* ⚠️ 口令规则必须**写在界面上**（issue 004）：修复前它只存在于后端
+            （`accounts.MIN_PASSWORD_LENGTH`），管理员填短了口令只会撞一句
+            「请求参数不合规」——规则不可见就等于没有规则。 */}
+        <p className="muted small">
+          初始口令至少 <span className="mono">{MIN_PASSWORD_LENGTH}</span> 位，且不能与登录标识相同
+          （规则以后端 <span className="mono">accounts.validate_password_strength</span> 为准）。
+        </p>
         <div className="row" style={{ marginTop: 8 }}>
           <input
             className="input"
@@ -232,8 +283,12 @@ function AdminConsole({ session }: { session: Session }) {
             className="input"
             style={{ maxWidth: 200 }}
             type="password"
-            placeholder="初始口令"
+            placeholder={`初始口令（至少 ${MIN_PASSWORD_LENGTH} 位）`}
             aria-label="初始口令"
+            // ⚠️ `minLength` 让规则**在填的时候就看得见**（issue 004）：
+            //    修复前这里是裸 `type="password"`（实测 minLength=-1、required=false），
+            //    口令策略只存在于后端，前端一无所知 —— 于是「能不能过」只能靠被拒来发现。
+            minLength={MIN_PASSWORD_LENGTH}
             value={draft.password}
             onChange={(event) => setDraft({ ...draft, password: event.target.value })}
           />
@@ -268,7 +323,7 @@ function AdminConsole({ session }: { session: Session }) {
             value={draft.subjectId}
             onChange={(event) => setDraft({ ...draft, subjectId: event.target.value })}
           />
-          <button className="btn" type="button" onClick={create}>
+          <button className="btn" type="button" onClick={() => void create()}>
             开账号
           </button>
         </div>
@@ -364,9 +419,11 @@ function AdminConsole({ session }: { session: Session }) {
                         onClick={() =>
                           void run(
                             () =>
-                              patchAccount(session.token, account.accountId, {
-                                status: account.status === "active" ? "disabled" : "active",
-                              }),
+                              withFreshToken(ENTRY, browserStorage(), (fresh) =>
+                                patchAccount(fresh, account.accountId, {
+                                  status: account.status === "active" ? "disabled" : "active",
+                                }),
+                              ),
                             account.status === "active"
                               ? `已停用 ${account.identifier}（他的在途令牌立刻失效）。`
                               : `已启用 ${account.identifier}。`,
@@ -380,13 +437,34 @@ function AdminConsole({ session }: { session: Session }) {
                         style={{ maxWidth: 170 }}
                         aria-label={`改 ${account.identifier} 的角色`}
                         value={account.role}
-                        onChange={(event) =>
+                        onChange={(event) => {
+                          // ⚠️ **必须在事件的同步阶段就把值取出来**（issue 006 的修复点）。
+                          //
+                          // 这个 `<select>` 是**受控**的（`value={account.role}`）。用户选了
+                          // `manager` 之后，`onChange` 里的 `run()` 会先 `setNotice(null)`
+                          // 调度一次重渲染 —— 而这一次渲染时 `account.role` **还是旧值**
+                          // `customer`，React 于是把 DOM 的 value **回滚**成 `customer`。
+                          //
+                          // 实测时序（真浏览器取证，见 issues/006）：
+                          //   change 同步 = manager     ← 只有这一瞬间是对的
+                          //   microtask   = customer    ← 之后永远是旧值
+                          //   t+50ms      = customer
+                          //
+                          // 所以把 `event.target.value` **留到 thunk 里再读**，读到的一定是旧值：
+                          // 请求体发的是 `{"role":"customer"}`（原值，等于什么都没改），
+                          // 后端照旧返回 200，而提示语（同步求值）却说「已改为 manager」
+                          // —— 这就是「提示成功、实际没生效」的全部成因。
+                          //
+                          // 反过来说：只要在这里同步取一次，提示语与请求体就**必然一致**。
+                          const nextRole = event.target.value;
                           void run(
                             () =>
-                              patchAccount(session.token, account.accountId, { role: event.target.value }),
-                            `已把 ${account.identifier} 的角色改为 ${event.target.value}（在途令牌已失效）。`,
-                          )
-                        }
+                              withFreshToken(ENTRY, browserStorage(), (fresh) =>
+                                patchAccount(fresh, account.accountId, { role: nextRole }),
+                              ),
+                            `已把 ${account.identifier} 的角色改为 ${nextRole}（在途令牌已失效）。`,
+                          );
+                        }}
                       >
                         {KNOWN_ROLES.map((role) => (
                           <option key={role} value={role}>
@@ -432,6 +510,17 @@ function describe(exc: unknown): string {
     }
     if (exc.isUnauthorized) {
       return `登录态已失效（账号可能被停用/口令被改）：请重新登录。request_id=${exc.requestId}`;
+    }
+    // ⚠️ 422 必须**把字段级原因翻出来**（issue 004 的根因 ②）：
+    //    后端在 `detail.fields` 里已经写清了「是哪个字段、为什么」，
+    //    而修复前这里走兜底分支只显示固定的「请求参数不合规」——
+    //    管理员刚填的四个字段全是「参数」，根本不知道该改哪一个。
+    //    这一条也是「前端判过、后端仍拒」时的兜底说明（后端始终是权威）。
+    if (exc.status === 422) {
+      const detail = fieldProblemText(exc.detail);
+      return detail
+        ? `请求被后端拒绝：${detail}（request_id=${exc.requestId}）`
+        : `${exc.message}（HTTP 422${exc.requestId ? `，request_id=${exc.requestId}` : ""}）`;
     }
     return `${exc.message}（HTTP ${exc.status}${exc.requestId ? `，request_id=${exc.requestId}` : ""}）`;
   }
