@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 换行符纪律（`core.autocrlf` 的补丁）
+#
+# 背景（本仓实测）：
+#   · 开发机是 Windows，`git config core.autocrlf` 是 **true**；
+#   · 于是 checkout 时**所有文本文件都会被写成 CRLF**（实测 427 个跟踪文件里有 356 个）；
+#   · 而 `git ls-files --eol` 显示索引里存的一直是 LF —— 也就是说「提交的内容是对的，
+#     坏在工作区那份副本」。
+#
+# 为什么必须管这件事（不是洁癖，是三类真实故障）：
+#   ① **Dockerfile**：`RUN ... \` 续行的反斜杠后面若跟着 CRLF，容器内 shell 看到的是
+#      `\<CR>` → 续行失效。症状是 `RUN` 把下一行当成新命令执行，
+#      报错信息完全指不到换行符上（实测这类问题平均要查半小时以上）。
+#   ② **YAML / env.list**：`env_file` 的解析**不剥 `\r`**。CRLF 的 `env.list` 里
+#      `POSTGRES_PASSWORD=abc\r` 会让密码真的带上一个回车 → 容器认证失败，
+#      而两处文本「肉眼完全一样」——这是最难自查的一类配置事故。
+#   ③ **`.sh` 脚本**：`/bin/sh^M: bad interpreter`。
+#
+# 处置口径：**只给「CRLF 会坏事」的类型显式声明 `eol=lf`**，不用 `* text=auto` 一把梭。
+#   理由：后者会让整个工作区在下次 checkout 时被批量改写（本仓 356 个文件），
+#   制造一次与本次修改无关的巨大 diff，掩盖真实变更。
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ⚠️⚠️ **必须知道的一件事（本仓实测，别指望属性自动修好存量文件）**：
+#
+#   `.gitattributes` 只影响「**git 下次写出这个文件时**」的换行，**不会**回头改写
+#   已经躺在工作区里的那份 CRLF 文件。实测三种情形：
+#
+#   | 操作 | 工作区结果 |
+#   |---|---|
+#   | 只加 `.gitattributes`，不碰文件 | ❌ **仍是 CRLF**（`git status` 还显示干净，最有欺骗性） |
+#   | `rm <file> && git checkout -- <file>` | ✅ 变成 LF |
+#   | 全新 clone（`core.autocrlf=true` 也一样） | ✅ 变成 LF |
+#
+#   `git status` 干净 ≠ 磁盘上是 LF：属性生效后 git **对比时会规范化**，
+#   所以 CRLF 与 LF 被视为「无差异」。要查真实字节，用：
+#
+#       git ls-files --eol | grep -v 'w/lf'
+#       # 期望：受本文件管辖的文件都不出现在输出里
+#
+#   存量文件想一次性修正（仓库根执行，⚠️ 会重写工作区文件，先确认无未提交改动）：
+#
+#       git rm --cached -r . && git reset --hard
+#
+#   本项目已对 `infra/**/*.yml`、`.env.example` 等**手工规范化过一次**；
+#   其余 `w/crlf` 的文件都属「CRLF 无害」的类型（见文件末尾的说明）。
+
+
+# ── 容器与编排（①② 类故障）────────────────────────────────────────────────────
+Dockerfile            text eol=lf
+Dockerfile.*          text eol=lf
+*.Dockerfile          text eol=lf
+docker-compose*.yml   text eol=lf
+compose*.yml          text eol=lf
+
+# ── 会被容器内程序直接读取的配置（② 类故障：\r 会变成值的一部分）──────────────
+*.yml                 text eol=lf
+*.yaml                text eol=lf
+env.list              text eol=lf
+env.list.*            text eol=lf
+.env                  text eol=lf
+.env.*                text eol=lf
+*.ini                 text eol=lf
+*.mako                text eol=lf
+*.json                text eol=lf
+
+
+# ── 在 Linux 里执行的脚本（③ 类故障）──────────────────────────────────────────
+*.sh                  text eol=lf
+*.bash                text eol=lf
+
+# ── 二进制：**绝不做换行转换**（`.ico` / 图片被当文本改写会直接损坏文件）────────
+*.ico                 binary
+*.png                 binary
+*.jpg                 binary
+*.jpeg                binary
+*.gif                 binary
+*.webp                binary
+*.pdf                 binary
+*.woff                binary
+*.woff2               binary
+*.ttf                 binary
+*.zip                 binary
+*.gz                  binary
+
+# ── 其余源码：保持各平台默认行为（Python/TS 都能正确处理 CRLF）──────────────
+# 刻意**不**声明 .py / .ts / .tsx / .md ——
+#   · `.py` / `.ts` 带 CRLF 完全不影响运行（行尾被语言层吃掉）；
+#   · `.md` 是给人看的，编辑器不该被强迫。
+#   把它们也钉成 LF 只会制造一次无意义的全仓 diff。

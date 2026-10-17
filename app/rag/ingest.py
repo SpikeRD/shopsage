@@ -38,9 +38,19 @@ logger = logging.getLogger(__name__)
 
 Embedder = Callable[..., Awaitable[list[list[float]]]]
 
-# embedding 的批大小：一次请求里塞太多文本会被厂商的 token 上限截断（litellm 返回 400），
-# 而本地后端在超大 batch 上会吃满内存。32 是本仓实测的稳妥值（1024 维 bge-m3，单条 ~600 字）。
-EMBED_BATCH = 32
+# embedding 的批大小：一次请求里塞太多文本会被厂商的**单次行数上限**直接拒（HTTP 400），
+# 而本地后端在超大 batch 上会吃满内存。
+#
+# ⚠️ 这个数字是**按厂商上限**定的，不是拍脑袋的「稳妥值」。实测（2026-10）：
+#   * 阿里云 `qwen3.7-text-embedding-flash`：**batch ≤ 25**（32 条会返回
+#     `InvalidParameter: batch size is invalid, it should not be larger than 25`）。
+#     注意：官方表格写的是「最大行数 20」，但实测 25 条能过、32 条被拒 ——
+#     以**实测**为准，官方文档在这处与实现不一致。
+#   * 本地 bge-m3：无硬上限，瓶颈在内存。
+#
+# 取 16 是刻意留余量（低于 25 一档，且是 2 的幂）：厂商上限随时可能调整，
+# 顶到 25 的边界值意味着一改策略就红。需要更大吞吐时改这个常量并**实测**一次。
+EMBED_BATCH = 16
 
 
 @dataclass

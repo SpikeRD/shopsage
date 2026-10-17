@@ -1,4 +1,4 @@
-﻿"""语义缓存的**端到端**语义（内存后端 + 可控假 embedding + 内存版本表）。
+"""语义缓存的**端到端**语义（内存后端 + 可控假 embedding + 内存版本表）。
 
 这一组对应 `13.cache.md` §7 的五条用例，逐条落地：
 
@@ -95,15 +95,27 @@ def test_dissimilar_question_misses(space: SemanticSpace) -> None:
 
 
 def test_gray_zone_similarity_does_not_hit(space: SemanticSpace) -> None:
-    """灰区（像但不敢答）：这是「阈值保守」这条设计的可观测落点。"""
+    """灰区（像但不敢答）：这是「阈值保守」这条设计的可观测落点。
+
+    ⚠️ 样本相似度**从阈值算出来**，不写死（原先是 `similarity=0.90` + 注释「默认阈值 0.93」）。
+    2026-10 换 embedding 模型后阈值从 0.93 降到 0.85，写死的 0.90 就从「灰区」变成了「命中」，
+    于是这条用例红在一个**完全正确**的改动上。
+
+    现在取「阈值与兜底线正中间」：不管两个阈值以后怎么调，
+    这条用例验的始终是「落在灰区里 ⇒ 不命中，但候选被带出来」。
+    """
+    from app.cache.settings import DEFAULT_SIM_FLOOR, DEFAULT_SIM_THRESHOLD
+
+    gray = (DEFAULT_SIM_THRESHOLD + DEFAULT_SIM_FLOOR) / 2  # 严格落在灰区内部
+
     cache = build(space)
-    space.place("退货流程是啥", base="怎么退货", similarity=0.90)  # 默认阈值 0.93
+    space.place("退货流程是啥", base="怎么退货", similarity=gray)
     prepared = cache.lookup(messages("怎么退货"), user_id=2, role="customer")
     cache.semantic.respond(prepared, ANSWER)
 
     near = cache.lookup(messages("退货流程是啥"), user_id=2, role="customer")
     assert near.hit is False
-    assert near.log.similarity == pytest.approx(0.90, abs=1e-3)
+    assert near.log.similarity == pytest.approx(gray, abs=1e-3)
     assert near.log.nearest is not None  # 灰区候选被带出来了（阈值校准的依据）
 
 

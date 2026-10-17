@@ -14,12 +14,35 @@ from app.rag.settings import DEFAULT_RERANK_MODEL, RagSettings
 
 
 def test_from_settings_reads_the_repo_env():
-    """本仓 `.env` 里配的是 local + bge-m3 + 1024 维（第 10 步的取值来源见 5.llm-runbook §7.6）。"""
+    """`RagSettings.from_settings()` 必须真的从本仓配置取值（而不是用类默认值兜底）。
+
+    ⚠️ 这条用例**刻意不钉具体取值**（原先写的是 `rerank == "local"`、`bge-m3`）。
+    钉死取值的代价：改 `.env` 里合法的配置（比如把 rerank 关掉、把 embedding 换成
+    API 后端）都会让这条用例红，而它想守的其实只是「读到了仓库配置」这件事。
+    2026-10 换 embedding 模型时正是这个原因红了一次 —— 而当时的改动是正确的。
+
+    现在守的是**性质**：
+      · 维度是 1024 且与迁移里的 `vector(n)` 一致（这是迁移锁定的值，见 app/rag/schema.py）；
+      · rerank 是三种合法模式之一，且 model 非空；
+      · candidates 与 max_top_k 的关系成立（初召回池必须 ≥ 最终 top-k）。
+    """
     settings = RagSettings.from_settings()
+
+    # 维度：本仓迁移把 vector(n) 写死成 1024，配置必须跟上
+    # （注意 `RagSettings()` 的类默认 vector_dim 是 0 = 不校验，所以不能拿它做基准）
     assert settings.vector_dim == 1024
-    assert settings.rerank == "local"
-    assert settings.rerank_model == "BAAI/bge-reranker-base"
+
+    # rerank 必须是三种合法模式之一（off/local/api），且 model 非空
+    assert settings.rerank in ("off", "local", "api")
+    assert settings.rerank_model.strip(), "rerank_model 不能为空"
+
+    # 初召回池必须容得下最终 top-k，否则 rerank 无料可选
     assert settings.candidates >= settings.max_top_k
+
+    # 与迁移对账（漂移会静默错，所以在这里也钉一次）
+    from app.rag.schema import VECTOR_DIM as MIGRATION_DIM
+
+    assert settings.vector_dim == MIGRATION_DIM
 
 
 def test_from_settings_falls_back_when_keys_are_absent(monkeypatch):

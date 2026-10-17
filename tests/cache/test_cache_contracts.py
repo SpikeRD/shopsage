@@ -234,7 +234,11 @@ def test_settings_is_the_only_place_with_threshold_defaults() -> None:
     assert 0 < DEFAULT_SIM_FLOOR <= DEFAULT_SIM_THRESHOLD < 1
     assert DEFAULT_POLICY_TTL_SECONDS > DEFAULT_TTL_SECONDS
     source = read("core.py")
-    assert "0.93" not in source, "core.py 不该再写一遍阈值默认值（它属于 settings.py）"
+    # 守的是「阈值默认值只允许在 settings.py 出现一次」，所以查的是**当前**默认值的字面量，
+    # 而不是历史上那个 0.93（写死历史值会让「阈值本身合法地改一次」就红）。
+    assert str(DEFAULT_SIM_THRESHOLD) not in source, (
+        f"core.py 不该再写一遍阈值默认值 {DEFAULT_SIM_THRESHOLD}（它属于 settings.py）"
+    )
 
 
 def test_prompt_version_is_a_single_constant() -> None:

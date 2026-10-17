@@ -31,15 +31,16 @@ x-app-base: &app-base
     args:
       # 是否连本地 embedding/rerank 一起装（sentence-transformers + torch，约 2 GB）。
       #
-      # ⚠️⚠️ 默认 **true**，因为 `env.list` 的 `EMBEDDING_BACKEND=local` / `RAG_RERANK`：
-      #    本仓迁移把向量维度写死成 `vector(1024)`（`app/rag/schema.py::VECTOR_DIM`），
-      #    而 1024 维的默认选择就是本地 bge-m3。两者必须**一起**改：
-      #      · EMBEDDING_BACKEND=local（或 RAG_RERANK=local）→ 必须 WITH_LOCAL_EMBEDDING=true
-      #      · 全走 API 后端（维度 1536 之类）→ 才设为 false，**并且**要改迁移重灌向量
-      #    配错时的症状最阴：镜像里没装 sentence-transformers，服务照样起来、
-      #    /health 全绿，直到**第一次检索**才报错，而调用的图会降级成「没有依据的回答」——
-      #    看起来像模型质量差。见 runbook §6.3。
-      WITH_LOCAL_EMBEDDING: "${WITH_LOCAL_EMBEDDING:-true}"
+      # ⚠️ 默认 **false**（2026-10 变更）：`env.list` 的默认 `EMBEDDING_BACKEND=litellm` +
+      #    阿里云 `dashscope/qwen3.7-text-embedding-flash`，**不需要 torch**。
+      #    两者必须一起改：
+      #      · 全走 API（当前默认）→ WITH_LOCAL_EMBEDDING=false，镜像小 2 GB
+      #      · EMBEDDING_BACKEND=local 或 RAG_RERANK=local → 必须设为 true，
+      #        否则镜像里没 sentence-transformers：服务照样起来、/health 全绿，
+      #        直到**第一次检索**才报错，而图会降级成「没有依据的回答」——看起来像模型质量差。
+      #    ⚠️ 注意它与维度无关：qwen3.7-text-embedding-flash 与 bge-m3 都是 1024 维，
+      #    迁移不用改。见 docs/runbook/17.docker-ops.md §6.3。
+      WITH_LOCAL_EMBEDDING: "${WITH_LOCAL_EMBEDDING:-false}"
   env_file:
     - env.list
   # ⚠️ env_file 的值会被 `environment:` 覆盖（compose 的优先级：
