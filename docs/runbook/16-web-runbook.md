@@ -979,7 +979,7 @@ uv run python -m scripts.db_check            # users 8 / orders 30 / products 20
 | 逐 token 增量帧 | `answer` 帧是整段（后端 `done: true` 注释已声明） | 第 11 步在 `answer` 前插入增量帧；前端按 `event` 分支即可（`reduceStream` 加一个 case） |
 | 图表 + 流式同时要 | 对内页走 HTTP（拿 spec），对客页走 WS（拿流式） | 改后端帧契约（`answer` 帧带 spec 或新增帧），前端换 `useChatStream` 的收尾分支 |
 | 登录 | 粘令牌（`scripts/dev_token.py`） | 生产：httpOnly Cookie + BFF 代理；本步的 `lib/api.ts` 是唯一改注入点的地方 |
-| 生产部署 | `npm run build` 产物 + `npm start` | 第 19 步写 `web/Dockerfile`（多阶段 + `output: "standalone"`）+ 接生产 compose |
+| 生产部署 | `npm run build` 产物 + `npm start` | ✅ **已落地**：`web/Dockerfile`（多阶段 + `output: "standalone"`）+ 生产 compose 的 `web` 服务；部署步骤见 [`17.docker-ops.md`](17.docker-ops.md) §3.4、§5.2（`NEXT_PUBLIC_API_BASE` 是**构建期**变量） |
 | 端到端浏览器自动化 | 无（真链路用 Node 跑客户端代码；接线用源码级断言） | 需要截图/点击回归时加 Playwright（届时把那 10 条真链路用例平移过去，并补上「点一下按钮」这类**只有浏览器能验**的动作） |
 | CI | 未挂 | 第 2 步的 `16.infra.md`：`npm ci --ignore-scripts && npm run typecheck && npm test && npm run build` |
 

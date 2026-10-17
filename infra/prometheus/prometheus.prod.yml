@@ -1,0 +1,56 @@
+# Prometheus 采集配置（**生产 / 全栈容器化**，第 17 步）
+#
+# 与 `prometheus.yml`（开发拓扑）的唯一区别是 **scrape 目标的地址口径**：
+#
+#   | 场景 | 业务在哪 | 该写什么 |
+#   |---|---|---|
+#   | 开发（`infra/docker-compose.dev.yml`） | Windows 开发机的 uv 进程 | Windows 在 VMware 网段的网卡 IP（写死，实测 192.168.1.13） |
+#   | 生产（本文件，`docker-compose.yml`） | **同栈的 `api` 容器** | **服务名 `api:8000`** |
+#
+# ⚠️ 为什么这里可以用服务名、而开发栈不能用：
+#   同一 compose 网络里 Docker 内置 DNS 会把 `api` 解析成该容器的 IP。开发栈的业务
+#   根本不在容器里，没有可解析的名字，所以那边只能写死 IP。
+#
+# ⚠️ 仍然**不能**写 `${...}`：prom/prometheus:v2.55.1 不替换 static_configs 里的
+#   环境变量（只作用于 external_labels，3.0 才默认生效）。写了既不替换也不报错，
+#   症状是 target 永久 down 而日志干净（`scripts/check_infra.py` 会把这类写法判为错误）。
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    env: prod
+    project: shopsage
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 业务 API（同栈容器，走服务名）
+  - job_name: shopsage-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: api
+
+  # Arq worker。
+  # ⚠️ 默认**注释掉**：worker 镜像里跑的 `arq` 进程**不监听 HTTP 端口**，
+  #    它只把指标写进自己进程内的 registry，没有 `/metrics` 端点可抓
+  #    （见 app/queue/worker.py：指标写入 `observability.metrics.default_metrics()`，
+  #    而对外暴露 `/metrics` 的是 api 进程）。
+  #    想采集 worker 的自定义指标，需要给 worker 起一个 metrics_server（本步未做）。
+  # - job_name: shopsage-worker
+  #   static_configs:
+  #     - targets: ["worker:9100"]
+
+  # OTel Collector 自身指标
+  # - job_name: otel-collector
+  #   static_configs:
+  #     - targets: ["otel-collector:8888"]
+  #       labels:
+  #         service: otel-collector

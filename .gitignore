@@ -2,6 +2,11 @@
 .env
 .env.*
 !.env.example
+# 容器环境变量清单（Linux 全栈部署用，里面全是密钥；只提交模板）
+# ⚠️ 必须在这里：`.env.*` 匹配不到 `env.list` 这个名字，
+#    漏了它一次 `git add -A` 就会把生产密钥提交上去。
+env.list
+!env.list.example
 
 # Python
 __pycache__/

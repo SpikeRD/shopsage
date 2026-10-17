@@ -1,0 +1,317 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ShopSage 生产编排（Linux 服务器，全栈容器化）
+#
+# 与 infra/docker-compose.dev.yml 的区别：
+#   · dev  —— **只起依赖**，业务代码跑在宿主机（Windows 开发机）的 uv .venv 里；
+#   · prod —— **业务也进容器**：api / worker / web / migrate 都是本项目镜像的容器。
+#
+# 用法（在【仓库根】执行，--project-directory . 不能省，见 2.infra-runbook.md 坑 1）：
+#   docker compose -f docker-compose.yml --project-directory . up -d --build
+#   docker compose -f docker-compose.yml --project-directory . ps
+#   docker compose -f docker-compose.yml --project-directory . logs -f api
+#
+# ⚠️ 环境变量走 `env_file: env.list`（不是仓库根 `.env`）：
+#   `.env` 只管「compose 自己的 `${...}` 插值」（`IMAGE_TAG` / `*_PORT` 这类部署拓扑参数），
+#   `env.list` 管「注入进容器的业务配置」（`ENV` / `DATABASE_URL` / `LLM_API_KEY` / `POSTGRES_*`…）。
+#   两者混用时的症状是「容器起得来、但业务配置全是默认值」——见 runbook §5.1。
+#
+# ⚠️ 这个文件**尽量不做业务变量的插值**，理由：
+#   插值读的是仓库根 `.env`，而容器内程序读的是 `env.list` —— 同一个值有两个来源
+#   必然漂移。业务配置只有一处真相：`env.list`。这里只剩「拓扑参数」（端口、标签）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: shopsage
+
+# ── YAML 锚点：三个业务服务共用同一份「镜像 + 环境 + 网络 + 挂载」─────
+x-app-base: &app-base
+  image: shopsage-api:${IMAGE_TAG:-latest}
+  build:
+    context: .
+    dockerfile: app/Dockerfile
+    args:
+      # 是否连本地 embedding/rerank 一起装（sentence-transformers + torch，约 2 GB）。
+      #
+      # ⚠️⚠️ 默认 **true**，因为 `env.list` 的 `EMBEDDING_BACKEND=local` / `RAG_RERANK`：
+      #    本仓迁移把向量维度写死成 `vector(1024)`（`app/rag/schema.py::VECTOR_DIM`），
+      #    而 1024 维的默认选择就是本地 bge-m3。两者必须**一起**改：
+      #      · EMBEDDING_BACKEND=local（或 RAG_RERANK=local）→ 必须 WITH_LOCAL_EMBEDDING=true
+      #      · 全走 API 后端（维度 1536 之类）→ 才设为 false，**并且**要改迁移重灌向量
+      #    配错时的症状最阴：镜像里没装 sentence-transformers，服务照样起来、
+      #    /health 全绿，直到**第一次检索**才报错，而调用的图会降级成「没有依据的回答」——
+      #    看起来像模型质量差。见 runbook §6.3。
+      WITH_LOCAL_EMBEDDING: "${WITH_LOCAL_EMBEDDING:-true}"
+  env_file:
+    - env.list
+  # ⚠️ env_file 的值会被 `environment:` 覆盖（compose 的优先级：
+  #    environment > env_file）。这里只放**必须**覆盖的项：
+  #    ① ENV=prod  —— 不写它，容器里就是 dev：JWT 弱密钥能过、CORS 默认放通 localhost，
+  #       而 fail-fast（缺 DATABASE_URL 直接拒启动）也不会触发；
+  #    ② SERVICE_NAME —— worker 与 api 要能在 OTEL 里区分开（否则 trace 混成一片）。
+  environment:
+    ENV: "prod"
+    TZ: "${TZ:-Asia/Shanghai}"
+    HF_HOME: "/app/.hf-cache"
+  volumes:
+    # HF 权重缓存：**必须挂命名卷**。不挂的话每次重建容器都要重新下载
+    # （bge-m3 + bge-reranker-base 约 3GB），且构建期与运行期各下一份。
+    - hf_cache:/app/.hf-cache
+  networks: [shopsage]
+  restart: unless-stopped
+
+services:
+  # ── 一次性迁移（不是常驻服务）───────────────────────────────────────────
+  # 为什么要单独一个服务，而不是在 api 的 CMD 里 `alembic upgrade head && uvicorn`：
+  #   ① api 有多个副本时，每个副本都会跑一次迁移，**互相抢 advisory lock**，
+  #      轻则启动变慢、重则有一个副本报「relation already exists」退出；
+  #   ② 迁移失败时应当**阻断发布**（compose 的 `depends_on: service_completed_successfully`
+  #      正好表达这件事），而不是让 api 带着旧表结构起来。
+  # ⚠️ `restart: "no"`：一次性任务失败后不要自动重试（会把错误日志刷满），要人看。
+  migrate:
+    <<: *app-base
+    container_name: shopsage-migrate
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── 业务 API（HTTP + WebSocket）───────────────────────────────────────────
+  api:
+    <<: *app-base
+    container_name: shopsage-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      # ⚠️ 绑 0.0.0.0 而不是 127.0.0.1：浏览器在宿主机/另一台机器上要直接连它
+      #    （WebSocket 不走 Next 的路由层，见 web/Dockerfile 的注释）。
+      #    想只用反代暴露时，把它改成 "127.0.0.1:8000:8000"。
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      # ⚠️ 用 python 而不是 curl：slim 镜像里没有 curl，而 python 一定有。
+      #    判据用 `/health` 的**状态码**（它恒 200，依赖故障写在 body 里 —— 见
+      #    app/api/health.py 的模块注释：拿 body 判健康会让依赖抖动触发容器重启）。
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Arq worker（常驻，异步长任务）─────────────────────────────────────────
+  worker:
+    <<: *app-base
+    container_name: shopsage-worker
+    # 同一个镜像换命令：`app.queue.worker.WorkerSettings` 是入口类（见该模块 docstring）
+    command: ["arq", "app.queue.worker.WorkerSettings"]
+    environment:
+      ENV: "prod"
+      TZ: "${TZ:-Asia/Shanghai}"
+      HF_HOME: "/app/.hf-cache"
+      # ⚠️ worker 与 api 必须能被区分：两者的 span/指标共用同一个 collector 与 Prometheus。
+      #    不区分时的症状是「队列耗时混进 HTTP 的 P99 里」，而图上完全看不出来。
+      SERVICE_NAME: "shopsage-worker"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # arq 自带 `--check`：连 Redis 读 worker 写的健康哨兵，退出码 0/1。
+      # ⚠️ 它不会调 `.env` 的加载，但 WorkerSettings 在类定义期读了 REDIS_URL
+      #    （见 app/queue/worker.py 的注释），所以容器里必须能读到该变量 ——
+      #    env.list 已注入，这里没问题。
+      test: ["CMD", "arq", "--check", "app.queue.worker.WorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Web 前端（Next standalone）─────────────────────────────────────────────
+  web:
+    image: shopsage-web:${IMAGE_TAG:-latest}
+    container_name: shopsage-web
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        # ⚠️⚠️ **构建期**变量：改了它必须 `up -d --build web`，重启容器无效
+        #      （Next 在 build 时把它字面替换进客户端 bundle）。见 runbook §5.2。
+        NEXT_PUBLIC_API_BASE: "${NEXT_PUBLIC_API_BASE:-http://localhost:8000}"
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      # 运行期变量：standalone server 读它决定监听端口/地址
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [shopsage]
+    restart: unless-stopped
+    healthcheck:
+      # wget 在 alpine 基础镜像里由 busybox 提供，无需额外安装
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── PostgreSQL 16 + pgvector ──────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: shopsage-postgres
+    restart: unless-stopped
+    # ⚠️ 凭据只有一处真相：`env.list`（与 api 的 DATABASE_URL 同一份文件）。
+    #    这样「改了 POSTGRES_PASSWORD 却没改 DATABASE_URL」这类漂移没有发生的地方。
+    #    代价：env.list 里的其它变量也会进这个容器（postgres 忽略不认识的变量）。
+    #    好处：`pg_isready` 的探针参数与初始化参数读的是**同一份**值。
+    env_file:
+      - env.list
+    environment:
+      # 只有这两项是「postgres 专属、不属于业务配置」的，因此留在 compose 里
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      TZ: "${TZ:-Asia/Shanghai}"
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    ports:
+      # ⚠️ 生产默认**不对宿主机暴露**（注释掉）。要在服务器上直连排障时再打开，
+      #    并且务必绑到 127.0.0.1 —— 绑 0.0.0.0 等于把库放到内网可及的边界上。
+      # - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # ⚠️ `$$` 是 compose 的转义：它把字面 `$` 交给容器内的 shell 展开，
+      #    于是这里读的是**容器自己**的 POSTGRES_USER/POSTGRES_DB（来自 env.list），
+      #    而不是 compose 侧的插值结果 —— 两处不会漂移。
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks: [shopsage]
+
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: shopsage-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      # 同上：默认不对外暴露
+      # - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [shopsage]
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: shopsage-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      # ⚠️ 挂的是**生产采集配置**（infra/prometheus/prometheus.yml 里的 target 是
+      #    开发拓扑的 192.168.1.13:8000，在 Linux 全栈容器里必须换成服务名 api:8000）。
+      - ./infra/prometheus/prometheus.prod.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "promtool", "check", "healthy", "--url=http://localhost:9090"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks: [shopsage]
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: shopsage-grafana
+    restart: unless-stopped
+    # ⚠️ 走 env.list 而不是 `${...}` 插值：插值读的是**仓库根 `.env`**（那个是开发机文件），
+    #    一旦服务器上也留着一份 .env，管理口令就会**静默**取自它 —— 而 env.list 里
+    #    那一份才是运维改过的地方。两处真相 = 「改了不生效」的经典形态。
+    #    Grafana 原生认 `GF_*` 环境变量，所以 env.list 里直接写 GF_ 即可（见模板 §8）。
+    env_file:
+      - env.list
+    environment:
+      # 这两项与「业务配置」无关、只属于展示栈，留在 compose 里更好读
+      GF_USERS_DEFAULT_THEME: "dark"
+      # ⚠️ 生产必须 false（dev 栈是 true）。对公网开放的匿名看板 =
+      #    把内部指标与 SQL 端点分布交出去。
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      # ⚠️ 默认 3001，**不是 3000**：3000 被 web 占用。两个服务抢同一个宿主端口时
+      #    `up -d` 会报 `port is already allocated` —— 而那是在 web 已经起来之后
+      #    才失败，看起来像「grafana 坏了」。
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks: [shopsage]
+
+  # ── OTel Collector（可选：--profile tracing 才起）─────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: shopsage-otel-collector
+    restart: unless-stopped
+    profiles: ["tracing"]
+    command: ["--config=/etc/otel/otel-collector.yml"]
+    ports:
+      - "${OTEL_HTTP_PORT:-4318}:4318"   # OTLP/HTTP（业务用这条）
+      - "${OTEL_GRPC_PORT:-4317}:4317"   # OTLP/gRPC
+    volumes:
+      - ./infra/otel/otel-collector.yml:/etc/otel/otel-collector.yml:ro
+      - otel_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 sh -c '</dev/tcp/127.0.0.1/4318' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks: [shopsage]
+
+networks:
+  shopsage:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  otel_data:
+  # HF 权重缓存（约 3GB：bge-m3 + bge-reranker-base）
+  hf_cache:

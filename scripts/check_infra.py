@@ -26,14 +26,29 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 YAML_FILES = (
+    # ── 开发依赖栈 ──────────────────────────────────────────────────────────
     "infra/docker-compose.dev.yml",
     "infra/prometheus/prometheus.yml",
     "infra/prometheus/rules/shopsage.yml",
     "infra/otel/otel-collector.yml",
     "infra/grafana/provisioning/datasources/prometheus.yml",
     "infra/grafana/provisioning/dashboards/shopsage.yml",
+    # ── 生产全栈（第 17 步 runbook 的落地物）─────────────────────────────────
+    # 加进来不只是「多解析一个文件」：`docker compose config -q` 只能在 Linux 上跑，
+    # 而开发机（Windows）没有 Docker —— 于是生产 compose 的 YAML 语法错误在开发期
+    # **没有任何东西会拦住它**，只能等到部署那一刻才发现。这个脚本补上那道闸。
+    "docker-compose.yml",
+    "infra/prometheus/prometheus.prod.yml",
 )
 DASHBOARD = "infra/grafana/provisioning/dashboards/shopsage-observability.json"
+
+#: 需要做「scrape 目标自洽性」检查的 Prometheus 配置文件。
+#: ⚠️ 两份都要查：dev 的 target 是写死的 Windows 网卡 IP，prod 的 target 是服务名 `api:8000`。
+#: 只查一份的后果是「另一份写错了没人知道，直到那套环境里 target 全 down」。
+PROMETHEUS_FILES = (
+    "infra/prometheus/prometheus.yml",
+    "infra/prometheus/prometheus.prod.yml",
+)
 
 #: 允许出现在记录规则表达式里的指标名前缀（我们这个项目自己的指标）。
 METRIC_RE = re.compile(r"\b(shopsage[a-z0-9_]*)\b")
@@ -69,30 +84,43 @@ def check_yaml() -> list[str]:
 
 
 def check_prometheus_scrape() -> list[str]:
-    """`prometheus.yml` 的 scrape 目标与录则挂载必须自洽。"""
+    """Prometheus 的 scrape 目标与录则挂载必须自洽（dev 与 prod 两份都查）。
+
+    为什么两份都要查：它们的 target 口径**故意不同**（dev 是写死的 Windows 网卡 IP，
+    prod 是服务名 `api:8000`），而写错的后果一致 —— 不报错、只是 target 永久 down。
+    只查一份时，另一份的错误要等到那套环境部署后才发现。
+    """
     problems: list[str] = []
-    data, error = _load_yaml("infra/prometheus/prometheus.yml")
+    for relative in PROMETHEUS_FILES:
+        problems += _check_one_prometheus(relative)
+    return problems
+
+
+def _check_one_prometheus(relative: str) -> list[str]:
+    problems: list[str] = []
+    label = Path(relative).name
+    data, error = _load_yaml(relative)
     if error or not data:
-        return [error or "prometheus.yml 为空"]
+        return [error or f"{label} 为空"]
 
     jobs = {job.get("job_name") for job in data.get("scrape_configs") or []}
-    print(f"  scrape jobs：{sorted(jobs)}")
+    print(f"  [{label}] scrape jobs：{sorted(jobs)}")
     for required in ("prometheus", "shopsage-api"):
         if required not in jobs:
-            problems.append(f"prometheus.yml 缺少 job：{required}（第 11 步的验收要求业务被采集）")
+            problems.append(f"{relative} 缺少 job：{required}（第 11 步的验收要求业务被采集）")
 
     api_job = next((j for j in data.get("scrape_configs") or [] if j.get("job_name") == "shopsage-api"), None)
     if api_job and api_job.get("metrics_path") != "/metrics":
         # 这是最容易写错的一处：`/metrics` **不在** API_PREFIX 下（见 app/api/health.py 的口径）
         problems.append(
-            f"shopsage-api 的 metrics_path 是 {api_job.get('metrics_path')!r}，应当是 '/metrics'"
+            f"{relative} 的 shopsage-api metrics_path 是 {api_job.get('metrics_path')!r}，应当是 '/metrics'"
             "（`/metrics` 刻意不在 API_PREFIX 下，否则改前缀会让抓取端集体失效）"
         )
 
     rule_files = data.get("rule_files") or []
-    print(f"  rule_files：{rule_files}")
+    print(f"  [{label}] rule_files：{rule_files}")
     if not rule_files:
-        problems.append("prometheus.yml 没有 rule_files：分 Agent 的 P99 记录规则不会被加载")
+        problems.append(f"{relative} 没有 rule_files：分 Agent 的 P99 记录规则不会被加载")
 
     # rule_files 指向容器内路径；仓库侧必须真实存在对应目录（否则 compose 挂载不到）
     rules_dir = ROOT / "infra" / "prometheus" / "rules"
@@ -108,7 +136,7 @@ def check_prometheus_scrape() -> list[str]:
                 # 所以这类写法一律判错：地址必须写死（可配置的话请换文件或升级 3.x）。
                 if _ENV_REF_RE.search(str(target)):
                     problems.append(
-                        f"job {job.get('job_name')} 的 target 是 {target!r}，里面含环境变量引用 —— "
+                        f"{relative} 的 job {job.get('job_name')} target 是 {target!r}，里面含环境变量引用 —— "
                         "Prometheus 2.x 不替换 static_configs 里的 `${...}`（只作用于 external_labels，"
                         "3.0 才默认生效），它既不报错也不替换：target 会永久 down"
                         "（`invalid URL escape \"%7B\"` 或 `invalid port \":8000%7D\"`）。"
@@ -118,9 +146,25 @@ def check_prometheus_scrape() -> list[str]:
                     )
                 if "localhost" in str(target) and job.get("job_name") != "prometheus":
                     problems.append(
-                        f"job {job.get('job_name')} 的 target 是 {target!r}："
+                        f"{relative} 的 job {job.get('job_name')} target 是 {target!r}："
                         "Prometheus 在容器里，localhost 指的是它自己（业务在宿主机上）"
                     )
+
+    # 生产那份**必须**用服务名而不是 IP：全栈容器化后业务就叫 `api`
+    if label.endswith(".prod.yml"):
+        targets = [
+            str(target)
+            for job in data.get("scrape_configs") or []
+            if job.get("job_name") == "shopsage-api"
+            for config in job.get("static_configs") or []
+            for target in config.get("targets") or []
+        ]
+        if targets and not any(t.startswith("api:") for t in targets):
+            problems.append(
+                f"{relative} 的 shopsage-api target 是 {targets}：生产全栈容器化后业务在同栈的 "
+                "`api` 容器里，应当写服务名 `api:8000`（拿开发那份写死 IP 的配置来跑生产，"
+                "target 会永久 down 且日志干净）"
+            )
     return problems
 
 
@@ -247,6 +291,78 @@ def check_dashboard() -> list[str]:
     return problems
 
 
+def check_prod_compose() -> list[str]:
+    """生产 compose 的**结构**检查（第 17 步 runbook 落地物）。
+
+    `docker compose config -q` 只能在 Linux 上跑（开发机 Windows 没有 Docker），
+    所以下面这些都只能在部署那一刻才被发现 —— 而每一条的失败形态都很绕：
+
+    | 检查 | 不做会怎样 |
+    |---|---|
+    | 每个业务服务都有 `build` 或 `image` | `up -d` 直接报 `has neither an image nor a build context` |
+    | `api`/`worker` 都 `depends_on: migrate: service_completed_successfully` | api 抢在迁移前面起来 → 表是旧的（`UndefinedColumn` 500） |
+    | 生产 compose 里没有 `${POSTGRES_*}` 这类业务变量插值 | 插值读仓库根 `.env`，与 `env.list` 两处真相必然漂移 |
+    | `prometheus` 挂的是 `prometheus.prod.yml` | 拿开发那份（target 是 Windows IP）跑生产 → target 永久 down |
+    """
+    problems: list[str] = []
+    data, error = _load_yaml("docker-compose.yml")
+    if error or not data:
+        return [error or "docker-compose.yml 为空"]
+    services = data.get("services") or {}
+    print(f"  服务：{sorted(services)}")
+
+    for name, service in services.items():
+        if not isinstance(service, dict):
+            problems.append(f"docker-compose.yml 的 {name} 不是映射")
+            continue
+        if "build" not in service and "image" not in service:
+            problems.append(
+                f"docker-compose.yml 的 {name} 既没有 image 也没有 build："
+                "`up -d` 会报 `has neither an image nor a build context`"
+            )
+
+    for name in ("api", "worker"):
+        depends = (services.get(name) or {}).get("depends_on") or {}
+        migrate_dep = depends.get("migrate") if isinstance(depends, dict) else None
+        condition = (migrate_dep or {}).get("condition") if isinstance(migrate_dep, dict) else None
+        if condition != "service_completed_successfully":
+            problems.append(
+                f"docker-compose.yml 的 {name} 没有 "
+                "`depends_on: migrate: condition: service_completed_successfully`："
+                "它会在迁移跑完之前启动，表结构可能是旧的（症状是 UndefinedColumn 500）"
+            )
+
+    # 业务变量不该在 compose 里插值（插值读 .env，与 env.list 是两套来源）
+    forbidden = ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "DATABASE_URL", "REDIS_URL")
+    text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    leaked = [name for name in forbidden if f"${{{name}" in text]
+    if leaked:
+        problems.append(
+            f"docker-compose.yml 里有业务变量的插值：{leaked} —— "
+            "插值读的是仓库根 `.env`，而容器读 `env.list`：两处真相必然漂移。"
+            "把它们只留在 env.list（需要覆盖时用 `environment:` 直接写值）"
+        )
+
+    # 生产 Prometheus 必须挂 prod 那份配置
+    prom_volumes = (services.get("prometheus") or {}).get("volumes") or []
+    prom_sources = [str(v).split(":")[0] for v in prom_volumes if isinstance(v, str)]
+    if not any(src.endswith("prometheus.prod.yml") for src in prom_sources):
+        problems.append(
+            f"docker-compose.yml 的 prometheus 挂的不是 prometheus.prod.yml（实际：{prom_sources}）—— "
+            "开发那份的 target 是 Windows 网卡 IP，在生产全栈容器里必然永久 down"
+        )
+
+    # env_file 必须指向 env.list（而不是 .env）
+    api_env_file = (services.get("api") or {}).get("env_file")
+    env_files = [api_env_file] if isinstance(api_env_file, str) else list(api_env_file or [])
+    if "env.list" not in env_files:
+        problems.append(
+            f"docker-compose.yml 的 api 没有 `env_file: env.list`（实际：{env_files}）—— "
+            "容器里的业务配置将全部退回代码默认值"
+        )
+    return problems
+
+
 def main() -> int:
     print("① YAML 可解析性：")
     problems = check_yaml()
@@ -256,6 +372,8 @@ def main() -> int:
     problems += check_recording_rules()
     print("④ Grafana 看板与数据源对账：")
     problems += check_dashboard()
+    print("⑤ 生产 compose 结构：")
+    problems += check_prod_compose()
     print()
     if problems:
         print(f"❌ 发现 {len(problems)} 个问题：")

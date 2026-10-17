@@ -19,6 +19,16 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   // `next build` 时这些包只在 Node 侧用，避免被打进客户端包
   serverExternalPackages: [],
+  /**
+   * 容器化（第 17 步 runbook）：`next build` 额外产出 `.next/standalone`，
+   * 里面只带**运行真正用到**的 node_modules —— 运行镜像因此不需要 `node_modules`，
+   * 体积从 ~600MB 降到 ~150MB。
+   *
+   * ⚠️ `web/Dockerfile` 的 `COPY --from=builder /app/.next/standalone ./` 依赖它：
+   *    去掉这一行 → 那个目录**不会生成**，构建在 COPY 那一步直接失败（不是静默降级）。
+   * ⚠️ 它对 `next dev` 无影响（只在 build 时生效），所以开发期照旧跑。
+   */
+  output: "standalone",
 };
 
 export default nextConfig;

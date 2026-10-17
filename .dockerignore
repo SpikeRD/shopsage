@@ -1,0 +1,84 @@
+# 构建上下文排除清单（作用对象：`app/Dockerfile`，context = 仓库根）
+#
+# 两条硬理由（漏掉任一条都会出事，不是「体积优化」）：
+#   1. `.venv/` 是**宿主平台**（开发机 Windows）的虚拟环境 —— 复制进 Linux 镜像后
+#      里面的 .so/.pyd 全是错的平台，而症状是运行时 `ImportError` 而不是构建失败；
+#   2. `.env` / `env.list` 是密钥，一旦进构建层，`docker history` 就能翻出来
+#      （`2.infra.md` §4 第 4 条：密钥不入镜像）。
+
+# ── 密钥与环境变量（★ 最重要的一组）──────────────────────────────────────────
+.env
+.env.*
+env.list
+*.pem
+*.key
+
+# ── 宿主虚拟环境与各类缓存 ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.pytest-tmp/
+pytest-of-*/
+.mypy_cache/
+.ruff_cache/
+.uv-cache/
+.npm-cache/
+.npm-config/
+.appdata/
+.coverage
+htmlcov/
+# HuggingFace 权重缓存：**绝不能进镜像**（几 GB，且是 Linux 路径下的符号链接结构）
+.hf-cache/
+
+# ── 版本库与 IDE ────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ── 不需要进业务镜像的目录 ──────────────────────────────────────────────────
+# tests/ 里被几个 demo 脚本 import（scripts/api_demo.py 等），所以镜像里跑不了它们，
+# 见 runbook §8 的故障速查。测试不属于运行镜像。
+tests/
+eval/
+issues/
+infra/
+
+# ⚠️ `web/` **不能整目录排除**：`web/Dockerfile` 的构建上下文也是仓库根
+# （它要 `COPY docs/kb`）。这里只排除前端的三类重产物 —— 它们的体积远超源码，
+# 而 api 镜像根本不会 COPY 它们（排除只影响「发送给 Docker 的上下文大小」）。
+#
+# ⚠️ **不要排除 `web/tests/`**：`web/tsconfig.json` 的 `include` 是 `**/*.ts`，
+#    而 `next build` 会按它做类型检查 —— 把被测文件之外的 .ts 凭空拿掉，
+#    会让「本机构建通过、镜像构建失败」这种最难查的偏差出现。
+web/node_modules/
+web/.next/
+web/tsconfig.tsbuildinfo
+
+# ── docs 只留知识库语料 ─────────────────────────────────────────────────────
+# ⚠️ `docs/kb` **必须进镜像**：`scripts.load_knowledge_base` 的默认 root 是 `docs/kb`，
+#    而 `RagSettings.knowledge_dir` 也是 `docs/kb` —— 少了它，灌库命令在容器里必然失败。
+#    这里排除的是 docs 下的**大目录**（runbook / modules 有几百 KB 中文文档，运行期用不到）。
+#
+# ⚠️ 这里**故意不写** `docs/*` + `!docs/kb` 这种「先全排、再放行」的写法：
+#    Docker 的 .dockerignore 与 gitignore 的语义不完全一样，被排除的**目录**
+#    再想放行它里面的内容是不可靠的 —— 症状是 `COPY docs/kb` 报
+#    `"/docs/kb": not found`，而文件明明在仓库里。宁可逐条列出目录。
+docs/runbook/
+docs/modules/
+docs/changes/
+
+# ── 其它编排文件（运行期 bind mount 进来，不需要进镜像）──────────────────────────
+docker-compose.yml
+
+# 根 README 与 uv/pytest 的说明文档不属于运行时依赖
+README.md
