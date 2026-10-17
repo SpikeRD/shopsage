@@ -19,11 +19,22 @@ ARG PYTHON_VERSION=3.12
 #    镜像构建要可复现，而 uv 的 lock 格式随版本变化（升级该显式改这一行）。
 ARG UV_VERSION=0.11.33
 
+# ── 阶段 0：uv 二进制（只有这一层依赖 UV_VERSION）──────────────────────────
+# ⚠️⚠️ 为什么要有这个 stage：BuildKit **不支持 `COPY --from=` 里的变量展开**，
+#     写成 `COPY --from=ghcr.io/astral-sh/uv:<版本> ...`（版本用 ARG 拼）会直接失败：
+#       ERROR: failed to build: failed to solve:
+#         variable expansion is not supported for --from,
+#         define a new stage with FROM using ARG from global scope as a workaround
+#     报错本身就给了修法：**在一处使用 `FROM` 的 stage 里做展开**（`FROM` 支持 ARG），
+#     再让后面的 `COPY --from=uv` 只引用**stage 名**。
+#     （旧版 buildx 有时是「不报错、按字面字符串 pull 一个不存在的镜像」，更难看出来。）
+#     ⚠️ 全局 ARG 在第一个 FROM 之前声明，才能被 FROM 引用 —— UV_VERSION 正好满足。
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 # ── 阶段 1：依赖层 ──────────────────────────────────────────────────────────
 FROM python:${PYTHON_VERSION}-slim AS deps
-ARG UV_VERSION
 
-COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
