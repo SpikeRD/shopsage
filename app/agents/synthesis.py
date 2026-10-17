@@ -336,9 +336,35 @@ async def synthesis_node(
         # ⚠️ 写用的上下文来自 `state["cache_context"]` —— 那是 `rag_node` 在读缓存那一刻
         # 留下的**可序列化字段**（问题串 / scope / 指纹 / 版本 / 分档 / TTL）。
         # 用「当前的 messages」去写是不行的：图会在本节点之后把这一轮追加进历史。
-        write = await remember_answer(state, answer, cache=cache, citations=citations)
-        if write is not None:
-            out["cache_info"] = {**(state.get("cache_info") or {}), "write": write.summary()}
+        #
+        # ── 「空结果不写缓存」（issue 010 的第 1 条修法，产品已确认）─────────
+        # 判据：**这一轮走了知识库分支**（`cache_context` 存在 ⟺ `rag_node` 跑过）
+        #       **且一条出处都没有**（`citations == []`）。
+        #
+        # 为什么不缓存：那种答案的内容是「我没查到」，而它最常见的成因是**瞬时的**
+        # —— `rag_chunks` 刚被全量回归清空（runbook §10.1 坑 6）、检索后端抖了一下、
+        # 或问法恰好没命中。把它按政策类 TTL 缓存 **7 天**，等于把一次故障固化成答案：
+        # 语料后来灌好了，用户问同一句仍然拿到「没有找到相关知识库片段」。
+        # 而它**省不下任何成本**（本来就没检索到东西、也没多少 token 可省），
+        # 收益近乎为零、代价是一周的错答案 —— 这笔交换不该做。
+        #
+        # ⚠️ 边界（别扩大）：判据必须带 `cache_context`。退款（`refund`）与寒暄
+        # （`final`）这两条路径**不经过 `rag_node`**，`cache_context` 为空，
+        # 它们的答案是「系统刚写入的真实事实」或「不需要材料的寒暄」，
+        # 虽然同样 `citations == []`，却**必须**照常缓存 —— 只按 `citations`
+        # 判空会把它们一起误伤，而症状是「退款结果不再进缓存」这种没人会怀疑缓存的问题。
+        writes_cache = bool(state.get("cache_context")) and bool(citations)
+        if not writes_cache:
+            logger.info(
+                "不写缓存：本轮走了知识库但有 0 条出处（或根本没走知识库）"
+                "—— 空结果按瞬态处理，见 issue 010。answer_chars=%d",
+                len(answer),
+            )
+            out["cache_info"] = {**(state.get("cache_info") or {}), "write": "skipped:empty_citations"}
+        else:
+            write = await remember_answer(state, answer, cache=cache, citations=citations)
+            if write is not None:
+                out["cache_info"] = {**(state.get("cache_info") or {}), "write": write.summary()}
     return out
 
 

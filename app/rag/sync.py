@@ -107,12 +107,19 @@ class RagSyncWorker:
         settings: RagSettings | None = None,
         embedder: Embedder | None = None,
         category: str = "general",
+        on_change: Any = None,
     ) -> None:
         self.settings = settings or RagSettings.from_settings()
         self.root = Path(root or self.settings.knowledge_dir)
         self.store = store or RagStore(dimension=self.settings.vector_dim)
         self.embedder = embedder
         self.category = category
+        #: 知识库变更回调（`app/rag/ingest.py::ingest_document(on_change=...)` 的同一个）。
+        #:
+        #: ⚠️ 为什么要在这里也留一个入口（issue 010）：定时同步是**生产上唯一会自动
+        #: 改知识库的路径**。它不接线 = 「每天晚上同步完，缓存还在讲昨天的政策」，
+        #: 而这比手工灌库更隐蔽 —— 没人会去看一份自己没跑过的命令有没有清缓存。
+        self.on_change = on_change
         self._stopped = False
 
     async def sync_once(
@@ -164,6 +171,7 @@ class RagSyncWorker:
                 settings=self.settings,
                 embedder=self.embedder,
                 force=force,
+                on_change=self.on_change,
             )
             report.ingested.append(result)
 

@@ -132,6 +132,23 @@ async def load(args: argparse.Namespace) -> int:
     if args.dry_run:
         return dry_run(root, strategy=args.strategy)
 
+    # ── 第 13 步：知识库一变，语义缓存整批失效（issue 010 的修复点）──────────
+    # ⚠️ 这一行曾经**不存在**，后果是：`corpus_revision` 永远停在 1，
+    #    而缓存条目也全是 revision=1 → `is_fresh()` 判「新鲜」→
+    #    「语料已经重新灌好了，缓存还在讲『没有找到相关知识库片段』」。
+    #    政策类条目的 TTL 是 7 天，所以这**能持续一整周**。
+    #
+    # 为什么用 `make_ingest_callback()` 而不是直接 `bump_after_ingest`：
+    # 那里已经把「revisions=None 时解析成进程默认的**那一个**实例」处理好了，
+    # 绕开它就会撞上「推了版本但缓存没失效」的老坑（见该函数的 docstring）。
+    # `--no-invalidate` 给「只想重算向量、不想清缓存」的排障场景留一个出口。
+    on_change = None
+    if not args.no_invalidate:
+        from app.cache.invalidate import make_ingest_callback
+
+        on_change = make_ingest_callback()
+        print("缓存失效：知识库有变更时会推进 corpus_revision，让语义缓存整批失效")
+
     if args.limit and not Path(root).is_file():
         # 只灌前 N 份：给「先小规模验证一次再全量」用的（本地 embedding 下前几次调用最慢）
         files = sorted(item for item in Path(root).rglob("*") if item.is_file())
@@ -146,6 +163,7 @@ async def load(args: argparse.Namespace) -> int:
                 store=store,
                 settings=settings,
                 force=args.force,
+                on_change=on_change,
             )
             total["documents"] += 1
             total["chunks"] += report.chunks_total
@@ -159,6 +177,7 @@ async def load(args: argparse.Namespace) -> int:
             store=store,
             settings=settings,
             force=args.force,
+            on_change=on_change,
         )
         summary = report.as_dict()
 
@@ -170,7 +189,15 @@ async def load(args: argparse.Namespace) -> int:
     if args.prune:
         from app.rag.sync import RagSyncWorker
 
-        worker = RagSyncWorker(root if Path(root).is_dir() else Path(root).parent, store=store, settings=settings)
+        # ⚠️ `on_change=` 必须一起传（issue 010）：下线文档同样是知识库变更，
+        # 缓存里「引用这份文档」的答案要跟着失效 —— 否则会出现「文档已下线，
+        # 缓存还在照它回答」。漏传的症状与灌库漏传完全一样，都是 revision 不动。
+        worker = RagSyncWorker(
+            root if Path(root).is_dir() else Path(root).parent,
+            store=store,
+            settings=settings,
+            on_change=on_change,
+        )
         sync_report = await worker.sync_once(prune=True, force=args.force)
         if sync_report.pruned:
             print(f"已下线（盘上已删除）：{', '.join(sync_report.pruned)}")
@@ -193,6 +220,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prune", action="store_true", help="顺便下线「盘上已删除」的文档")
     parser.add_argument("--limit", type=int, default=0, help="只灌前 N 份（先小规模验证时用）")
     parser.add_argument("--dry-run", action="store_true", help="只解析 + 分块，不写库、不算向量")
+    parser.add_argument(
+        "--no-invalidate",
+        action="store_true",
+        help="不清语义缓存（默认会清：知识库有变更就推进 corpus_revision）。"
+        "只在「重算向量但故意要保留缓存」的排障场景用",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="打印 DEBUG 日志")
     args = parser.parse_args(argv)
 

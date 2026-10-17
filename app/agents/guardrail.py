@@ -321,6 +321,33 @@ def _materials_digest(state: GraphState) -> str:
         f"- 分析结论：{'有' if analysis.get('headline') else '无'}",
         f"- 未拿到的材料：{'；'.join(str(r) for r in (state.get('refusals') or [])) or '无'}",
     ]
+    # ── 第 13 步：**缓存命中**也是一条「不经过检索、直接由节点产出事实」的路径 ──
+    # ⚠️ 这里曾经漏写（issue 009），后果是「每一次缓存命中都被判成编造」：
+    #
+    #   rag_node 命中语义缓存时返回 `docs: []`（缓存的是**整段答案**，不是检索结果），
+    #   于是上面第二行恒为「知识库片段：0 条」；而 synthesis 复用的那句缓存答案
+    #   带着上一轮真检索生成的 `[1]`~`[5]` 编号引用 ——
+    #   判定器看到「材料 0 条 + 回答满是条款引用」，判定「编造」在它那边**完全正确**。
+    #
+    #   实测症状：同一句连问两次，第 1 次 `delivered`、第 2 次起 `blocked`，
+    #   而 `citations` 仍然非空（所以只看出处的验收全绿，见 16.web-runbook §6.2）。
+    #
+    # 与上面 `refund` 那段是同一条纪律的第三次复发：
+    # **新增一条「事实不经检索直达」的路径时，必须同步更新所有核对编造的下游。**
+    cache_info = state.get("cache_info") or {}
+    # 两个判据都要认（顺序有讲究）：
+    # ① `cached_answer_used` 是 `synthesis` 命中缓存时显式写的**事实**（最准）；
+    # ② `outcome == "hit"` 是 `rag_node` 读缓存时写的账目 —— 它更早、也更宽
+    #    （理论上两者应同时成立，但只认一个就会在「synthesis 的键被上游覆盖」时失效）。
+    if cache_info.get("cached_answer_used") or str(cache_info.get("outcome") or "") == "hit":
+        citations = [str(item) for item in (state.get("citations") or [])]
+        similarity = cache_info.get("similarity")
+        how = f"，相似度 {similarity:.4f}" if isinstance(similarity, (int, float)) else ""
+        lines.append(
+            f"- **本轮复用语义缓存里的既有答案{how}**：该答案由上一轮**真实检索**生成，"
+            f"出处共 {len(citations)} 条（{', '.join(citations[:5]) or '无'}）。"
+            "回答里的 `[n]` 编号是**如实的**，不是编造 —— 不要因为「本次没有重新检索」就判它编造。"
+        )
     refund = state.get("refund") or {}
     if refund:
         # 只写「发生了什么」，不写原始字段名（判定者要判断的是「答案有没有编造」，

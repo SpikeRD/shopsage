@@ -75,6 +75,32 @@ class IngestReport:
     warnings: list[str] = field(default_factory=list)
     chunk_ids: list[str] = field(default_factory=list)
 
+    @property
+    def doc_changed(self) -> bool:
+        """这次入库**有没有真的改到文档内容**（缓存版本失效的触发判据）。
+
+        ## ⚠️ 这个属性是被 `on_change` 的接线逼出来的（issue 010 的连带缺陷）
+
+        `ingest_document` 在**很久以前**就写了 `if report.doc_changed:` 来决定
+        要不要调 `on_change`，但 `IngestReport` 上**从来没有**这个字段，
+        而且那句话在 `try` 之外 —— 于是任何调用方只要真的传了 `on_change=`，
+        第一次入库就会 `AttributeError: 'IngestReport' object has no attribute 'doc_changed'`。
+
+        后果不是「缓存偶尔不失效」，而是**这条接线根本没人敢接**：
+        `scripts/load_knowledge_base.py` 一直没传 `on_change`，
+        所以灌库从不推进 `corpus_revision`，语义缓存里的旧条目（包括
+        「检索回 0 条」那种）会一直讲到 TTL 到期（政策类 7 天）。
+
+        ## 为什么用「派生」而不是再加一个字段
+
+        「有没有变」是 `action` 的函数（`action` 已经由 `_is_noop(upsert)` 算好了）：
+        `created` / `updated` / `reindexed` 都算变，`unchanged` 不算；
+        `deleted`（下线）**也算变** —— 文档没了，缓存里引用它的答案同样必须失效，
+        否则会出现「文档已经下线，缓存还在照它回答」。
+        所以这里只把 `unchanged` 排除在外。
+        """
+        return self.action != "unchanged"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "source": self.source,
@@ -91,6 +117,7 @@ class IngestReport:
             "strategy": self.strategy,
             "category": self.category,
             "kind": self.kind,
+            "doc_changed": self.doc_changed,
             "elapsed_ms": round(self.elapsed_ms, 1),
             "warnings": list(self.warnings),
         }
@@ -315,14 +342,26 @@ async def ingest_document(
     # ── 第 13 步：知识库变更之后推进缓存版本（第三级失效的触发点）──────────
     # 只在**真的改动了**的时候调（`report.doc_changed`）：跑一次同步但什么都没变
     # 也会 bump 一次版本，那会把整份缓存白清一遍 —— 而它看起来只是「命中率偶尔掉一下」。
-    if on_change is not None and report.doc_changed:
+    #
+    # ⚠️ 判据本身也要放进 `try`（issue 010）：`report.doc_changed` 若不巧还是个
+    # 不存在的属性，`AttributeError` 会在 `try` **之外**炸掉整次入库 ——
+    # 而入库本身已经成功了，用户看到的却是"灌库失败"，且缓存没失效。
+    # 「回调链路出任何问题都不许反噬入库」这条口径，对判据同样成立。
+    if on_change is not None:
         try:
-            on_change(report)
-        except Exception as exc:  # noqa: BLE001 - 缓存侧的问题不该让入库失败
-            logger.warning("入库后的 on_change 回调失败（入库本身已成功）：%s: %s", type(exc).__name__, exc)
-            report.warnings.append(
-                f"知识库变更回调失败（语义缓存可能未失效，靠 TTL 兜底）：{type(exc).__name__}: {exc}"
-            )
+            changed = bool(report.doc_changed)
+        except Exception as exc:  # noqa: BLE001 - 判据出问题也不许让入库失败
+            logger.warning("读取 doc_changed 失败，跳过缓存失效（入库本身已成功）：%s", exc)
+            changed = False
+            report.warnings.append(f"无法判定本次是否改动，已跳过缓存失效：{exc}")
+        if changed:
+            try:
+                on_change(report)
+            except Exception as exc:  # noqa: BLE001 - 缓存侧的问题不该让入库失败
+                logger.warning("入库后的 on_change 回调失败（入库本身已成功）：%s: %s", type(exc).__name__, exc)
+                report.warnings.append(
+                    f"知识库变更回调失败（语义缓存可能未失效，靠 TTL 兜底）：{type(exc).__name__}: {exc}"
+                )
     return report
 
 
@@ -348,22 +387,36 @@ async def delete_document(
     hard: bool = False,
     store: RagStore | None = None,
     settings: RagSettings | None = None,
+    on_change: Callable[[IngestReport], None] | None = None,
 ) -> IngestReport:
     """下线一份文档（`10.rag.md` 第 2 节的 `delete_document`）。
 
     默认**软删**：片段标 `is_active=false`、文档标无效 —— 引用还在、检索不再可见
     （理由见 `store.delete_document`）。`hard=True` 真的删（误灌文档时用）。
+
+    `on_change`：下线也是**知识库变更**，缓存里引用这份文档的答案同样要失效
+    （否则「文档已经下线了，缓存还在照它回答」）。语义与 `ingest_document` 一致：
+    只有真的删到了东西（`action="deleted"`）才回调。
     """
     resolved_settings = settings or RagSettings.from_settings()
     active_store = store or RagStore(dimension=resolved_settings.vector_dim)
     counts = await asyncio.to_thread(active_store.delete_document, source, hard=hard)
-    return IngestReport(
+    report = IngestReport(
         source=source,
         action="deleted" if counts["documents"] else "unchanged",
         chunks_total=0,
         deactivated=int(counts["chunks"]),
         warnings=[] if counts["documents"] else ["库里没有这份文档（source 对不上？）：什么都没做。"],
     )
+    if on_change is not None and report.doc_changed:
+        try:
+            on_change(report)
+        except Exception as exc:  # noqa: BLE001 - 缓存侧的问题不该让下线失败
+            logger.warning("下线后的 on_change 回调失败（下线本身已成功）：%s: %s", type(exc).__name__, exc)
+            report.warnings.append(
+                f"知识库变更回调失败（语义缓存可能未失效，靠 TTL 兜底）：{type(exc).__name__}: {exc}"
+            )
+    return report
 
 
 @dataclass
@@ -420,8 +473,16 @@ async def ingest_path(
     force: bool = False,
     recursive: bool = True,
     suffixes: Sequence[str] = SUPPORTED_SUFFIXES,
+    on_change: Callable[[IngestReport], None] | None = None,
 ) -> DirectoryIngestReport:
-    """把一个目录（或单个文件）灌进知识库：**只处理支持的后缀**，逐个增量入库。"""
+    """把一个目录（或单个文件）灌进知识库：**只处理支持的后缀**，逐个增量入库。
+
+    `on_change` 会**逐份文档**透传给 `ingest_document`（只在那一份真的变了时触发）。
+    为什么不做成「整目录只回调一次」：一次灌库可能有多份文档变化，
+    而版本推进的语义是「变了就 +1」，每一份都该留下自己的痕迹
+    （`bumped_by` 里能看出是哪一份触发的）。多次推进的代价只是版本号变大，
+    不影响正确性 —— 缓存是按 `fingerprint` 隔离的，旧的一律不可见。
+    """
     path = Path(root)
     resolved_settings = settings or RagSettings.from_settings()
     active_store = store or RagStore(dimension=resolved_settings.vector_dim)
@@ -434,6 +495,7 @@ async def ingest_path(
             settings=resolved_settings,
             embedder=embedder,
             force=force,
+            on_change=on_change,
         )
         return DirectoryIngestReport(documents=[report])
 
@@ -454,6 +516,7 @@ async def ingest_path(
             settings=resolved_settings,
             embedder=embedder,
             force=force,
+            on_change=on_change,
         )
         result.documents.append(report)
     return result

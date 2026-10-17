@@ -197,28 +197,60 @@ test("真流式：一帧不漏地走完 skeleton→node→answer→done（B2 的
   assert.ok(state.nodes.includes("router"), `节点帧里应当有 router，收到 ${state.nodes.join(",")}`);
 });
 
-test("真溯源：问知识库问题 → answer 帧带出处，且能被 parseCitation 解析", { skip: skipNoCustomer }, async () => {
+test("真溯源：问知识库问题 → **答出来了** 且 answer 帧带出处、能解析、能点开", { skip: skipNoCustomer }, async () => {
   // ⚠️ 问法要挑一句**语料里真有、且路由稳定判成知识库类**的。
   // 实测对比（runbook §6.5）：
   //   "7天无理由退货的运费由谁承担？" → route=rag、3 条出处（稳定）
   //   "退货政策是怎么规定的？"        → 有时也走 rag，但检索回 0 条 → 无出处
-  // 后者不是前端的问题（是「问法 → 检索 → 生成」这条链的非确定性，属第 10/14 步），
-  // 而这条用例要钉的是**前端的溯源链路**：出处能到达前端、能解析、能点开。
-  const state = await askOnce(TOKEN_CUSTOMER, "7天无理由退货的运费由谁承担？");
-  assert.ok(
-    state.citations.length > 0,
-    "知识库问题应当带出处（语料要先灌：uv run python -m scripts.load_knowledge_base；" +
-      "若刚跑过全量回归，向量库已被清空 —— 见 runbook §10.1 坑 6）",
-  );
-  const parsed = parseCitation(state.citations[0]);
-  assert.ok(parsed.document.length > 0, `出处解析不出文档名：${state.citations[0]}`);
-  assert.ok(parsed.chunkId, `出处里应当带片段 id：${state.citations[0]}`);
-  assert.match(parsed.chunkId, /^[0-9a-f]{6,}$/, `片段 id 形状不对：${parsed.chunkId}`);
-  // 出处指向的文档必须真的能在 /api/kb 里读到（**闭环**：不然前端点开是一片 404）
-  const response = await fetch(`${WEB_BASE}/api/kb?name=${encodeURIComponent(parsed.document)}`);
-  assert.equal(response.status, 200, `出处页读不到 ${parsed.document}：HTTP ${response.status}`);
-  const payload = (await response.json()) as { content?: string };
-  assert.ok((payload.content ?? "").length > 0, "出处指向的原文不该为空");
+  //
+  // ## ⚠️ 这条用例曾经**只断言 citations**，于是在一条完全坏掉的路径上全绿（issue 009）
+  //
+  // 实测代价：语义缓存命中时 `rag_node` 返回 `docs: []`，输出护栏把缓存里的
+  // **真答案**判成编造，用户拿到的是「抱歉，这个请求我无法处理」——
+  // 而 `citations` **照常非空**（来自上一轮的真出处），所以这条用例当时 `pass 10 / fail 0`。
+  //
+  // 一句话记住：**「有出处」是必要条件，不是充分条件。**
+  // 用户要的是「答出来了」，所以这里必须同时断言 `flowState === "delivered"`
+  // 与回答正文里没有拦截话术 —— 那才是用户体感。
+  //
+  // 连问两次是刻意的：第 2 次必然走**语义缓存**，而 issue 009 正是只在第 2 次起发作。
+  // 只问一次的用例，永远测不到缓存那条路。
+  const question = "7天无理由退货的运费由谁承担？";
+
+  for (const attempt of [1, 2]) {
+    const state = await askOnce(TOKEN_CUSTOMER, question);
+
+    // ① 真的答完了（用户体感的第一判据）
+    assert.equal(
+      state.flowState,
+      "delivered",
+      `第 ${attempt} 次提问没有答完（flow_state=${state.flowState}，blocked=${state.blocked}）：` +
+        `回答=${state.answer.slice(0, 80)} —— 若这是第 2 次，先怀疑语义缓存那条路（issue 009）`,
+    );
+    assert.equal(state.blocked, false, `第 ${attempt} 次提问被拦下了`);
+    assert.ok(state.answer.length > 0, `第 ${attempt} 次提问的回答不能为空`);
+    // ② 回答正文里不能是拦截话术（比断言 flow_state 更贴近用户看到的东西）
+    assert.ok(
+      !/无法处理|被合规护栏拦下/.test(state.answer),
+      `第 ${attempt} 次提问拿到的是拦截话术，不是答案：${state.answer.slice(0, 80)}`,
+    );
+
+    // ③ 溯源闭环：出处能到达前端、能解析、能点开
+    assert.ok(
+      state.citations.length > 0,
+      `第 ${attempt} 次：知识库问题应当带出处（语料要先灌：uv run python -m scripts.load_knowledge_base；` +
+        "若刚跑过全量回归，向量库已被清空 —— 见 runbook §10.1 坑 6）",
+    );
+    const parsed = parseCitation(state.citations[0]);
+    assert.ok(parsed.document.length > 0, `出处解析不出文档名：${state.citations[0]}`);
+    assert.ok(parsed.chunkId, `出处里应当带片段 id：${state.citations[0]}`);
+    assert.match(parsed.chunkId, /^[0-9a-f]{6,}$/, `片段 id 形状不对：${parsed.chunkId}`);
+    // 出处指向的文档必须真的能在 /api/kb 里读到（**闭环**：不然前端点开是一片 404）
+    const response = await fetch(`${WEB_BASE}/api/kb?name=${encodeURIComponent(parsed.document)}`);
+    assert.equal(response.status, 200, `出处页读不到 ${parsed.document}：HTTP ${response.status}`);
+    const payload = (await response.json()) as { content?: string };
+    assert.ok((payload.content ?? "").length > 0, "出处指向的原文不该为空");
+  }
 });
 
 test("对内报表：HTTP 返回真 chart_spec，且能过图表适配层", { skip: skipNoInternal }, async () => {
