@@ -368,5 +368,5 @@ uv run python -m scripts.check_infra
 ---
 
 <sub>
-📚 本次文档整理成果在 [`docs/review/`](docs/review/SUMMARY.md)；原始 README 备份在 [`docs/review/appendix/README.原始备份.md`](docs/review/appendix/README.原始备份.md)。
+📚 本次文档整理成果在 [`docs/review/`](docs/review/SUMMARY.md)
 </sub>
