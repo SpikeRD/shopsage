@@ -2,45 +2,256 @@
 
 接入企业数据库（用户/订单/商品数据）与内部知识库的多 Agent 协作系统，同时服务「客户问题处理」与「内部员工需求」，支持 Docker 容器化部署到 Linux 服务器。
 
-## 文档导航
+---
+
+## 🚀 想快速开始？先看这里（3 条路，选一条）
+
+| 你的目的 | 直接读 | 耗时 |
+|---|---|---|
+| **第一次接手，想搞懂这套系统在干什么** | [`docs/review/architecture/diagrams.md`](docs/review/architecture/diagrams.md) | 15 min |
+| **只想把它跑起来** | 本文 [§4 本地开发](#4-本地开发：起服务) → [§6 容器化部署](#6-容器化部署) | 40 min |
+| **想知道现在哪里有问题、别踩什么坑** | [`docs/review/02-异常清单.md`](docs/review/02-异常清单.md) + [`docs/review/03-待确认清单.md`](docs/review/03-待确认清单.md) | 25 min |
+
+> 📌 **文档整理成果总入口：[`docs/review/SUMMARY.md`](docs/review/SUMMARY.md)**（完成情况、Top5 问题、必读清单、质量自检、已知边界）。
+> 如果只读一个文件，读它。
+
+---
+
+## 1. 这是什么
+
+两条业务线，三个入口：
+
+| 入口 | 使用者 | 典型需求 |
+|---|---|---|
+| **对客** `/` | 客户 | 查订单状态、退换货咨询、产品咨询、物流查询、**申请退款** |
+| **对内** `/internal` | 员工（含客服的退款审批台 `/internal/refunds`） | 销售数据分析、库存查询、客户信息查询、生成报表、**审批退款** |
+| **管理台** `/admin` | 管理员 | 开账号 / 停用 / 改角色 / 重置口令 |
+
+技术形态一句话：**FastAPI + LangGraph 多节点图 + LiteLLM，PostgreSQL(带 pgvector) + Redis，Next.js 前端，Docker Compose 部署。**
+
+一次问答的完整链路（骨架帧 → 图 → 答案帧）见 [`docs/review/architecture/diagrams.md`](docs/review/architecture/diagrams.md) §3 时序图。
+
+---
+
+## 2. 文档导航（三张表，别混看）
+
+### 2.1 先读这三份（面向"理解"）
 
 | 文档 | 内容 | 建议阅读时机 |
 |---|---|---|
-| [docs/architecture.md](docs/architecture.md) | 技术框架、模块划分、多 Agent 协作、数据库 Schema、安全/可观测/可伸缩设计、开发部署流程 | 先读，建立整体认知 |
-| [docs/problem-solving.md](docs/problem-solving.md) | 痛点 → 方案 → 技术点 → 指标的工程问题清单（含落地优先级） | 后读，用于落地与面试/简历讲述 |
-| [docs/runbook/1.config-guide.md](docs/runbook/1.config-guide.md) | **配置实操手册**：配置从哪取值、怎么改（`.env` / 环境变量）、Docker 怎么传值、`test_config.py` 怎么手动测 | 第一次配环境时读，排查「配置不生效」时查 |
-| [docs/runbook/2.infra-runbook.md](docs/runbook/2.infra-runbook.md) | **开发依赖启动手册**：跨主机（Windows 开发机 + Linux 依赖机）起 postgres/pgvector/redis/prometheus/grafana、连通性验证、故障速查、证据回填 | 起依赖栈时照抄；「连不上库」时分诊 |
-| [docs/runbook/3.db-runbook.md](docs/runbook/3.db-runbook.md) | **数据库实操手册**：建库/扩展校验、SQLAlchemy 连接与连接池、Alembic 迁移、种子数据、读写引擎切换与行级过滤验证 | 做第 3 步（db）时照抄；查连接数/SQL 归属时用 |
-| [docs/modules/](docs/modules/README.md) | 每个模块的开发 + 测试文档（8 段模板，文件名按建议开发顺序编号），含建议开发顺序与 problem-solving 映射 | 开发每个模块前/后，边做边查 |
-| [docs/runbook/4.uv-pytest-basics.md](docs/runbook/4.uv-pytest-basics.md) | **uv / pytest 基础命令手册**：uv 管环境依赖（`sync`/`run`/`add`/锁文件）、pytest 选用例与读输出（`-k`/`-m`/退出码/fixture）、本项目 `db` 标记与实测口径、故障速查 | 第一次拿到仓库时读；命令报错（`exit code 5`、缓存权限）时查 |
-| [docs/runbook/](docs/runbook/) | 实操手册目录（编号与 `docs/modules/` 的第 N 步对齐，如 `1.config-guide.md`、`2.infra-runbook.md`、`3.db-runbook.md`） | 要「怎么做、怎么确认做对了」时读 |
-| [docs/环境迁移验收.md](docs/环境迁移验收.md) | **环境迁移验收清单**：换机器后按步验收（工具链 / uv 缓存 / 依赖栈 / 数据库 / 后端 / 跨源 / 前端 / 测试套件 / 知识库），含逐步实测证据、P0 问题与可直接执行的修复命令 | **迁移到新机器后第一份要跑的文档** |
-| [issues/](issues/README.md) | **问题台账**：实测撞到但当场不修/修不完的问题（现象 / 根因 / **判据** / 处理状态），一条一个文件 | 遇到「这算不算坏了」时先查这里有没有既定判据 |
-| [docs/changes/](docs/changes/README.md) | **需求变更台账**：「原来是什么 → 改成什么 → 为什么 → 怎么做 → 怎么验收」，一条变更一个文件；**先定稿文档，再写代码** | 想加/改功能时，先在这里开一条变更单 |
+| [`docs/review/architecture/diagrams.md`](docs/review/architecture/diagrams.md) | 系统上下文图 / 分层依赖图 / 一次请求时序图 / 图内部拓扑（Mermaid，每个节点带代码位置） | **最先读**，建立整体认知 |
+| [`docs/review/architecture/modules.md`](docs/review/architecture/modules.md) | 模块表（职责/接口/依赖/代码位置）+ 4 条阅读路径（按 RPA→agent 背景定制） | 第二次读 |
+| [`docs/review/architecture/glossary.md`](docs/review/architecture/glossary.md) | 术语表：`user_id` vs `subject_id`、`can_enter_internal` vs `canUseInternal`、`blocked` vs 挂起…… | 遇到不认识的词时查 |
 
-> 📌 **编号约定**：`docs/modules/` 下的模块文档按 [`docs/modules/README.md`](docs/modules/README.md) 的**建议开发顺序**编号
-> （`1.config.md` … `16.web.md`，README 自身不编号）；`docs/runbook/` 下的手册复用同一套编号，即
-> **第 N 步的模块文档配 `N.*` 手册**（例：`3.db.md` ↔ `3.db-runbook.md`）。
->
-> ⚠️ 一个例外：`4.uv-pytest-basics.md` **不绑定第 4 步模块**，它是任何一步都要用的**工具命令手册**
-> （uv/pytest 底座），放在 `runbook/` 下只是因为同属「怎么做」类文档。
+### 2.2 干活时查（面向"做"）
 
-## 建议阅读顺序
+| 文档 | 内容 | 什么时候用 |
+|---|---|---|
+| [`docs/review/consolidated/`](docs/review/consolidated/) | 全部原始文档的**精简版**：16 个模块篇 + 7 个 runbook 主题篇 + 变更台账 + 问题台账 + 语料清单 | 想快速知道某模块"是什么、坑在哪" |
+| [`docs/review/tech-stack/index.md`](docs/review/tech-stack/index.md) | 技术栈总览 + **P0/P1/P2 学习优先级** + 10 篇技术分册（LangGraph / FastAPI+asyncio / sqlglot / LiteLLM / pgvector+RAG / Redis+arq / JWT+Argon2 / OTEL+Prometheus / Next.js / MCP） | 要补某个技术时 |
+| [`docs/review/appendix/问题定位索引.md`](docs/review/appendix/问题定位索引.md) | **现象 → 先看哪 → 判据 → 详见**，6 类共 40 条 + 脚本速查 | 出故障时按现象查 |
+| [`docs/review/appendix/存疑保留.md`](docs/review/appendix/存疑保留.md) | 拿不准该不该删、但保留在原处的文档索引 | 想知道某份旧文档还算不算数 |
 
-1. **architecture.md**：了解技术栈选型与模块边界，明确「对客/对内」两条业务线。
-2. **problem-solving.md**：按 P0 → P1 → P2 优先级，把架构中的设计落到可验证的工程问题，形成「问题 → 方案 → 证据」闭环。
-3. **docs/modules/Number.xxx.md**：开始写某个模块前，读它对应的「开发 + 测试」文档；开发完按「验收标准」自检并回填证据。
-4. **docs/runbook/**：动到环境/库/迁移这类「必须一步步确认」的操作时，照抄同编号的实操手册（`3.db-runbook.md` 等），并把实测输出回填到模块文档第 8 节。
+### 2.3 原始文档（面向"细节与溯源"）
 
-## 角色与权限
+> ⚠️ **以下文档是整理前的原始版本，部分内容已过时**。过时项清单见 [`docs/review/02-异常清单.md`](docs/review/02-异常清单.md)（24 条，每条带位置与裁决）。
+> **判断优先级：代码 > `docs/review/` > 原始文档。**
 
-> 权威定义在代码里：角色→权限点 [`app/security/rbac.py::ROLE_PERMISSIONS`](app/security/rbac.py)、
-> 角色→敏感等级 [`app/security/policy.py::ROLE_MAX_SENSITIVITY`](app/security/policy.py)、
+| 文档 | 内容 | 注意 |
+|---|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | 技术框架、模块划分、多 Agent 协作、数据库 Schema | ⚠️ §2 技术栈表有过时项（见下 §8） |
+| [`docs/problem-solving.md`](docs/problem-solving.md) | 痛点 → 方案 → 技术点 → 指标的工程问题清单（A1–G1） | ⚠️ A3/G1 状态需按代码复核 |
+| [`docs/modules/`](docs/modules/README.md) | 每个模块的开发 + 测试文档（8 段模板） | 先看 `docs/review/consolidated/modules/` |
+| [`docs/runbook/`](docs/runbook/) | 实操手册（编号与 `docs/modules/` 对齐） | 先看 `docs/review/consolidated/runbook/` |
+| [`docs/changes/`](docs/changes/README.md) | 需求变更台账 001–003 | 想加/改功能时，先在这里开变更单 |
+| [`issues/`](issues/README.md) | 问题台账 001–010（现象/根因/**判据**/处理） | 「这算不算坏了」先查这里 |
+| [`docs/环境迁移验收.md`](docs/环境迁移验收.md) | 换机器后的逐步验收清单 | 含历史 IP，勿照抄 |
+| [`docs/kb/`](docs/kb/) | **运行时语料**（8 份，灌进 pgvector） | 不是说明书，改它等于改答案 |
+
+---
+
+## 3. 技术栈（**以代码为准**）
+
+> ⚠️ `docs/architecture.md:21-37` 的"确认版"技术栈表里 **4 项与代码不符**（LlamaIndex / LangChain SQLDatabaseToolkit / GitHub Actions / 测试数字）。
+> 下表重建自 `pyproject.toml` + `web/package.json`。详细分册见 [`docs/review/tech-stack/`](docs/review/tech-stack/index.md)。
+
+| 层 | 实际选型 | 说明 |
+|---|---|---|
+| 语言 / Web | Python ≥3.12 + **FastAPI** + uvicorn | 异步、类型友好 |
+| 依赖 / 虚拟环境 | **uv** | `uv sync` / `uv run`，不用 `venv + pip` |
+| Agent 编排 | **LangGraph** ≥1.2.14 | 有状态图 + checkpointer 断点重放（`durability="sync"`） |
+| LLM 接入 | **LiteLLM** + tenacity | 一家接口打多家（deepseek + dashscope embedding） |
+| Text-to-SQL | **sqlglot（自研 AST 守卫）** | *不是* LangChain SQLDatabaseToolkit |
+| RAG | **自研**（解析/分块/混合检索/rerank） | *不是* LlamaIndex |
+| 向量库 | **pgvector**（HNSW 索引，`vector(1024)`） | 与业务库同实例 |
+| 业务库 | **PostgreSQL** + SQLAlchemy 2 + psycopg3 | 读写双引擎（只读角色兜底） |
+| 迁移 | **Alembic** | 7 个迁移，单链 |
+| 缓存 / 会话 | **Redis** | 限流桶 / 语义缓存快路径 / arq 队列 |
+| 异步任务 | **arq** | 重试分级 + 死信表 + 人工重放 |
+| 鉴权 | **PyJWT**(HS256) + **Argon2id** | 令牌带 `token_version`（立即失效） |
+| 可观测 | **OpenTelemetry + Prometheus + Grafana + Langfuse** | 指标 / span / LLM 记录 |
+| 评测 | **自研**（指标名对齐 Ragas，不装 ragas） | golden dataset + 单/多 Agent 对照 |
+| 协议 | **MCP** SDK 2.x（`MCPServer`） | 4 个工具对外暴露 |
+| 前端 | **Next.js 15.5.27** + React 19 + Tailwind 4 + ECharts 5 | App Router，standalone 产物 |
+| 部署 | **Docker Compose** | 9 个服务，详见 §6 |
+| CI/CD | ❌ **未落地** | 仓库无 `.github/` |
+
+---
+
+## 4. 本地开发：起服务
+
+> **前置**：Python ≥3.12、uv ≥0.11、Node ≥22、PostgreSQL + pgvector、Redis。
+> 依赖栈怎么起见 [§6.1 或 `docs/review/consolidated/runbook/环境与部署.md`](docs/review/consolidated/runbook/环境与部署.md)。
+
+```bash
+# ① 装依赖（仓库根执行；uv run 不改工作目录，命令必须在仓库根）
+uv sync
+
+# ② 配置：复制模板 → 填真实值
+cp .env.example .env
+#   DATABASE_URL / REDIS_URL / LLM_API_KEY / JWT_SECRET 必填
+#   JWT_SECRET 生产必须换随机值：openssl rand -hex 32（ENV=prod 用开发默认密钥会拒绝启动）
+#   ENV=prod 时缺 DATABASE_URL 或 LLM_API_KEY 会【直接拒绝启动】
+
+# ③ 建表 + 灌数据
+uv run alembic upgrade head
+uv run python -m scripts.seed          # 幂等
+uv run python -m scripts.db_check --check
+
+# ④ 灌知识库语料（约 45–82s）—— 漏了这步检索会全空
+uv run python -m scripts.load_knowledge_base
+
+# ⑤ 起后端
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+#   ⚠️ 不要加 --reload：本机实测起不来（watchfiles 要起子进程）
+#   /docs 看 OpenAPI · /health 看依赖状态 · WS /api/chat/stream 走流式
+```
+
+```bash
+# ⑥ 起前端（另开一个终端）
+cd web
+npm install --ignore-scripts          # ⚠️ 必须带 --ignore-scripts
+npm run dev                           # → http://127.0.0.1:3000
+```
+
+**登录**（演示账号，口令在 `scripts/seed.py::DEMO_ACCOUNTS`，刻意不打印到终端）：
+
+| 账号 | 落在 |
+|---|---|
+| `admin` | `/admin`（管理台） |
+| `13800000002` | `/`（对客） |
+| `employee` | `/internal`（对内） |
+
+> ⚠️ **打开页面请用 `http://127.0.0.1:3000` 或 `http://localhost:3000`**。
+> `next dev` 打印的 `Network: http://<网卡IP>:3000` **默认不在跨源白名单里**，照它打开会
+> 「页面能开、WebSocket 也连不上、发消息没反应」——**症状极像后端坏了**。
+> 要按实际地址核对：`uv run python -m scripts.check_web_cors --web http://<该地址>:3000`
+
+**常见启动失败**：[`docs/review/appendix/问题定位索引.md`](docs/review/appendix/问题定位索引.md) §A（起不来 / 连不上，8 条）。
+
+---
+
+## 5. 常用命令速查
+
+全部在**仓库根**执行（前端命令在 `web/`）：
+
+```bash
+uv run pytest -q                              # 全量测试（连不上库时 db 用例自动 skip）
+uv run pytest -q -m "not db"                  # 只跑不需要数据库的用例
+uv run pytest -q tests/api                    # 按目录/文件选
+uv run alembic upgrade head                   # 建表 / 升级
+uv run python -m scripts.seed                 # 灌演示数据（幂等）
+uv run python -m scripts.db_check --check     # 验收断言：缺表/行数不足则退出码 1
+uv run python -m scripts.load_knowledge_base  # 灌知识库语料（跑完全量回归后必须重灌）
+uv run python -m scripts.check_infra          # 配置自检
+uv run python -m scripts.dev_token --account admin   # 签一个演示令牌（按账号签）
+uv run python -m scripts.db_readonly --regrant-only  # ⚠️ 迁移回滚后必须重放只读授权
+```
+
+```bash
+cd web
+npm test                       # 离线用例（node --test，不连后端）
+npm run typecheck
+npm run build                  # 构建通过（验收第 1 条）
+node tests/run-live.mjs        # 真链路（需后端在跑）
+```
+
+**取证脚本**（⚠️ 会**真的改演示库**，只该对开发/演示库跑，跑完自行复原）：
+
+```bash
+uv run python -m scripts.evidence_accounts    # 账号与口令确实在库里（Argon2id，非明文）
+uv run python -m scripts.evidence_paths       # 三条主路径回归（需后端在跑）
+uv run python -m scripts.evidence_refunds     # 退款申请/审批闭环（需后端在跑）
+node scripts/admin-create-evidence.mjs        # 真浏览器：开账号
+node scripts/admin-patch-evidence.mjs         # 真浏览器：停用（验 CORS 预检）
+node scripts/admin-role-evidence.mjs          # 真浏览器：改角色
+node scripts/logout-during-llm-evidence.mjs   # 真浏览器：等 LLM 时退出登录
+```
+
+后端地址可用 `SHOPSAGE_API` 覆盖（默认 `http://127.0.0.1:8000`）——**改完代码后原进程不会自动更新**，取证前先确认端口上跑的是哪一版。
+
+---
+
+## 6. 容器化部署
+
+两种形态都支持，**差异只在少数几处**：
+
+| 项 | ① 独立 Linux 服务器 | ② Windows + Docker Desktop + WSL2 |
+|---|---|---|
+| 执行位置 | 服务器 `~/ShopSage` | **WSL Ubuntu 的 `~/shopsage`**（原生文件系统，不是 `/mnt/e/...`） |
+| `NEXT_PUBLIC_API_BASE` | `http://<服务器IP>:8000` | 用默认 `http://localhost:8000` |
+| `API_CORS_ORIGINS` | `https://shopsage.example.com` | `http://localhost:3000,http://127.0.0.1:3000` |
+| `EMBEDDING_API_KEY` | 可留空（同厂商时才可） | **必须填**（主模型 DeepSeek、embedding dashscope → 否则首次检索 401） |
+
+> ⚠️ 上面每一项**照抄服务器口径到本机都会静默失败**（不报错，只是连不上或 401）。
+
+### 6.1 一次性部署（Linux 侧仓库根执行）
+
+```bash
+cp env.list.example env.list && chmod 600 env.list        # 里面全是密钥
+docker compose -f docker-compose.yml --project-directory . config -q   # 只读校验
+docker compose -f docker-compose.yml --project-directory . build
+docker compose -f docker-compose.yml --project-directory . up -d postgres redis
+docker compose -f docker-compose.yml --project-directory . run --rm migrate
+docker compose -f docker-compose.yml --project-directory . up -d --wait
+uv run python -m scripts.check_infra
+```
+
+9 个服务：`migrate`（一次性）/ `api` / `worker` / `web` / `postgres` / `redis` / `prometheus` / `grafana` / `otel-collector`（`--profile tracing`）。
+`migrate` / `api` / `worker` **共用同一个后端镜像**（换命令不换镜像）——这保证「入队用的任务名」与「消费用的实现」是同一份代码。
+
+### 6.2 改完之后跑哪条（速查）
+
+| 改了什么 | 命令 | 丢数据？ |
+|---|---|---|
+| `env.list` | `up -d --force-recreate api worker` | 不丢 |
+| `app/**` `.py` | `up -d --build api worker`（改模型再补 `run --rm migrate`） | 不丢 |
+| `web/**` 或 `NEXT_PUBLIC_API_BASE` | `up -d --build web`（**重启无效**，它是构建期变量） | 不丢 |
+| `pyproject.toml` / `uv.lock` | `up -d --build` | 不丢 |
+| `infra/prometheus/**` | `up -d --force-recreate prometheus` | 不丢 |
+| 彻底重来 | `down -v && up -d` | ⚠️ **全丢** |
+
+> **两条铁律**：① `docker compose restart` **不重新解析 YAML、不重读 `env.list`**；② `env.list` 的改动只对**下一次创建的容器**生效。
+
+### 6.3 ⚠️ 部署验证状态（诚实标注）
+
+- **Windows + WSL2 形态**：已跑通（`git log`：`c169a37 在windows本机完成docker部署并启动`）。
+- **独立 Linux 服务器形态**：**尚无证据**。`docs/modules/2.infra.md:9-10` 自己写着"尚未在任何真实 Linux 服务器上执行过"。
+- 详见 [`docs/review/02-异常清单.md`](docs/review/02-异常清单.md) E-06 与 [`docs/review/03-待确认清单.md`](docs/review/03-待确认清单.md) Q-09。
+
+详细手册：[`docs/review/consolidated/runbook/环境与部署.md`](docs/review/consolidated/runbook/环境与部署.md) / [`docs/runbook/17.docker-ops.md`](docs/runbook/17.docker-ops.md) / [`docs/runbook/18.docker-install-windows.md`](docs/runbook/18.docker-install-windows.md)。
+
+---
+
+## 7. 角色与权限
+
+> **权威定义在代码里（改权限请改代码）**：
+> 角色→权限点 [`app/security/rbac.py::ROLE_PERMISSIONS`](app/security/rbac.py)，
+> 角色→敏感等级 [`app/security/policy.py::ROLE_MAX_SENSITIVITY`](app/security/policy.py)，
 > 角色→入口 [`app/security/accounts.py::entry_for_role`](app/security/accounts.py)。
-> 本表是它们的说明，**改权限请改代码**（前端 `web/src/lib/auth.ts::ROLE_PERMISSIONS` 是副本，
-> 只用于渲染菜单，不用于授权判断）。
+> 前端 [`web/src/lib/auth.ts::ROLE_PERMISSIONS`](web/src/lib/auth.ts) 是**副本**，只用于渲染菜单，**不用于授权判断**。
 
-### 权限点（8 个）
+### 7.1 权限点（8 个）
 
 | 权限点 | 含义 |
 |---|---|
@@ -53,41 +264,24 @@
 | `approve:refund` | **审批**退款（变更 003 新增）。`requested → approved / rejected` |
 | `admin` | 管理台：开账号 / 停用 / 改角色 / 重置口令 ——**有它就进「管理台」入口** |
 
-### 角色对照表（6 个角色，实测自代码）
+### 7.2 角色对照表（6 个角色）
 
 | 角色 | 入口 | 权限点 | 数据清晰度上限 |
 |---|---|---|---|
 | `customer` | 对客 | `read:own` `write:ticket` `request:refund` | 脱敏 |
-| `customer_service` | **对内**（变更 003 起） | `read:own` `write:refund` `write:ticket` `approve:refund` | **公开（可对外）** |
+| `customer_service` | **对内**（变更 003 起） | `read:own` `write:ticket` `write:refund` `approve:refund` | **公开（可对外）** |
 | `internal_employee` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` `approve:refund` | 脱敏 |
 | `manager` | 对内 | `read:own` `read:all_orders` `write:refund` `write:ticket` `approve:refund` | **内部可见** |
 | `finance_auditor` | 对内 | `read:own` `read:all_orders` `read:finance` `write:ticket` `approve:refund` | 财务级 |
 | `admin` | 管理台 | 全部 8 个 | 财务级 |
 
-> **变更 003 的两处关键变化**（详见 [docs/changes/003](docs/changes/003-refund-workflow-and-entry-permissions.md)）：
-> 1. **退款拆成「申请 / 发起 / 审批」三个权限点**：客户能**申请**（`request:refund`）但
->    **永远批不了**（拿不到 `approve:refund`）—— 这修的是「对客入口可以自己审批退款申请」。
-> 2. **客服的入口从「对客」改为「对内」**：他有 `approve:refund` 却没有 `read:all_orders`，
->    而入口判据已放宽为「能读全站订单 **或** 能审批退款」。
->    ⚠️ 「能进对内」≠「能查全站」：这两个判据在前后端都是**分开**的函数
->    （`can_enter_internal` / `canUseInternalEntry` vs `canUseInternal`），不许多写一处。
+### 7.3 三条容易看错的地方
 
-### 入口分流规则（`entry_for_role`，判据是**能力**不是角色名）
-有 `admin` → 管理台；否则**能进对内**（有 `read:all_orders` **或** `approve:refund`）→ 对内；否则 → 对客。
-（变更 003 把「或 `approve:refund`」加进来，否则客服进不去他自己的退款审批台。）
+1. **`manager` 与 `internal_employee` 的权限点完全相同** —— 差别只在**数据清晰度上限**（主管看得到真实姓名，普通员工只看到脱敏值）。「权限点管能做什么，敏感等级管看得多清楚」是两条**正交**的轴。
+2. **`customer_service` 的可见度是六个角色里最低的（公开级）**，比客户本人还低。这是**刻意**的：客服是一线、最容易被社工或要求截图，所以连脱敏后的手机号都不给（要联系客户走工单流程）。
+3. **`admin` 是「财务级」而不是「无限」** —— 它真正多出来的是**动作权限**（`admin` 权限点），不是「能看到所有人的手机号明文」。
 
-### 三条容易看错的地方
-
-1. **`manager` 与 `internal_employee` 的权限点完全相同** —— 差别只在**数据清晰度上限**
-   （主管看得到真实姓名，普通员工只看到脱敏值）。「权限点管能做什么，敏感等级管看得多清楚」
-   是两条**正交**的轴，别指望在权限点列表里看出主管的差别。
-2. **`customer_service` 的可见度是六个角色里最低的（公开级）**，比客户本人还低。
-   这是**刻意**的：客服是一线、最容易被社工或被要求截图，所以连脱敏后的手机号都不给
-   （要联系客户走工单流程，不靠肉眼读号）。
-3. **`admin` 是「财务级」而不是「无限」** —— 它真正多出来的是**动作权限**
-   （`admin` 权限点），不是「能看到所有人的手机号明文」。敏感等级最高就到财务级。
-
-### 数据清晰度等级（4 级）
+### 7.4 数据清晰度等级（4 级）
 
 | 等级 | 名称 | 典型字段 / 形态 |
 |---|---|---|
@@ -98,7 +292,7 @@
 
 **未登记的角色 = 权限点空集、清晰度 -1（什么都看不到）**，即**默认拒绝**。
 
-### 三条正交的边界（不要混）
+### 7.5 三条正交的边界（不要混）
 
 | 边界 | 回答的问题 | 唯一真相 |
 |---|---|---|
@@ -106,111 +300,73 @@
 | **RBAC** | 这个**角色**能不能做这件事 | [`app/security/rbac.py`](app/security/rbac.py) |
 | **脱敏** | 同一条数据，给这个角色**看多清楚** | [`app/security/masking.py`](app/security/masking.py) + `policy.ROLE_MAX_SENSITIVITY` |
 
-> ⚠️ 前端 `web/src/lib/auth.ts` 的角色表**只是副本**，用来决定「显示哪些菜单」；
-> **任何真正的授权判断都在后端**。客户把地址栏敲成 `/admin` 一样能打开那个页面，
-> 但那一页的每个请求都会被后端拒（`@require_permission(PERM_ADMIN)`，越权按 404 返回）。
+> ⚠️ **入口判据 ≠ 查询判据**：`can_enter_internal`（能不能进对内界面 = 有 `read:all_orders` **或** `approve:refund`）
+> 与 `has_permission(role, read:all_orders)`（能不能查全站）是**两个函数**，前后端都不许混用。
+> 客户把地址栏敲成 `/admin` 一样能打开那个页面，但那一页的每个请求都会被后端拒（越权**按 404 返回**，不是 403 —— 避免订单号存在性探测）。
 
-## 当前进度
+---
+
+## 8. ⚠️ 已知问题与注意事项（读代码前先看这 6 条）
+
+| # | 事 | 影响 | 详见 |
+|---|---|---|---|
+| 1 | **技术栈表过时**：`docs/architecture.md` 写 LlamaIndex / LangChain SQLDatabaseToolkit / GitHub Actions，代码里都没有 | 对外介绍/面试会被追问 | `02-异常清单.md` E-01/E-02/E-05 |
+| 2 | **多模型自动降级 + 熔断未实现**（problem-solving A3） | 不能对外宣称"主模型故障自动降级" | `02` E-03、`03` Q-01 |
+| 3 | **`POST /api/chat/approve` 已删除**，审批搬到 `POST /api/refunds/decision`（需 `approve:refund`） | 旧 runbook 会让人找不存在的接口 | `02` E-04 |
+| 4 | **`payment_method` 对所有角色都打码成 `***`**（含财务级） | 订单页"支付方式"列等于没信息 | `issues/008`（**未修**） |
+| 5 | **应用数据库角色仍是 SUPERUSER** | 凭据泄露则不受权限约束 | `docs/runbook/4.security-runbook.md:402-428` |
+| 6 | **CI/CD 未落地**，测试数字（`1846 passed` 等）全是历史快照 | 完成度不可按 README 旧数字判断 | `02` E-05、`03` Q-02 |
+
+另外两条最有教学价值的坑（不修，但值得知道）：
+- `issues/007`：一条死 WebSocket 连接 → 无让出点忙等 → **锁死整个事件循环**。
+- `issues/009`：语义缓存命中后 `docs` 归零 → 护栏把**真答案**判成编造。**「有出处」≠「答出来了」**。
+
+---
+
+## 9. 项目进度（按代码核实，非历史快照）
 
 | 模块 | 状态 | 代码 | 验证方式 |
 |---|---|---|---|
-| 1 config | ✅ 完成 | `app/config/` | `uv run pytest -q tests/test_config.py` |
-| 2 infra（仅开发依赖） | ✅ 依赖栈在 Linux VM 上跑通 | `infra/docker-compose.dev.yml` | `docs/runbook/2.infra-runbook.md` |
-| 3 **db** | ✅ **完成**（8 张表 / 迁移 / 种子 / 行级过滤 / 连接池） | `app/db/`、`alembic/`、`scripts/` | `uv run alembic upgrade head` → `uv run python -m scripts.seed` → `uv run python -m scripts.db_check --check` → `uv run pytest -q`（**97 passed, 1 skipped**） |
-| 4–8 security / llm / tools / agents / graph | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/security/`、`app/llm/`、`app/tools/`、`app/agents/`、`app/graph/` | `uv run pytest -q -k "graph or agents or tools or llm or security"`；第 8 步口径：`79 passed, 1 skipped`（图）+ 全量 `730 passed` |
-| 9 **api** | ✅ **完成**（**首个端到端切片**：HTTP → 图 → Text-to-SQL → 回答；含 WebSocket 流式、限流、审批通道） | `app/api/`、`app/main.py`、`scripts/api_demo.py` | `uv run pytest -q tests/api`（**138 passed**）；`uv run python -m scripts.api_demo`（七个场景，首帧 **10~13ms**）；全量 **870 passed** |
-| 10–15 rag / observability / queue / cache / eval / mcp | ✅ 完成（各步的实操手册见 `docs/runbook/`，编号与模块一致） | `app/rag/`、`app/observability/`、`app/queue/`、`app/cache/`、`app/eval/`、`app/mcp/` | 见各步 runbook 的状态表；第 15 步口径：全量 **1613 passed, 50 skipped, 13 deselected, 6 errors** |
-| 16 **web** | ✅ **完成**（**演示层**：对客流式 + 溯源可视化 + 人机审批 / 对内报表 + 图表 + SQL 回显 / 按角色分流） | `web/`（Next 15 + TS + Tailwind + ECharts）、`scripts/dev_token.py`、`scripts/check_web_cors.py` | `cd web; npm test`（**119 passed**）；`npm run build`（**✓ 4.3s**）；`node tests/run-live.mjs`（**10 passed**） |
-| 17 **变更 001：账号登录 + 管理台** | ✅ 完成（**真登录**：账号+口令、刷新续期、三档入口、管理员开账号） | `app/security/accounts.py`、`app/api/auth.py`、`app/api/admin.py`、`web/src/app/admin/`、`web/src/lib/session.ts` | `uv run pytest -q tests/security tests/api`；`uv run python -m scripts.seed`；`cd web; npm test`；全量 **1745 passed, 50 skipped** |
-| 18 **变更 002：前端改版** | ✅ 完成（**浅色护眼** + 登录/主界面分离 + **左侧边栏**按权限分流 + **自动探活** + 管理台表格修复） | `web/src/app/(auth)/`、`web/src/app/(app)/`、`web/src/components/SideNav.tsx`、`HealthBanner.tsx`、`web/src/lib/health.ts` | `cd web; npm test`（**150 passed**）；`npm run build`；`npm run typecheck`；`uv run python -m scripts.evidence_accounts`；`uv run python -m scripts.evidence_paths` |
-| **issue 004 修复** | ✅ 已修复（**管理员开账号 422**：口令策略只落在后端 → 前端不知道、报错不说原因、失败还清空表单） | `web/src/lib/password.ts`、`web/src/app/(app)/admin/page.tsx` | `cd web; npm test`（**169 passed**，新增 10）；`node scripts/admin-create-evidence.mjs`（**真浏览器 5 passed**）；见 [`issues/004`](issues/004-admin-cannot-create-account.md) |
-| **issue 005 修复** | ✅ 已修复（**管理台停用/改角色 `Failed to fetch`**：CORS 白名单漏了 `PATCH` → 预检 400，那条请求根本没发出） | `app/api/main.py`、`tests/api/test_cors.py` | `uv run pytest -q tests/api/test_cors.py`；`node scripts/admin-patch-evidence.mjs`（**真浏览器 7 passed**）；见 [`issues/005`](issues/005-cors-missing-patch-method.md) |
-| **issue 006 修复** | ✅ 已修复（**管理台改角色提示成功但没生效**：受控 `select` 的值在异步 thunk 执行前被 React 回滚 → 请求体发的是旧角色） | `web/src/app/(app)/admin/page.tsx`、`web/tests/hook-wiring.test.ts` | `cd web; npm test`（**171 passed**，新增 2）；`node scripts/admin-role-evidence.mjs`（**真浏览器 6 passed**）；见 [`issues/006`](issues/006-admin-role-change-not-persisted.md) |
-| **issue 007 修复** | ✅ 已修复（**等 LLM 回复时退出登录 → 整个后端被一条死连接锁死**：WS 断连抛的 `WebSocketDisconnected` 掉进兜底分支 → 纯 CPU 忙等占满事件循环，之后连登录都永远得不到响应） | `app/api/chat.py`、`tests/api/test_chat_stream_disconnect.py` | `uv run pytest -q tests/api/test_chat_stream_disconnect.py`（**4 passed**；摘掉修复即 2 条红）；`node scripts/logout-during-llm-evidence.mjs`（**真浏览器 4 passed**）；见 [`issues/007`](issues/007-logout-during-llm-hangs-event-loop.md) |
-| 19 **变更 003：退款闭环 + 入口贯通** | ✅ 完成（**管理员能进三个入口**；**客户订单页 + 申请退款（LLM/手动）**；**员工退款审批台**；**客户不能再自己审批退款**） | `app/security/rbac.py`、`app/api/{orders,refunds,refund_errors}.py`、`app/tools/{orders,refund}.py`、`app/agents/refund.py`、`app/graph/builder.py`、`alembic/versions/20261016_c7a4e2f9b1d8_*`、`web/src/app/(app)/{orders,internal/refunds}/`、`web/src/lib/{auth,session,refund_ui}.ts` | `uv run pytest -q`（**1846 passed, 50 skipped**）；`cd web; npm test`（**201 passed**）、`npm run build`（`/orders` 与 `/internal/refunds` 均在路由表）；`uv run alembic upgrade head` + `downgrade -1` 往返；`uv run python -m scripts.evidence_refunds`（**真链路 19/19 PASS**）；见 [`docs/changes/003`](docs/changes/003-refund-workflow-and-entry-permissions.md) |
+| 1 config | ✅ | `app/config/` | `uv run pytest -q tests/test_config.py` |
+| 2 infra（开发依赖栈） | ✅ | `infra/docker-compose.dev.yml` | `docs/runbook/2.infra-runbook.md` |
+| 3 db | ✅ 10 张表 / 7 迁移 / 种子 / 行级过滤 / 连接池 | `app/db/`、`alembic/`、`scripts/` | `alembic upgrade head` → `scripts.seed` → `db_check --check` |
+| 4–8 security / llm / tools / agents / graph | ✅ | `app/security/`、`app/llm/`、`app/tools/`、`app/agents/`、`app/graph/` | `uv run pytest -q -k "graph or agents or tools or llm or security"` |
+| 9 api | ✅ 首个端到端切片（HTTP → 图 → Text-to-SQL → 回答；WS 流式、限流） | `app/api/`、`app/main.py` | `uv run pytest -q tests/api`、`scripts/api_demo.py` |
+| 10–15 rag / observability / queue / cache / eval / mcp | ✅ | 对应 `app/*` 目录 | 见各 runbook 状态表 |
+| 16 web | ✅ 三入口 + 流式 + 溯源 + 图表 | `web/` | `cd web && npm test && npm run build` |
+| 变更 001 账号登录 + 管理台 | ✅ | `app/security/accounts.py`、`app/api/{auth,admin}.py` | `scripts/evidence_accounts` |
+| 变更 002 前端改版（浅色 + 侧边栏 + 自动探活） | ✅ | `web/src/components/`、`web/src/lib/health.ts` | `scripts/evidence_paths` |
+| 变更 003 退款闭环 + 入口贯通 | ✅ | `app/api/{orders,refunds}.py`、`app/tools/refund.py`、`app/agents/refund.py` | `scripts/evidence_refunds` |
+| issue 004–007 修复 | ✅ | 见 `issues/` 各条 | 见各条"验证"节 |
+| issue 008（payment_method 打码） | ❌ **未修** | `app/security/masking.py:136` | — |
+| 生产部署（Linux 服务器形态） | ⚠️ **未验证** | `docker-compose.yml` | 见 §6.3 |
+| CI/CD | ❌ **未落地** | 无 | — |
 
-> 📌 **变更 002（前端改版）的用法**：
-> ① 后端照旧 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
-> ② 前端 `cd web; npm run dev` → <http://127.0.0.1:3000>；
-> ③ 打开 `/login` 用账号+口令登录，登录后落在**左侧边栏**外壳里：
-> 侧边栏按你的权限显示入口（客户只看得到「对客问答」，员工多一个「对内查询」，管理员三个都有），
-> 底部固定显示**个人信息 + 权限状态**（权限点来自 `GET /api/auth/me`，失败时回退本地并**明确标注是回退值**）。
-> ④ **每次打开或刷新页面都会自动探活一次**（`GET /health`）；后端没连上时页面顶部出现异常横幅，
-> 含后端地址与分诊步骤，另有「重新探活」按钮。
-> ⚠️ **登录页不再有「开发模式粘贴令牌」**（变更 002 按「只管登录账户」删掉了）。
-> 排障要手粘令牌时，改在 DevTools 里执行：
-> `localStorage.setItem("shopsage.token.customer", "<令牌>")`（key 见 `web/src/lib/auth.ts::tokenKey`）。
-> 变更说明、决策记录与实测证据见 [`docs/changes/002-light-ui-sidebar-and-autoprobe.md`](docs/changes/002-light-ui-sidebar-and-autoprobe.md)。
+> ⚠️ 本表的"验证方式"列是**怎么验**，不是"已经验过"。要确认真实基线，跑一次 `uv run pytest -q` 与 `cd web && npm test`（见 [`docs/review/03-待确认清单.md`](docs/review/03-待确认清单.md) Q-02）。
 
-> 📌 **变更 001（账号登录 + 管理台）的用法**：
-> ① 起依赖栈与后端；② 灌演示账号 `uv run python -m scripts.seed`（口令写在 `scripts/seed.py`
-> 的 `DEMO_ACCOUNTS` 里，**刻意不打印到终端**）；③ 打开 `/login`，用这三个之一登录：
-> `admin` / `13800000002` / `employee` → 分别落在 `/admin`、`/`、`/internal`。
-> 管理员可在 `/admin` 开账号；停用/改角色/重置口令会**立刻作废该账号所有在途令牌**。
-> 变更说明、决策记录与实测证据见 [`docs/changes/001-account-login-and-admin-console.md`](docs/changes/001-account-login-and-admin-console.md)。
+---
 
-> ⚠️ **变更 001 的升级影响**：旧令牌（没有 `aid`/`ver` 声明）一律被拒，
-> 且 `thread_id` 形状从 `u{user_id}:` 改为 `c{user_id}:` / `e{emp_id}:`
-> （员工与客户不再共用会话桶）—— **升级后需要重新登录，旧会话作废**。
+## 10. 编号约定
 
-> 📌 第 9 步的启动方式：`uv run uvicorn app.main:app --reload --port 8000`
-> （`/docs` 看 OpenAPI、`/health` 看依赖状态、`WS /api/chat/stream` 走流式；
-> 逐步操作与排障见 [`docs/runbook/9.api-runbook.md`](docs/runbook/9.api-runbook.md)）。
+`docs/modules/` 下的模块文档按建议开发顺序编号（`1.config.md` … `16.web.md`）；`docs/runbook/` 复用同一套编号，即**第 N 步的模块文档配 `N.*` 手册**（例：`3.db.md` ↔ `3.db-runbook.md`）。
 
-> 📌 第 16 步的启动方式（**两个进程 + 一次自检**）：
-> ① 后端 `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000`；
-> ② 前端 `cd web; npm install --ignore-scripts; npm run dev` → <http://127.0.0.1:3000>；
-> ③ 登录：**直接用账号 + 口令**（变更 001 起有真登录接口了，见上面那条）。
-> 排障时仍可用 `uv run python -m scripts.dev_token --account admin` 签一个令牌，
-> 在 `/login` 的「开发模式」里粘贴（它**没有刷新令牌**，30 分钟后要重来）。
-> ⚠️ 页面报 `Failed to fetch` 时先跑 `uv run python -m scripts.check_web_cors`
-> （**别去重签令牌** —— 没有状态码的 fetch 失败不是令牌问题，是「进程没起」或「跨源被拦」）；
-> ⚠️ **打开页面请用 `http://127.0.0.1:3000`（或 `http://localhost:3000`）**：
-> `next dev` 打印的 `Network: http://<网卡IP>:3000` **默认不在跨源白名单里**，照它打开会
-> 「页面能开、WebSocket 也能连，但一直显示连不上、发消息没反应」（症状极像后端坏了）。
-> 要按实际打开的地址核对，加 `--web`：`... check_web_cors --web http://<该地址>:3000`；
-> 故障记录与修法见 [`docs/runbook/16-web-runbook.md`](docs/runbook/16-web-runbook.md) §10.1 坑 18。
-> 若「HTTP 通但对客页说 WebSocket 连接失败」，多半是 `NEXT_PUBLIC_API_BASE` 指到了前端自己
-> （它是**构建期**变量，改了要重启 `npm run dev`）。
-> 逐步操作、坑与分诊见 [`docs/runbook/16-web-runbook.md`](docs/runbook/16-web-runbook.md)。
+> ⚠️ 两个已知例外：
+> 1. `4.uv-pytest-basics.md` **不绑定第 4 步模块**，是任何一步都要用的工具命令手册。
+> 2. `docs/modules/README.md` 的"建议开发顺序"表与实际文件编号**整体错开 1–2**（见 [`docs/review/02-异常清单.md`](docs/review/02-异常清单.md) E-13）——**以文件名编号为准**。
 
-常用命令（都在**仓库根**执行；本机无 Docker，数据库在 VMware-Linux 上）：
+---
 
-```bash
-uv run pytest -q                              # 全量测试（连不上库时 db 用例自动 skip）
-uv run pytest -q -m "not db"                  # 只跑不需要数据库的用例
-uv run alembic upgrade head                   # 建表 / 升级（连接串从 .env 读，见 alembic/README）
-uv run python -m scripts.seed                 # 灌演示数据（幂等：重复执行结果一致）
-uv run python -m scripts.db_check             # 现场核查：表、行数、约束统计
-uv run python -m scripts.db_check --check     # 验收断言：缺表/行数不足则退出码 1
-uv run python -m scripts.load_knowledge_base  # 灌知识库语料（跑完全量回归后必须重灌，见 16 runbook §10.1 坑 6）
-uv run python -m scripts.dev_token --account admin   # 签一个能粘进 Web 登录页的演示令牌（按账号签，变更 001）
-uv run python -m scripts.dev_token --role admin      # 也可以按角色取「第一个启用账号」来签
-uv run python -m scripts.evidence_accounts           # 变更 002 取证：账号与口令确实在库里（Argon2id，非明文）
-uv run python -m scripts.evidence_paths              # 变更 002 取证：三条主路径回归（需后端在跑）
-uv run python -m scripts.evidence_refunds            # 变更 003 取证：入口贯通 + 退款申请/审批闭环 + 客户不能自审批（需后端在跑）
-```
+## 11. 贡献约定（现状）
 
-> ⚠️ `scripts.evidence_refunds` 会**真的改演示库**（提交并审批退款），跑完按 `evidence3-` 前缀清理。
-> 后端地址可用 `SHOPSAGE_API` 覆盖（默认 `http://127.0.0.1:8000`）——
-> **改完代码后原进程不会自动更新**，取证时先确认端口上跑的是哪一版。
+- **分支**：实际只有 `main`（文档里写的 `main / develop / feature-*` 未落地）。
+- **提交信息**：中文短句，非 Conventional Commits。
+- **pre-commit / ruff / black / mypy**：未配置。
+- **加功能请先开变更单**：按 [`docs/changes/README.md`](docs/changes/README.md) 的五步流程（**先定稿文档，再写代码**）。
+- **改权限请改代码**（`app/security/rbac.py`），不要只改前端副本。
+- **改语料等于改答案**（`docs/kb/`），改完要重跑 `scripts.load_knowledge_base`。
 
-前端（都在 `web/` 下执行；需要 Node ≥ 22，本机实测 v24.16.0）：
+---
 
-```bash
-npm install --ignore-scripts   # ⚠️ 必须带 --ignore-scripts（见 16 runbook §10.1 坑 1）
-npm run dev                    # 开发模式 → http://127.0.0.1:3000
-npm test                       # 离线用例（201 条，不连后端；变更 002 起 +31，issue 004/006 再 +12，变更 003 再 +30）
-npm run typecheck              # 类型检查
-npm run build                  # 构建通过（验收第 1 条）
-node tests/run-live.mjs        # 真链路用例（10 条，需要后端在跑）
-npx tsx scripts/probe-evidence.ts      # 变更 002 取证：探活判据（改 NEXT_PUBLIC_API_BASE 可对比断连/正常）
-npx tsx scripts/sidebar-evidence.ts    # 变更 002 取证：三角色的侧边栏入口分流（需后端在跑 + TOK_* 环境变量）
-node scripts/admin-create-evidence.mjs # issue 004 取证：**真浏览器**点管理台的「开账号」（需前后端都在跑）
-node scripts/admin-patch-evidence.mjs  # issue 005 取证：**真浏览器**点「停用」（验 CORS 预检 + 状态翻转）
-node scripts/admin-role-evidence.mjs   # issue 006 取证：**真浏览器**改角色（验请求体、后端值、提示语三者一致）
-node scripts/logout-during-llm-evidence.mjs  # issue 007 取证：**真浏览器**「等 LLM 回复时退出登录 → 再登录」
-```
-
-> ⚠️ 三个 `admin-*-evidence.mjs` 都会**真的改演示库**（建号 / 停用 / 改角色），跑完各自复原现场。
-> 它们只该对着**开发/演示库**跑。
+<sub>
+📚 本次文档整理成果在 [`docs/review/`](docs/review/SUMMARY.md)；原始 README 备份在 [`docs/review/appendix/README.原始备份.md`](docs/review/appendix/README.原始备份.md)。
+</sub>
